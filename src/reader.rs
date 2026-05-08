@@ -281,15 +281,8 @@ impl Qcow2Reader {
                     //   data → refcount(new=1) → L2 → refcount(old-1).
                     let virt_cluster = cursor / cluster_size;
                     let mut full = vec![0u8; cluster_size as usize];
-                    self.read_decompressed_slice(
-                        virt_cluster,
-                        host_off,
-                        byte_len,
-                        0,
-                        &mut full,
-                    )?;
-                    full[in_cluster as usize..in_cluster as usize + chunk]
-                        .copy_from_slice(src);
+                    self.read_decompressed_slice(virt_cluster, host_off, byte_len, 0, &mut full)?;
+                    full[in_cluster as usize..in_cluster as usize + chunk].copy_from_slice(src);
 
                     let new_host = self.allocate_cluster()?;
                     {
@@ -376,9 +369,8 @@ impl Qcow2Reader {
 
         for block_idx in 0..rt_entries_total {
             let entry_off = block_idx * 8;
-            let block_off = u64::from_be_bytes(
-                rt_bytes[entry_off..entry_off + 8].try_into().unwrap(),
-            );
+            let block_off =
+                u64::from_be_bytes(rt_bytes[entry_off..entry_off + 8].try_into().unwrap());
             if block_off == 0 {
                 // Refcount block not present for this range. Allocating
                 // a new block is Phase D — skip for now.
@@ -394,8 +386,7 @@ impl Qcow2Reader {
 
             for entry_idx in 0..entries_per_block as usize {
                 let off = entry_idx * 2;
-                let refcount =
-                    u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
+                let refcount = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
                 if refcount == 0 {
                     let host_cluster_idx =
                         (block_idx as u64) * entries_per_block + (entry_idx as u64);
@@ -482,8 +473,7 @@ impl Qcow2Reader {
         }
 
         let off = (entry_idx as usize) * 2;
-        let cur =
-            u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
+        let cur = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
         if cur == 0 {
             return Err(Error::Corrupt(
                 "decrement: refcount already zero (double free?)",
@@ -584,8 +574,7 @@ impl Qcow2Reader {
         if (l1_idx as usize) >= l1.len() {
             return Err(Error::Corrupt("l1_idx out of range"));
         }
-        let l1_offset_on_disk =
-            self.header.l1_table_offset + (l1_idx as u64) * 8;
+        let l1_offset_on_disk = self.header.l1_table_offset + (l1_idx as u64) * 8;
         {
             let mut f = self.file.lock().unwrap();
             f.seek(SeekFrom::Start(l1_offset_on_disk))?;
@@ -797,7 +786,7 @@ fn decode_compressed_descriptor(entry: u64, cluster_bits: u32) -> (u64, usize) {
     let x = (62 - (cluster_bits - 8)) as u64;
     let host_off = descriptor & ((1u64 << x) - 1);
     let n = descriptor >> x; // additional 512-byte sectors beyond the one
-    // containing host_off.
+                             // containing host_off.
     let start_sector = host_off / 512;
     let end_byte = (start_sector + n + 1) * 512;
     let span = (end_byte - host_off) as usize;

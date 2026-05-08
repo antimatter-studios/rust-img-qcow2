@@ -114,16 +114,12 @@ mod tests {
         f.write_all(&hdr).unwrap();
 
         let mut l1 = [0u8; 4096];
-        l1[0..8].copy_from_slice(
-            &((L2_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes(),
-        );
+        l1[0..8].copy_from_slice(&((L2_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes());
         f.seek(SeekFrom::Start(L1_OFF)).unwrap();
         f.write_all(&l1).unwrap();
 
         let mut l2 = [0u8; 4096];
-        l2[0..8].copy_from_slice(
-            &((D0_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes(),
-        );
+        l2[0..8].copy_from_slice(&((D0_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes());
         f.seek(SeekFrom::Start(L2_OFF)).unwrap();
         f.write_all(&l2).unwrap();
 
@@ -182,7 +178,9 @@ mod tests {
 
     #[test]
     fn rw_open_writes_to_allocated_cluster_via_fs_core_handle() {
-        use fs_core::ffi::{fs_core_device_flush, fs_core_device_is_writable, fs_core_device_write_at};
+        use fs_core::ffi::{
+            fs_core_device_flush, fs_core_device_is_writable, fs_core_device_write_at,
+        };
 
         let path = tmp_path("rw_smoke");
         build_image(&path);
@@ -210,8 +208,7 @@ mod tests {
             // this fixture has no refcount table — the allocator has nowhere
             // to claim a fresh cluster from. (The full-fixture allocator
             // path is exercised by the Phase B unit tests.)
-            let rc =
-                fs_core_device_write_at(h, 4096, payload.as_ptr(), payload.len());
+            let rc = fs_core_device_write_at(h, 4096, payload.as_ptr(), payload.len());
             assert_eq!(rc, FsCoreErrorCode::Custom);
 
             fs_core_device_close(h);

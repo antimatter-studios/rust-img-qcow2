@@ -100,22 +100,27 @@ impl Header {
         let nb_snapshots = read_u32(bytes, 60);
         let snapshots_offset = read_u64(bytes, 64);
 
-        let (incompatible_features, compatible_features, autoclear_features, refcount_order, header_length) =
-            if version >= 3 {
-                if bytes.len() < 104 {
-                    return Err(Error::Corrupt("v3 header shorter than 104 bytes"));
-                }
-                (
-                    read_u64(bytes, 72),
-                    read_u64(bytes, 80),
-                    read_u64(bytes, 88),
-                    read_u32(bytes, 96),
-                    read_u32(bytes, 100),
-                )
-            } else {
-                // v2 implicit defaults per spec.
-                (0, 0, 0, 4, 72)
-            };
+        let (
+            incompatible_features,
+            compatible_features,
+            autoclear_features,
+            refcount_order,
+            header_length,
+        ) = if version >= 3 {
+            if bytes.len() < 104 {
+                return Err(Error::Corrupt("v3 header shorter than 104 bytes"));
+            }
+            (
+                read_u64(bytes, 72),
+                read_u64(bytes, 80),
+                read_u64(bytes, 88),
+                read_u32(bytes, 96),
+                read_u32(bytes, 100),
+            )
+        } else {
+            // v2 implicit defaults per spec.
+            (0, 0, 0, 4, 72)
+        };
 
         // Sanity: l1 must be large enough to address the whole virtual disk.
         let l2_entries_per_cluster = cluster_size / 8;
@@ -161,8 +166,7 @@ impl Header {
             return Err(Error::Unsupported("encryption (AES or LUKS)"));
         }
         if self.version >= 3 {
-            let unknown = self.incompatible_features
-                & !(incompat::DIRTY | incompat::CORRUPT);
+            let unknown = self.incompatible_features & !(incompat::DIRTY | incompat::CORRUPT);
             if unknown != 0 {
                 if self.incompatible_features & incompat::DATA_FILE != 0 {
                     return Err(Error::Unsupported("external data file"));
@@ -186,8 +190,14 @@ fn read_u32(b: &[u8], off: usize) -> u32 {
 
 fn read_u64(b: &[u8], off: usize) -> u64 {
     u64::from_be_bytes([
-        b[off], b[off + 1], b[off + 2], b[off + 3],
-        b[off + 4], b[off + 5], b[off + 6], b[off + 7],
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
     ])
 }
 

@@ -150,11 +150,17 @@ fn allocated_cluster_reads_back_data() {
 
     let mut buf = vec![0u8; 4096];
     r.read_at(0, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0xAA), "virt cluster 0 should be all 0xAA");
+    assert!(
+        buf.iter().all(|&b| b == 0xAA),
+        "virt cluster 0 should be all 0xAA"
+    );
 
     let mut buf = vec![0u8; 4096];
     r.read_at(8192, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0xBB), "virt cluster 2 should be all 0xBB");
+    assert!(
+        buf.iter().all(|&b| b == 0xBB),
+        "virt cluster 2 should be all 0xBB"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -167,7 +173,10 @@ fn unallocated_cluster_reads_zeros() {
 
     let mut buf = vec![0xFFu8; 4096];
     r.read_at(4096, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0), "unallocated cluster must read as zeros");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "unallocated cluster must read as zeros"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -180,7 +189,10 @@ fn v3_zero_flag_reads_zeros() {
 
     let mut buf = vec![0xFFu8; 4096];
     r.read_at(12288, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0), "v3 zero-flagged cluster must read as zeros");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "v3 zero-flagged cluster must read as zeros"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -227,8 +239,8 @@ const L2_FLAG_ZERO: u64 = 1u64 << 0;
 ///   cluster 2   L2 table
 ///   cluster 3+  compressed bytes (sector-padded)
 fn build_compressed_image(path: &PathBuf, pattern: u8) {
-    use flate2::Compression;
     use flate2::write::DeflateEncoder;
+    use flate2::Compression;
 
     // Compress 4096 bytes of `pattern` with raw deflate.
     let plain = vec![pattern; CLUSTER_SIZE as usize];
@@ -254,8 +266,7 @@ fn build_compressed_image(path: &PathBuf, pattern: u8) {
 
     // Layout: header(0) + L1(1) + L2(2) + compressed(3..3+span_clusters) +
     //         refcount table(N) + refcount block(N+1) + free space.
-    let span_clusters =
-        (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
+    let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
     let comp_end_cluster = 3 + span_clusters; // first cluster after compressed
     let rt_cluster = comp_end_cluster;
     let rb_cluster = comp_end_cluster + 1;
@@ -322,7 +333,10 @@ fn compressed_cluster_round_trip() {
     let r = Qcow2Reader::open(&path).unwrap();
     let mut buf = vec![0u8; 4096];
     r.read_at(0, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0xCC), "decompressed cluster must match input pattern");
+    assert!(
+        buf.iter().all(|&b| b == 0xCC),
+        "decompressed cluster must match input pattern"
+    );
 
     // Cache hit: read again, smaller window.
     let mut buf2 = vec![0u8; 16];
@@ -394,11 +408,7 @@ fn pair_paths(name: &str) -> (PathBuf, PathBuf, String) {
     );
     let parent = dir.join(format!("qcow2_parent_{stamp}.qcow2"));
     let child = dir.join(format!("qcow2_child_{stamp}.qcow2"));
-    let rel = parent
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let rel = parent.file_name().unwrap().to_string_lossy().into_owned();
     (parent, child, rel)
 }
 
@@ -449,10 +459,7 @@ fn backing_too_deep_for_self_reference() {
     // Build a qcow2 whose backing path points at itself, then confirm we
     // reject before exhausting the stack.
     let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "qcow2_cycle_{}.qcow2",
-        std::process::id()
-    ));
+    let path = dir.join(format!("qcow2_cycle_{}.qcow2", std::process::id()));
     let rel = path.file_name().unwrap().to_string_lossy().into_owned();
     build_child_with_backing(&path, &rel, &[]);
 

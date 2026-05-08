@@ -41,7 +41,10 @@ impl fmt::Display for Error {
             Error::Corrupt(s) => write!(f, "corrupt qcow2: {s}"),
             Error::Unsupported(s) => write!(f, "unsupported qcow2 feature: {s}"),
             Error::OutOfBounds { offset, len, size } => {
-                write!(f, "read [{offset}, {offset}+{len}) past virtual size {size}")
+                write!(
+                    f,
+                    "read [{offset}, {offset}+{len}) past virtual size {size}"
+                )
             }
             Error::Decompress(s) => write!(f, "decompress: {s}"),
             Error::BadBackingPath => write!(f, "backing-file path is not valid UTF-8"),
