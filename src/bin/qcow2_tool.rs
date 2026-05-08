@@ -53,7 +53,10 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     let h = r.header();
     println!("version            : {}", h.version);
     println!("cluster_bits       : {}", h.cluster_bits);
-    println!("cluster_size       : {} ({:#x})", h.cluster_size, h.cluster_size);
+    println!(
+        "cluster_size       : {} ({:#x})",
+        h.cluster_size, h.cluster_size
+    );
     println!(
         "virtual_size       : {} bytes ({:.2} MiB)",
         h.virtual_size,
