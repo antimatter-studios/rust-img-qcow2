@@ -1,0 +1,41 @@
+[package]
+name = "am-img-qcow2"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust QCOW2 reader. Exposes a Rust API and a C ABI suitable for FFI from C/C++/Go/Swift."
+repository = "https://github.com/antimatter-studios/rust-img-qcow2"
+
+[lib]
+# Published as `am-img-qcow2` on crates.io; consumers `use qcow2::...`
+# inside their code. Decoupling the package name from the lib name keeps the
+# brand-y prefix out of every import statement.
+name = "qcow2"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "qcow2_tool"
+path = "src/bin/qcow2_tool.rs"
+
+[dependencies]
+# Pure-Rust deflate backend (default when `default-features = true`).
+# Used to decompress zlib-compressed clusters per the qcow2 spec.
+flate2 = "1"
+# Block-device trait surface. Local path dep until both crates are
+# published; flip to a published version on the first crates.io release.
+am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+
+[dev-dependencies]
+# Partition probe + FS sniff, used by the `inspect` example to demonstrate
+# the qcow2 -> partitions -> sniff stack.
+am-partitions = { path = "../rust-partitions", version = "0.1" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"  # required for catch_unwind at the C-ABI boundary
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"

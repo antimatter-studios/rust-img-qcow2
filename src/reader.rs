@@ -1,0 +1,869 @@
+//! Read path: virtual offset -> L1 -> L2 -> host offset -> file read.
+//!
+//! Supported now:
+//! - Uncompressed clusters
+//! - Zlib-compressed clusters (raw deflate per the spec)
+//! - Backing-file chain (recursive)
+//! - Sparse / v3 zero-flagged clusters
+//!
+//! Not yet:
+//! - Internal snapshots, write path, encryption, external data file,
+//!   non-zlib compression types (zstd), extended L2.
+
+use crate::error::{Error, Result};
+use crate::header::Header;
+use flate2::read::DeflateDecoder;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Bits 9..55 inclusive — host cluster offset for L1 and uncompressed L2.
+const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
+
+/// L2 entry flags.
+const L2_FLAG_COMPRESSED: u64 = 1 << 62;
+/// v3 only: when bit 62 is clear, bit 0 means "this cluster reads as zeros".
+const L2_FLAG_ZERO: u64 = 1 << 0;
+/// COPIED: bit 63 of an L1 or L2 entry. Set means "this cluster's refcount
+/// is exactly 1, so it can be written through without copy-on-write."
+/// Always set when the writer allocates a fresh cluster.
+const L2_FLAG_COPIED: u64 = 1 << 63;
+
+/// Maximum backing-file recursion depth. A pathological chain (or a cycle)
+/// is rejected rather than blowing the stack or hanging.
+const MAX_BACKING_DEPTH: u32 = 16;
+
+/// What an L2 lookup tells us about a virtual cluster.
+#[derive(Debug, Clone, Copy)]
+enum ClusterMap {
+    /// L1 or L2 entry is zero — defer to backing if present, else zeros.
+    Unallocated,
+    /// v3 zero flag — always reads zeros, never defers to backing.
+    Zero,
+    /// Uncompressed allocated cluster.
+    Plain { host_off: u64 },
+    /// Compressed cluster — `host_off` is byte-granular (not cluster-aligned),
+    /// `byte_len` is the on-disk span in bytes (sector-rounded).
+    Compressed { host_off: u64, byte_len: usize },
+}
+
+/// Read-only QCOW2 reader backed by a file. May own a recursive backing-file
+/// reader if the image references a parent.
+///
+/// Implements [`fs_core::BlockRead`] so the reader can be handed directly to
+/// any consumer that takes a `BlockRead` — partition probes, filesystem
+/// drivers, slice decorators. The inherent [`Qcow2Reader::read_at`] keeps
+/// the rich [`Error`] type for callers that want to match on specific
+/// failure modes.
+pub struct Qcow2Reader {
+    file: Mutex<File>,
+    header: Header,
+    /// Cached L1 table. Always small (l1_size * 8 bytes). Mutex-wrapped
+    /// because the writer mutates entries in place when allocating L2
+    /// tables.
+    l1: Mutex<Vec<u64>>,
+    /// Single-slot L2 cache: (l1_index, cluster bytes).
+    l2_cache: Mutex<Option<(u32, Vec<u8>)>>,
+    /// Single-slot decompressed-cluster cache: (virt_cluster_index, bytes).
+    /// Catches sequential access within one compressed cluster.
+    decompress_cache: Mutex<Option<(u64, Vec<u8>)>>,
+    /// Optional parent in the backing chain. Always opened read-only,
+    /// regardless of the child's mode — you don't write through backing.
+    backing: Option<Box<Qcow2Reader>>,
+    /// True when the image was opened read-write. Read-only images reject
+    /// every `write_at` call up front.
+    writable: bool,
+}
+
+impl Qcow2Reader {
+    /// Open `path` read-only and parse the header + L1 table. If the image
+    /// references a backing file, the parent is opened recursively (capped at
+    /// [`MAX_BACKING_DEPTH`]).
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_inner(path.as_ref(), false, MAX_BACKING_DEPTH)
+    }
+
+    /// Open `path` read-write. Backing parents (if any) are still opened
+    /// read-only — writes only ever land in the leaf image.
+    ///
+    /// Phase A scope: writes succeed only against clusters that are already
+    /// allocated in this image with refcount = 1 (uncompressed, not
+    /// zero-flagged, no snapshots). Writes that would need cluster
+    /// allocation, copy-on-write, decompression, or snapshot-aware refcount
+    /// updates return `Error::Unsupported(...)`. See `write_at` for the
+    /// exact rejection list.
+    pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_inner(path.as_ref(), true, MAX_BACKING_DEPTH)
+    }
+
+    /// Open read-write if possible, fall back to read-only otherwise.
+    /// Useful for inspectors that prefer RW but tolerate locked paths.
+    pub fn open_best_effort<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let p = path.as_ref();
+        match Self::open_rw(p) {
+            Ok(r) => Ok(r),
+            Err(_) => Self::open(p),
+        }
+    }
+
+    fn open_inner(path: &Path, writable: bool, depth_remaining: u32) -> Result<Self> {
+        if depth_remaining == 0 {
+            return Err(Error::BackingTooDeep);
+        }
+
+        let mut file = if writable {
+            OpenOptions::new().read(true).write(true).open(path)?
+        } else {
+            File::open(path)?
+        };
+
+        let mut head_bytes = [0u8; 104];
+        file.seek(SeekFrom::Start(0))?;
+        let mut total = 0usize;
+        while total < head_bytes.len() {
+            match file.read(&mut head_bytes[total..])? {
+                0 => break,
+                n => total += n,
+            }
+        }
+        if total < 72 {
+            return Err(Error::Corrupt("file shorter than v2 header"));
+        }
+
+        let header = Header::parse(&head_bytes[..total])?;
+        header.check_supported()?;
+
+        let mut l1_bytes = vec![0u8; (header.l1_size as usize) * 8];
+        file.seek(SeekFrom::Start(header.l1_table_offset))?;
+        file.read_exact(&mut l1_bytes)?;
+        let mut l1 = Vec::with_capacity(header.l1_size as usize);
+        for chunk in l1_bytes.chunks_exact(8) {
+            l1.push(u64::from_be_bytes(chunk.try_into().unwrap()));
+        }
+
+        let backing = if header.backing_file_size != 0 {
+            let backing_path = read_backing_path(&mut file, &header, path)?;
+            // Backing parents always open read-only — writes only land in
+            // the leaf image's own cluster store.
+            Some(Box::new(Self::open_inner(
+                &backing_path,
+                false,
+                depth_remaining - 1,
+            )?))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            file: Mutex::new(file),
+            header,
+            l1: Mutex::new(l1),
+            l2_cache: Mutex::new(None),
+            decompress_cache: Mutex::new(None),
+            backing,
+            writable,
+        })
+    }
+
+    /// Virtual disk size in bytes — the addressable range for `read_at`.
+    pub fn virtual_size(&self) -> u64 {
+        self.header.virtual_size
+    }
+
+    /// Cluster size (1 << cluster_bits).
+    pub fn cluster_size(&self) -> u64 {
+        self.header.cluster_size
+    }
+
+    /// QCOW2 version (2 or 3).
+    pub fn version(&self) -> u32 {
+        self.header.version
+    }
+
+    /// Parsed header.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Whether this image has a backing parent.
+    pub fn has_backing(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Whether the image was opened read-write.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Write to the image. Behaviour by cluster state:
+    ///
+    /// - **Allocated, uncompressed, single-ref**: direct write to the
+    ///   existing host cluster.
+    /// - **Unallocated or v3-zero-flagged**: allocate a fresh host
+    ///   cluster, zero-initialise it, write the user payload at the
+    ///   in-cluster offset, update L2 (with COPIED set). If the L1 entry
+    ///   was unallocated, an L2 table is allocated first.
+    /// - **Compressed**: decompress into a full-cluster buffer, splice
+    ///   the user payload in, allocate a fresh uncompressed host
+    ///   cluster, write the modified buffer, repoint L2. The old
+    ///   compressed cluster's refcount is currently left in place —
+    ///   `qemu-img check` will report it as a leak; Phase D adds the
+    ///   decrement.
+    ///
+    /// Crash-safety ordering: refcount → data → metadata, with
+    /// `sync_data()` between each step. A crash mid-allocation may leak a
+    /// cluster but never corrupts the image.
+    ///
+    /// Refused with [`Error::Unsupported`]:
+    ///
+    /// - Image with `nb_snapshots > 0` (snapshot-aware CoW is Phase D).
+    /// - Image with `refcount_order != 4` (only u16 refcounts handled).
+    /// - Image with no refcount table, or no free entry in any refcount
+    ///   block (refcount-block growth is Phase D).
+    ///
+    /// Refused with [`Error::ReadOnly`]: image opened via `open()`.
+    /// Refused with [`Error::OutOfBounds`]: range past virtual size.
+    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if !self.writable {
+            return Err(Error::ReadOnly);
+        }
+        let len = buf.len() as u64;
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or(Error::Corrupt("offset+len overflow"))?;
+        if end > self.header.virtual_size {
+            return Err(Error::OutOfBounds {
+                offset,
+                len,
+                size: self.header.virtual_size,
+            });
+        }
+
+        // Snapshot safety: shared clusters (refcount > 1) need
+        // copy-on-write. Phase D will handle them; for now refuse the
+        // whole image up front so we never silently corrupt a snapshot.
+        if self.header.nb_snapshots > 0 {
+            return Err(Error::Unsupported(
+                "write to image with snapshots (no CoW for shared clusters yet)",
+            ));
+        }
+
+        let cluster_size = self.header.cluster_size;
+        let cluster_mask = cluster_size - 1;
+        let l2_entries = self.header.l2_entries();
+
+        let mut cursor = offset;
+        let mut written = 0usize;
+
+        while cursor < end {
+            let in_cluster = cursor & cluster_mask;
+            let chunk = std::cmp::min(cluster_size - in_cluster, end - cursor) as usize;
+            let src = &buf[written..written + chunk];
+
+            let map = self.lookup_cluster(cursor)?;
+            match map {
+                ClusterMap::Plain { host_off } => {
+                    // Existing cluster: write through.
+                    let mut f = self.file.lock().unwrap();
+                    f.seek(SeekFrom::Start(host_off + in_cluster))?;
+                    f.write_all(src)?;
+                }
+                ClusterMap::Compressed { host_off, byte_len } => {
+                    // Read+decompress the existing cluster, splice in the
+                    // user's slice, allocate a fresh uncompressed host
+                    // cluster, write, repoint L2, then decrement the old
+                    // compressed cluster's refcount so its host cluster
+                    // is reusable. Crash-safety order:
+                    //   data → refcount(new=1) → L2 → refcount(old-1).
+                    let virt_cluster = cursor / cluster_size;
+                    let mut full = vec![0u8; cluster_size as usize];
+                    self.read_decompressed_slice(
+                        virt_cluster,
+                        host_off,
+                        byte_len,
+                        0,
+                        &mut full,
+                    )?;
+                    full[in_cluster as usize..in_cluster as usize + chunk]
+                        .copy_from_slice(src);
+
+                    let new_host = self.allocate_cluster()?;
+                    {
+                        let mut f = self.file.lock().unwrap();
+                        f.seek(SeekFrom::Start(new_host))?;
+                        f.write_all(&full)?;
+                        f.sync_data()?;
+                    }
+                    let l1_idx = (virt_cluster / l2_entries) as u32;
+                    let l2_idx = (virt_cluster % l2_entries) as u32;
+                    let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
+                    self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
+
+                    // Old cluster has no L2 reference now; release it.
+                    // If decrement fails the cluster leaks but the image
+                    // stays consistent — fsck-recoverable.
+                    let _ = self.decrement_refcount(host_off);
+                }
+                ClusterMap::Zero | ClusterMap::Unallocated => {
+                    // Phase B: allocate a fresh cluster, zero-init it,
+                    // write the slice the caller asked for, point L2 at
+                    // it.
+                    let new_host = self.allocate_cluster()?;
+                    self.zero_cluster(new_host)?;
+                    {
+                        let mut f = self.file.lock().unwrap();
+                        f.seek(SeekFrom::Start(new_host + in_cluster))?;
+                        f.write_all(src)?;
+                        f.sync_data()?;
+                    }
+                    let virt_cluster = cursor / cluster_size;
+                    let l1_idx = (virt_cluster / l2_entries) as u32;
+                    let l2_idx = (virt_cluster % l2_entries) as u32;
+                    let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
+                    self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
+                }
+            }
+
+            cursor += chunk as u64;
+            written += chunk;
+        }
+        Ok(())
+    }
+
+    /// Find a host cluster with refcount = 0 in an existing refcount
+    /// block, increment it to 1, and return the cluster's host byte
+    /// offset. Refcount-block writes are `sync_data`-flushed before
+    /// returning so the claim is durable.
+    ///
+    /// Errors with `Unsupported` when the image has no refcount table,
+    /// uses a non-u16 refcount width, or every populated refcount block
+    /// is full (Phase D handles allocating new refcount blocks).
+    fn allocate_cluster(&self) -> Result<u64> {
+        let cluster_size = self.header.cluster_size;
+        let refcount_bits = if self.header.version >= 3 {
+            1u32 << self.header.refcount_order
+        } else {
+            16
+        };
+        if refcount_bits != 16 {
+            return Err(Error::Unsupported(
+                "non-16-bit refcount entries (refcount_order != 4)",
+            ));
+        }
+        let refcount_bytes: u64 = 2;
+        let entries_per_block = cluster_size / refcount_bytes;
+
+        let rt_off = self.header.refcount_table_offset;
+        let rt_clusters = self.header.refcount_table_clusters as u64;
+        if rt_off == 0 || rt_clusters == 0 {
+            return Err(Error::Unsupported(
+                "no refcount table (cannot allocate clusters)",
+            ));
+        }
+        let rt_size = rt_clusters * cluster_size;
+        let mut rt_bytes = vec![0u8; rt_size as usize];
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(rt_off))?;
+            f.read_exact(&mut rt_bytes)?;
+        }
+
+        let rt_entries_total = (rt_size / 8) as usize;
+
+        for block_idx in 0..rt_entries_total {
+            let entry_off = block_idx * 8;
+            let block_off = u64::from_be_bytes(
+                rt_bytes[entry_off..entry_off + 8].try_into().unwrap(),
+            );
+            if block_off == 0 {
+                // Refcount block not present for this range. Allocating
+                // a new block is Phase D — skip for now.
+                continue;
+            }
+
+            let mut block_bytes = vec![0u8; cluster_size as usize];
+            {
+                let mut f = self.file.lock().unwrap();
+                f.seek(SeekFrom::Start(block_off))?;
+                f.read_exact(&mut block_bytes)?;
+            }
+
+            for entry_idx in 0..entries_per_block as usize {
+                let off = entry_idx * 2;
+                let refcount =
+                    u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
+                if refcount == 0 {
+                    let host_cluster_idx =
+                        (block_idx as u64) * entries_per_block + (entry_idx as u64);
+                    let host_off = host_cluster_idx * cluster_size;
+
+                    block_bytes[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
+                    {
+                        let mut f = self.file.lock().unwrap();
+                        f.seek(SeekFrom::Start(block_off))?;
+                        f.write_all(&block_bytes)?;
+                        f.sync_data()?;
+                    }
+                    return Ok(host_off);
+                }
+            }
+        }
+
+        Err(Error::Unsupported(
+            "no free clusters in existing refcount blocks",
+        ))
+    }
+
+    /// Decrement the refcount of the host cluster containing `host_off`.
+    /// Mirror image of [`Qcow2Reader::allocate_cluster`]: locates the
+    /// matching refcount block, drops the entry by 1, syncs.
+    ///
+    /// Used by the compressed-cluster rewrite path to free the old
+    /// compressed cluster after a fresh uncompressed replacement is in
+    /// place. Multi-host-cluster compressed data: this only decrements
+    /// the starting cluster — additional spanned clusters stay marked
+    /// in-use, becoming a "clean leak" recoverable by `qemu-img check`.
+    /// Real compressed payloads almost always fit in one host cluster,
+    /// so the leak window is rare in practice.
+    fn decrement_refcount(&self, host_off: u64) -> Result<()> {
+        let cluster_size = self.header.cluster_size;
+        let refcount_bits = if self.header.version >= 3 {
+            1u32 << self.header.refcount_order
+        } else {
+            16
+        };
+        if refcount_bits != 16 {
+            return Err(Error::Unsupported(
+                "non-16-bit refcount entries (refcount_order != 4)",
+            ));
+        }
+        let entries_per_block = cluster_size / 2;
+
+        let host_cluster_idx = host_off / cluster_size;
+        let block_idx = host_cluster_idx / entries_per_block;
+        let entry_idx = host_cluster_idx % entries_per_block;
+
+        let rt_off = self.header.refcount_table_offset;
+        let rt_clusters = self.header.refcount_table_clusters as u64;
+        if rt_off == 0 || rt_clusters == 0 {
+            return Err(Error::Unsupported(
+                "no refcount table (cannot decrement refcount)",
+            ));
+        }
+        let rt_size = rt_clusters * cluster_size;
+        if block_idx * 8 >= rt_size {
+            return Err(Error::Corrupt(
+                "decrement: host cluster past refcount table coverage",
+            ));
+        }
+
+        let mut rt_entry_bytes = [0u8; 8];
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(rt_off + block_idx * 8))?;
+            f.read_exact(&mut rt_entry_bytes)?;
+        }
+        let block_off = u64::from_be_bytes(rt_entry_bytes);
+        if block_off == 0 {
+            return Err(Error::Corrupt(
+                "decrement: refcount block not allocated for this range",
+            ));
+        }
+
+        let mut block_bytes = vec![0u8; cluster_size as usize];
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(block_off))?;
+            f.read_exact(&mut block_bytes)?;
+        }
+
+        let off = (entry_idx as usize) * 2;
+        let cur =
+            u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
+        if cur == 0 {
+            return Err(Error::Corrupt(
+                "decrement: refcount already zero (double free?)",
+            ));
+        }
+        let new_refcount = cur - 1;
+        block_bytes[off..off + 2].copy_from_slice(&new_refcount.to_be_bytes());
+
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(block_off))?;
+            f.write_all(&block_bytes)?;
+            f.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Write `cluster_size` zero bytes to `host_off` and `sync_data`.
+    /// Used to initialise a freshly-allocated cluster before the user's
+    /// payload lands inside it.
+    fn zero_cluster(&self, host_off: u64) -> Result<()> {
+        let cluster_size = self.header.cluster_size as usize;
+        let zeros = vec![0u8; cluster_size];
+        let mut f = self.file.lock().unwrap();
+        f.seek(SeekFrom::Start(host_off))?;
+        f.write_all(&zeros)?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Overwrite a single L2 entry on disk and invalidate the in-memory
+    /// L2 cache so subsequent lookups re-read. Allocates a fresh L2 table
+    /// (and updates L1) on demand if `l1[l1_idx]` is unallocated.
+    fn update_l2_entry(&self, l1_idx: u32, l2_idx: u32, new_entry: u64) -> Result<()> {
+        let l2_table_off = {
+            let l1 = self.l1.lock().unwrap();
+            if (l1_idx as usize) >= l1.len() {
+                return Err(Error::Corrupt("l1_idx out of range"));
+            }
+            l1[l1_idx as usize] & OFFSET_MASK
+        };
+        let l2_table_off = if l2_table_off == 0 {
+            self.allocate_l2_table(l1_idx)?
+        } else {
+            l2_table_off
+        };
+
+        let cluster_size = self.header.cluster_size as usize;
+        let mut l2_bytes = vec![0u8; cluster_size];
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(l2_table_off))?;
+            f.read_exact(&mut l2_bytes)?;
+        }
+
+        let off = (l2_idx as usize) * 8;
+        l2_bytes[off..off + 8].copy_from_slice(&new_entry.to_be_bytes());
+
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(l2_table_off))?;
+            f.write_all(&l2_bytes)?;
+            f.sync_data()?;
+        }
+
+        // Invalidate caches keyed off this L2 cluster.
+        *self.l2_cache.lock().unwrap() = None;
+        *self.decompress_cache.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Flush writes to stable storage. No-op for read-only images.
+    pub fn flush(&self) -> Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
+        let mut f = self.file.lock().unwrap();
+        f.flush()?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Allocate a host cluster, zero-initialise it, and point L1 at it as
+    /// a brand-new L2 table. Returns the host offset of the new L2.
+    fn allocate_l2_table(&self, l1_idx: u32) -> Result<u64> {
+        let l2_host = self.allocate_cluster()?;
+        self.zero_cluster(l2_host)?;
+        let new_l1_entry = (l2_host & OFFSET_MASK) | L2_FLAG_COPIED;
+        self.update_l1_entry(l1_idx, new_l1_entry)?;
+        Ok(l2_host)
+    }
+
+    /// Overwrite a single L1 entry on disk and update the in-memory cache.
+    /// Holds the l1 mutex across the disk write so other threads never
+    /// observe a memory/disk mismatch.
+    fn update_l1_entry(&self, l1_idx: u32, new_entry: u64) -> Result<()> {
+        let mut l1 = self.l1.lock().unwrap();
+        if (l1_idx as usize) >= l1.len() {
+            return Err(Error::Corrupt("l1_idx out of range"));
+        }
+        let l1_offset_on_disk =
+            self.header.l1_table_offset + (l1_idx as u64) * 8;
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(l1_offset_on_disk))?;
+            f.write_all(&new_entry.to_be_bytes())?;
+            f.sync_data()?;
+        }
+        l1[l1_idx as usize] = new_entry;
+        Ok(())
+    }
+
+    /// Read exactly `buf.len()` bytes starting at virtual `offset`.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let len = buf.len() as u64;
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or(Error::Corrupt("offset+len overflow"))?;
+        if end > self.header.virtual_size {
+            return Err(Error::OutOfBounds {
+                offset,
+                len,
+                size: self.header.virtual_size,
+            });
+        }
+
+        let cluster_size = self.header.cluster_size;
+        let cluster_mask = cluster_size - 1;
+
+        let mut cursor = offset;
+        let mut written = 0usize;
+
+        while cursor < end {
+            let in_cluster = cursor & cluster_mask;
+            let chunk = std::cmp::min(cluster_size - in_cluster, end - cursor) as usize;
+
+            let map = self.lookup_cluster(cursor)?;
+            let dst = &mut buf[written..written + chunk];
+
+            match map {
+                ClusterMap::Plain { host_off } => {
+                    let mut f = self.file.lock().unwrap();
+                    f.seek(SeekFrom::Start(host_off + in_cluster))?;
+                    f.read_exact(dst)?;
+                }
+                ClusterMap::Compressed { host_off, byte_len } => {
+                    let virt_cluster = cursor / cluster_size;
+                    self.read_decompressed_slice(
+                        virt_cluster,
+                        host_off,
+                        byte_len,
+                        in_cluster as usize,
+                        dst,
+                    )?;
+                }
+                ClusterMap::Zero => {
+                    dst.fill(0);
+                }
+                ClusterMap::Unallocated => {
+                    self.read_unallocated(cursor, dst)?;
+                }
+            }
+
+            cursor += chunk as u64;
+            written += chunk;
+        }
+
+        Ok(())
+    }
+
+    /// Defer to the backing chain if present, otherwise zero-fill. Backing
+    /// reads past the backing's virtual_size are zero-filled per the spec.
+    fn read_unallocated(&self, virt: u64, dst: &mut [u8]) -> Result<()> {
+        match &self.backing {
+            None => {
+                dst.fill(0);
+                Ok(())
+            }
+            Some(b) => {
+                let bsz = b.virtual_size();
+                let len = dst.len() as u64;
+                if virt >= bsz {
+                    dst.fill(0);
+                    Ok(())
+                } else if virt + len > bsz {
+                    let n = (bsz - virt) as usize;
+                    b.read_at(virt, &mut dst[..n])?;
+                    dst[n..].fill(0);
+                    Ok(())
+                } else {
+                    b.read_at(virt, dst)
+                }
+            }
+        }
+    }
+
+    fn lookup_cluster(&self, virt: u64) -> Result<ClusterMap> {
+        let cluster_size = self.header.cluster_size;
+        let virt_cluster = virt / cluster_size;
+        let l2_entries = self.header.l2_entries();
+        let l1_index = (virt_cluster / l2_entries) as u32;
+        let l2_index = (virt_cluster % l2_entries) as u32;
+
+        let l1_entry = {
+            let l1 = self.l1.lock().unwrap();
+            if (l1_index as u64) >= l1.len() as u64 {
+                return Err(Error::Corrupt("l1_index past l1 table"));
+            }
+            l1[l1_index as usize]
+        };
+        let l2_table_off = l1_entry & OFFSET_MASK;
+        if l2_table_off == 0 {
+            return Ok(ClusterMap::Unallocated);
+        }
+
+        let l2_entry = self.read_l2_entry(l1_index, l2_table_off, l2_index)?;
+
+        if l2_entry & L2_FLAG_COMPRESSED != 0 {
+            let (host_off, byte_len) =
+                decode_compressed_descriptor(l2_entry, self.header.cluster_bits);
+            return Ok(ClusterMap::Compressed { host_off, byte_len });
+        }
+        if self.header.version >= 3 && (l2_entry & L2_FLAG_ZERO) != 0 {
+            return Ok(ClusterMap::Zero);
+        }
+        let host = l2_entry & OFFSET_MASK;
+        if host == 0 {
+            return Ok(ClusterMap::Unallocated);
+        }
+        Ok(ClusterMap::Plain { host_off: host })
+    }
+
+    fn read_l2_entry(&self, l1_index: u32, l2_table_off: u64, l2_index: u32) -> Result<u64> {
+        let cluster_size = self.header.cluster_size as usize;
+        let mut cache = self.l2_cache.lock().unwrap();
+
+        let need_load = match &*cache {
+            Some((cached_idx, _)) => *cached_idx != l1_index,
+            None => true,
+        };
+
+        if need_load {
+            let mut buf = vec![0u8; cluster_size];
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(l2_table_off))?;
+            f.read_exact(&mut buf)?;
+            *cache = Some((l1_index, buf));
+        }
+
+        let bytes = &cache.as_ref().unwrap().1;
+        let off = (l2_index as usize) * 8;
+        let entry = u64::from_be_bytes(bytes[off..off + 8].try_into().unwrap());
+        Ok(entry)
+    }
+
+    /// Decompress (or hit the cache for) a compressed cluster, then copy out
+    /// `[skip, skip+dst.len())` of the decompressed bytes.
+    fn read_decompressed_slice(
+        &self,
+        virt_cluster: u64,
+        host_off: u64,
+        byte_len: usize,
+        skip: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let cluster_size = self.header.cluster_size as usize;
+
+        // Cache lookup.
+        {
+            let cache = self.decompress_cache.lock().unwrap();
+            if let Some((c, bytes)) = &*cache {
+                if *c == virt_cluster {
+                    dst.copy_from_slice(&bytes[skip..skip + dst.len()]);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Read compressed bytes.
+        let mut compressed = vec![0u8; byte_len];
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(host_off))?;
+            f.read_exact(&mut compressed)?;
+        }
+
+        // Raw deflate (no zlib header) per qcow2 spec.
+        let mut decoder = DeflateDecoder::new(&compressed[..]);
+        let mut decoded = vec![0u8; cluster_size];
+        decoder
+            .read_exact(&mut decoded)
+            .map_err(|e| Error::Decompress(e.to_string()))?;
+
+        dst.copy_from_slice(&decoded[skip..skip + dst.len()]);
+
+        // Populate cache.
+        let mut cache = self.decompress_cache.lock().unwrap();
+        *cache = Some((virt_cluster, decoded));
+        Ok(())
+    }
+}
+
+/// Decode the compressed-cluster descriptor in an L2 entry. Returns the
+/// byte-granular host offset and the on-disk span (sector-rounded).
+fn decode_compressed_descriptor(entry: u64, cluster_bits: u32) -> (u64, usize) {
+    // Strip COPIED (bit 63) and the COMPRESSED flag (bit 62).
+    let descriptor = entry & ((1u64 << 62) - 1);
+    let x = (62 - (cluster_bits - 8)) as u64;
+    let host_off = descriptor & ((1u64 << x) - 1);
+    let n = descriptor >> x; // additional 512-byte sectors beyond the one
+    // containing host_off.
+    let start_sector = host_off / 512;
+    let end_byte = (start_sector + n + 1) * 512;
+    let span = (end_byte - host_off) as usize;
+    (host_off, span)
+}
+
+/// Read the backing-file path from the header and resolve it relative to the
+/// child image's directory if it isn't absolute.
+fn read_backing_path(file: &mut File, header: &Header, child_path: &Path) -> Result<PathBuf> {
+    let len = header.backing_file_size as usize;
+    if len > 1024 {
+        return Err(Error::Corrupt("backing_file_size > 1024 bytes"));
+    }
+    let mut bytes = vec![0u8; len];
+    file.seek(SeekFrom::Start(header.backing_file_offset))?;
+    file.read_exact(&mut bytes)?;
+    let s = std::str::from_utf8(&bytes).map_err(|_| Error::BadBackingPath)?;
+    let p = Path::new(s);
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        let parent = child_path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(parent.join(p))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fs_core::BlockRead bridge — lifts qcow2's rich Error to fs_core::Error so
+// any consumer that takes a `BlockRead` (partition probe, fs driver, slice
+// adapter) can drive a Qcow2Reader directly.
+// ---------------------------------------------------------------------------
+
+impl fs_core::BlockRead for Qcow2Reader {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        Qcow2Reader::read_at(self, offset, buf).map_err(qcow2_to_fs_core_error)
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.virtual_size()
+    }
+}
+
+/// Phase A write support: forwards to inherent `write_at` / `flush` /
+/// `is_writable`. Read-only images keep returning `ReadOnly` from the
+/// inherent `write_at`, which maps cleanly to `fs_core::Error::ReadOnly`.
+impl fs_core::BlockDevice for Qcow2Reader {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        Qcow2Reader::write_at(self, offset, buf).map_err(qcow2_to_fs_core_error)
+    }
+
+    fn flush(&self) -> fs_core::Result<()> {
+        Qcow2Reader::flush(self).map_err(qcow2_to_fs_core_error)
+    }
+
+    fn is_writable(&self) -> bool {
+        Qcow2Reader::is_writable(self)
+    }
+}
+
+fn qcow2_to_fs_core_error(e: Error) -> fs_core::Error {
+    match e {
+        Error::Io(io) => fs_core::Error::Io(io),
+        Error::OutOfBounds { offset, len, size } => {
+            fs_core::Error::OutOfBounds { offset, len, size }
+        }
+        Error::ReadOnly => fs_core::Error::ReadOnly,
+        other => fs_core::Error::Custom(other.to_string()),
+    }
+}
