@@ -187,9 +187,7 @@ impl Header {
             // COMPRESSION_TYPE in incompatible_features means "compression
             // is something other than the default (zlib)". We honour it as
             // long as compression_type itself is a value we implement.
-            let known = incompat::DIRTY
-                | incompat::CORRUPT
-                | incompat::COMPRESSION_TYPE;
+            let known = incompat::DIRTY | incompat::CORRUPT | incompat::COMPRESSION_TYPE;
             let unknown = self.incompatible_features & !known;
             if unknown != 0 {
                 if self.incompatible_features & incompat::DATA_FILE != 0 {
