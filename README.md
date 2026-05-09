@@ -6,9 +6,9 @@ for FFI from C/C++/Go/Swift.
 
 ## Status
 
-Read path: complete for the common case. Write path: phases A/B/C landed
-(allocated / sparse / compressed clusters); phase D (refcount-block growth
-and snapshot CoW) is the remaining gap.
+Read path: complete for the common case (zlib + zstd clusters, backing
+chains, sparse / zero clusters). Write path: full set landed — allocation,
+refcount-block growth, compressed-cluster rewrite, snapshot copy-on-write.
 
 ### Read
 
@@ -16,23 +16,21 @@ and snapshot CoW) is the remaining gap.
 - [x] L1 / L2 cluster lookup, uncompressed clusters
 - [x] Sparse / all-zero clusters (v3 zero flag honoured)
 - [x] zlib-compressed clusters
+- [x] zstd-compressed clusters (header `compression_type = 1`)
 - [x] Backing-file chain (parent path resolution + fall-through reads)
-- [ ] zstd-compressed clusters
-- [ ] Internal snapshots (image opens read-only when `nb_snapshots > 0`)
 
 ### Write
 
-- [x] Phase A — write into already-allocated clusters
-- [x] Phase B — sparse-grow (allocate cluster + L2 entry + refcount,
-      crash-safe ordering)
-- [x] Phase C — compressed-cluster rewrite (decompress → modify →
-      reallocate → update L2)
-- [x] `decrement_refcount` on cluster replacement (no longer leaks the
-      old compressed cluster after rewrite)
-- [ ] Phase D — refcount-block growth (currently returns `Unsupported`
-      when an existing refcount block is full)
-- [ ] Phase D — snapshot copy-on-write (writing a shared cluster while
-      `nb_snapshots > 0`)
+- [x] Write into already-allocated clusters
+- [x] Sparse-grow (allocate cluster + L2 entry + refcount, crash-safe
+      ordering)
+- [x] Compressed-cluster rewrite (decompress → modify → reallocate →
+      update L2)
+- [x] `decrement_refcount` on cluster replacement (no leak after rewrite)
+- [x] Refcount-block growth — allocates a fresh refcount block when every
+      existing one is full
+- [x] Snapshot copy-on-write — writes to clusters whose host refcount > 1
+      clone the cluster before mutating, leaving the snapshot's view intact
 
 ## API surface
 

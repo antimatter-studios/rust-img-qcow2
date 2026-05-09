@@ -1,6 +1,6 @@
 [package]
 name = "am-img-qcow2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust QCOW2 reader. Exposes a Rust API and a C ABI suitable for FFI from C/C++/Go/Swift."
@@ -21,6 +21,9 @@ path = "src/bin/qcow2_tool.rs"
 # Pure-Rust deflate backend (default when `default-features = true`).
 # Used to decompress zlib-compressed clusters per the qcow2 spec.
 flate2 = "1"
+# Pure-Rust zstd decoder. Only used when an image declares
+# compression_type = 1 (zstd) in its v3 header. MIT-licensed, no_std-able.
+ruzstd = "0.8"
 # Block-device trait surface. Local path dep until both crates are
 # published; flip to a published version on the first crates.io release.
 am-fs-core = { path = "../rust-fs-core", version = "0.1" }
@@ -29,6 +32,9 @@ am-fs-core = { path = "../rust-fs-core", version = "0.1" }
 # Partition probe + FS sniff, used by the `inspect` example to demonstrate
 # the qcow2 -> partitions -> sniff stack.
 am-partitions = { path = "../rust-partitions", version = "0.1" }
+# Zstd encoder used only by the synthetic-image test harness to build
+# fixture clusters; never linked into the runtime crate.
+zstd = "0.13"
 
 [profile.release]
 lto = true
