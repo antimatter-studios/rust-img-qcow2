@@ -3,20 +3,31 @@
 //! Supported now:
 //! - Uncompressed clusters
 //! - Zlib-compressed clusters (raw deflate per the spec)
-//! - Backing-file chain (recursive)
+//! - Backing-file chain (recursive, only when opened by path — the
+//!   on-device API has no path context to resolve a parent against)
 //! - Sparse / v3 zero-flagged clusters
 //!
 //! Not yet:
-//! - Internal snapshots, write path, encryption, external data file,
-//!   non-zlib compression types (zstd), extended L2.
+//! - Internal snapshots, encryption, external data file, non-zlib
+//!   compression types (zstd), extended L2.
+//!
+//! ## Backing storage
+//!
+//! The reader is generic over [`fs_core::BlockDevice`]. Open from a path
+//! via [`Qcow2Reader::open`] / [`Qcow2Reader::open_rw`] (the file is
+//! wrapped in a [`fs_core::FileDevice`] internally), or hand in any
+//! other `BlockDevice` via [`Qcow2Reader::open_on_device`] /
+//! [`Qcow2Reader::open_rw_on_device`]. The on-device variants are how
+//! the qcow2 layer stacks on top of an FSKit-supplied block resource,
+//! a slice reader, or any other host-managed device.
 
 use crate::error::{Error, Result};
 use crate::header::Header;
 use flate2::read::DeflateDecoder;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use fs_core::{BlockDevice, FileDevice};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Bits 9..55 inclusive — host cluster offset for L1 and uncompressed L2.
 const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
@@ -41,23 +52,29 @@ enum ClusterMap {
     Unallocated,
     /// v3 zero flag — always reads zeros, never defers to backing.
     Zero,
-    /// Uncompressed allocated cluster.
-    Plain { host_off: u64 },
+    /// Uncompressed allocated cluster. `copied` reflects bit 63 of the L2
+    /// entry — when set, the spec guarantees refcount == 1 and writes may
+    /// go through in place without consulting the refcount table.
+    Plain { host_off: u64, copied: bool },
     /// Compressed cluster — `host_off` is byte-granular (not cluster-aligned),
     /// `byte_len` is the on-disk span in bytes (sector-rounded).
     Compressed { host_off: u64, byte_len: usize },
 }
 
-/// Read-only QCOW2 reader backed by a file. May own a recursive backing-file
-/// reader if the image references a parent.
+/// QCOW2 reader backed by a generic [`fs_core::BlockDevice`]. May own a
+/// recursive backing-file reader if the image references a parent.
 ///
-/// Implements [`fs_core::BlockRead`] so the reader can be handed directly to
-/// any consumer that takes a `BlockRead` — partition probes, filesystem
-/// drivers, slice decorators. The inherent [`Qcow2Reader::read_at`] keeps
-/// the rich [`Error`] type for callers that want to match on specific
-/// failure modes.
+/// Implements [`fs_core::BlockRead`] / [`fs_core::BlockDevice`] so the
+/// reader can be handed straight to any consumer that takes those traits
+/// — partition probes, filesystem drivers, slice decorators. The
+/// inherent [`Qcow2Reader::read_at`] / [`Qcow2Reader::write_at`] keep the
+/// rich [`Error`] type for callers that want to match on specific failure
+/// modes.
 pub struct Qcow2Reader {
-    file: Mutex<File>,
+    /// Backing block device. All host-offset reads/writes go through here.
+    /// `Arc<dyn BlockDevice>` because `BlockDevice` is `Send + Sync` and
+    /// the reader may live behind an `Arc` itself (FFI handles).
+    dev: Arc<dyn BlockDevice>,
     header: Header,
     /// Cached L1 table. Always small (l1_size * 8 bytes). Mutex-wrapped
     /// because the writer mutates entries in place when allocating L2
@@ -81,7 +98,14 @@ impl Qcow2Reader {
     /// references a backing file, the parent is opened recursively (capped at
     /// [`MAX_BACKING_DEPTH`]).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_inner(path.as_ref(), false, MAX_BACKING_DEPTH)
+        let p = path.as_ref();
+        let dev = FileDevice::open(p).map_err(fs_core_to_qcow2_error)?;
+        Self::open_inner(
+            Arc::new(dev),
+            false,
+            MAX_BACKING_DEPTH,
+            Some(p.to_path_buf()),
+        )
     }
 
     /// Open `path` read-write. Backing parents (if any) are still opened
@@ -94,7 +118,14 @@ impl Qcow2Reader {
     /// updates return `Error::Unsupported(...)`. See `write_at` for the
     /// exact rejection list.
     pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_inner(path.as_ref(), true, MAX_BACKING_DEPTH)
+        let p = path.as_ref();
+        let dev = FileDevice::open_rw(p).map_err(fs_core_to_qcow2_error)?;
+        Self::open_inner(
+            Arc::new(dev),
+            true,
+            MAX_BACKING_DEPTH,
+            Some(p.to_path_buf()),
+        )
     }
 
     /// Open read-write if possible, fall back to read-only otherwise.
@@ -107,56 +138,89 @@ impl Qcow2Reader {
         }
     }
 
-    fn open_inner(path: &Path, writable: bool, depth_remaining: u32) -> Result<Self> {
+    /// Open read-only on top of an arbitrary `BlockDevice`. The on-device
+    /// path has no filesystem context, so an image that references a
+    /// backing file is rejected with `Error::Unsupported` — backing-chain
+    /// resolution requires the path-based entry points.
+    pub fn open_on_device(dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        Self::open_inner(dev, false, MAX_BACKING_DEPTH, None)
+    }
+
+    /// Open read-write on top of an arbitrary `BlockDevice`. The device
+    /// must report `is_writable()`; otherwise the call returns
+    /// `Error::ReadOnly`.
+    pub fn open_rw_on_device(dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        if !dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        Self::open_inner(dev, true, MAX_BACKING_DEPTH, None)
+    }
+
+    fn open_inner(
+        dev: Arc<dyn BlockDevice>,
+        writable: bool,
+        depth_remaining: u32,
+        parent_path: Option<PathBuf>,
+    ) -> Result<Self> {
         if depth_remaining == 0 {
             return Err(Error::BackingTooDeep);
         }
 
-        let mut file = if writable {
-            OpenOptions::new().read(true).write(true).open(path)?
-        } else {
-            File::open(path)?
-        };
-
-        let mut head_bytes = [0u8; 104];
-        file.seek(SeekFrom::Start(0))?;
-        let mut total = 0usize;
-        while total < head_bytes.len() {
-            match file.read(&mut head_bytes[total..])? {
-                0 => break,
-                n => total += n,
+        // Header: v2 stops at 72, v3 fixed fields at 104, v3 additional
+        // fields (compression_type at 104, then padding) extend further.
+        // Read 112 bytes so we always capture the compression_type byte
+        // for any v3 image that declared it.
+        let mut head_bytes = [0u8; 112];
+        match dev.read_at(0, &mut head_bytes) {
+            Ok(()) => {}
+            Err(fs_core::Error::ShortRead { got, .. }) if got >= 72 => {
+                // Tolerate device shorter than 112 bytes as long as we got
+                // the v2 minimum — Header::parse will reject if needed.
+                head_bytes[got..].fill(0);
             }
-        }
-        if total < 72 {
-            return Err(Error::Corrupt("file shorter than v2 header"));
+            Err(e) => return Err(fs_core_to_qcow2_error(e)),
         }
 
-        let header = Header::parse(&head_bytes[..total])?;
+        let header = Header::parse(&head_bytes[..])?;
         header.check_supported()?;
 
         let mut l1_bytes = vec![0u8; (header.l1_size as usize) * 8];
-        file.seek(SeekFrom::Start(header.l1_table_offset))?;
-        file.read_exact(&mut l1_bytes)?;
+        dev.read_at(header.l1_table_offset, &mut l1_bytes)
+            .map_err(fs_core_to_qcow2_error)?;
         let mut l1 = Vec::with_capacity(header.l1_size as usize);
         for chunk in l1_bytes.chunks_exact(8) {
             l1.push(u64::from_be_bytes(chunk.try_into().unwrap()));
         }
 
         let backing = if header.backing_file_size != 0 {
-            let backing_path = read_backing_path(&mut file, &header, path)?;
+            // Backing-chain resolution needs a real path so the parent can
+            // be opened by name. Reject when caller went through the
+            // on-device entry point.
+            let child_path = match &parent_path {
+                Some(p) => p.clone(),
+                None => {
+                    return Err(Error::Unsupported(
+                        "image references a backing file; open by path to resolve the chain",
+                    ));
+                }
+            };
+            let backing_path = read_backing_path(&dev, &header, &child_path)?;
             // Backing parents always open read-only — writes only land in
             // the leaf image's own cluster store.
+            let parent_dev =
+                FileDevice::open(&backing_path).map_err(fs_core_to_qcow2_error)?;
             Some(Box::new(Self::open_inner(
-                &backing_path,
+                Arc::new(parent_dev),
                 false,
                 depth_remaining - 1,
+                Some(backing_path),
             )?))
         } else {
             None
         };
 
         Ok(Self {
-            file: Mutex::new(file),
+            dev,
             header,
             l1: Mutex::new(l1),
             l2_cache: Mutex::new(None),
@@ -196,6 +260,20 @@ impl Qcow2Reader {
         self.writable
     }
 
+    // -- internal device adapters ------------------------------------------
+
+    fn dev_read(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        self.dev.read_at(off, buf).map_err(fs_core_to_qcow2_error)
+    }
+
+    fn dev_write(&self, off: u64, buf: &[u8]) -> Result<()> {
+        self.dev.write_at(off, buf).map_err(fs_core_to_qcow2_error)
+    }
+
+    fn dev_flush(&self) -> Result<()> {
+        self.dev.flush().map_err(fs_core_to_qcow2_error)
+    }
+
     /// Write to the image. Behaviour by cluster state:
     ///
     /// - **Allocated, uncompressed, single-ref**: direct write to the
@@ -212,7 +290,7 @@ impl Qcow2Reader {
     ///   decrement.
     ///
     /// Crash-safety ordering: refcount → data → metadata, with
-    /// `sync_data()` between each step. A crash mid-allocation may leak a
+    /// `dev.flush()` between each step. A crash mid-allocation may leak a
     /// cluster but never corrupts the image.
     ///
     /// Refused with [`Error::Unsupported`]:
@@ -243,14 +321,12 @@ impl Qcow2Reader {
             });
         }
 
-        // Snapshot safety: shared clusters (refcount > 1) need
-        // copy-on-write. Phase D will handle them; for now refuse the
-        // whole image up front so we never silently corrupt a snapshot.
-        if self.header.nb_snapshots > 0 {
-            return Err(Error::Unsupported(
-                "write to image with snapshots (no CoW for shared clusters yet)",
-            ));
-        }
+        // Snapshot safety is handled per-cluster below: a shared cluster
+        // (host refcount > 1) is CoW'd before the user payload lands. The
+        // image-wide `nb_snapshots > 0` check that Phase A used is gone —
+        // shared clusters can exist for reasons other than internal
+        // snapshots (e.g. external tooling), and the per-cluster check is
+        // what actually keeps snapshots intact.
 
         let cluster_size = self.header.cluster_size;
         let cluster_mask = cluster_size - 1;
@@ -266,11 +342,49 @@ impl Qcow2Reader {
 
             let map = self.lookup_cluster(cursor)?;
             match map {
-                ClusterMap::Plain { host_off } => {
-                    // Existing cluster: write through.
-                    let mut f = self.file.lock().unwrap();
-                    f.seek(SeekFrom::Start(host_off + in_cluster))?;
-                    f.write_all(src)?;
+                ClusterMap::Plain { host_off, copied } => {
+                    // COPIED bit (L2 bit 63) is the spec's promise that
+                    // refcount == 1, so we can write in place without
+                    // touching the refcount table. When it's clear we have
+                    // to consult the actual refcount: a value > 1 means
+                    // the cluster is shared (with an internal snapshot,
+                    // with another L2 entry, etc.) and writing through
+                    // would mutate the snapshot's view. In that case we
+                    // CoW: allocate a fresh cluster, duplicate the
+                    // contents, splice in the user payload, repoint L2,
+                    // then drop the old refcount.
+                    let needs_cow = if copied {
+                        false
+                    } else {
+                        self.read_refcount(host_off)? > 1
+                    };
+                    if !needs_cow {
+                        self.dev_write(host_off + in_cluster, src)?;
+                    } else {
+                        let virt_cluster = cursor / cluster_size;
+                        let mut full = vec![0u8; cluster_size as usize];
+                        self.dev_read(host_off, &mut full)?;
+                        full[in_cluster as usize..in_cluster as usize + chunk]
+                            .copy_from_slice(src);
+
+                        // Crash-safety order:
+                        //   data → refcount(new=1) → L2 → refcount(old-1).
+                        // allocate_cluster already wrote refcount=1 for
+                        // the new cluster; the data write follows; only
+                        // after L2 is repointed do we drop the old refcount.
+                        let new_host = self.allocate_cluster()?;
+                        self.dev_write(new_host, &full)?;
+                        self.dev_flush()?;
+                        let l1_idx = (virt_cluster / l2_entries) as u32;
+                        let l2_idx = (virt_cluster % l2_entries) as u32;
+                        let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
+                        self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
+
+                        // Drop the snapshot's outstanding share by 1.
+                        // Failure here leaks one refcount but never
+                        // corrupts data — fsck-recoverable.
+                        let _ = self.decrement_refcount(host_off);
+                    }
                 }
                 ClusterMap::Compressed { host_off, byte_len } => {
                     // Read+decompress the existing cluster, splice in the
@@ -285,12 +399,8 @@ impl Qcow2Reader {
                     full[in_cluster as usize..in_cluster as usize + chunk].copy_from_slice(src);
 
                     let new_host = self.allocate_cluster()?;
-                    {
-                        let mut f = self.file.lock().unwrap();
-                        f.seek(SeekFrom::Start(new_host))?;
-                        f.write_all(&full)?;
-                        f.sync_data()?;
-                    }
+                    self.dev_write(new_host, &full)?;
+                    self.dev_flush()?;
                     let l1_idx = (virt_cluster / l2_entries) as u32;
                     let l2_idx = (virt_cluster % l2_entries) as u32;
                     let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
@@ -307,12 +417,8 @@ impl Qcow2Reader {
                     // it.
                     let new_host = self.allocate_cluster()?;
                     self.zero_cluster(new_host)?;
-                    {
-                        let mut f = self.file.lock().unwrap();
-                        f.seek(SeekFrom::Start(new_host + in_cluster))?;
-                        f.write_all(src)?;
-                        f.sync_data()?;
-                    }
+                    self.dev_write(new_host + in_cluster, src)?;
+                    self.dev_flush()?;
                     let virt_cluster = cursor / cluster_size;
                     let l1_idx = (virt_cluster / l2_entries) as u32;
                     let l2_idx = (virt_cluster % l2_entries) as u32;
@@ -327,14 +433,29 @@ impl Qcow2Reader {
         Ok(())
     }
 
-    /// Find a host cluster with refcount = 0 in an existing refcount
-    /// block, increment it to 1, and return the cluster's host byte
-    /// offset. Refcount-block writes are `sync_data`-flushed before
-    /// returning so the claim is durable.
+    /// Find a host cluster with refcount = 0, increment it to 1, and
+    /// return the cluster's host byte offset.
     ///
-    /// Errors with `Unsupported` when the image has no refcount table,
-    /// uses a non-u16 refcount width, or every populated refcount block
-    /// is full (Phase D handles allocating new refcount blocks).
+    /// Three fast paths in order:
+    /// 1. Free entry inside an already-present refcount block — claim it.
+    /// 2. A refcount-table slot points to no block (`block_off == 0`) —
+    ///    allocate a fresh host cluster for that block, point the table
+    ///    entry at it, then claim a free entry inside it.
+    /// 3. Every populated block is full and there is no empty slot — we
+    ///    grow at the tail by recycling cluster `host_cluster_idx == 0`'s
+    ///    spare scan: in practice every refcount table sized for the
+    ///    underlying device has spare entries, and the case that lands
+    ///    here is "refcount table itself is too small". That requires
+    ///    refcount-table reallocation, which is intentionally out of
+    ///    scope; surfaces as `Unsupported`.
+    ///
+    /// Crash-safety order for the new-block path:
+    ///   data (zeroed block) → block-with-self-ref=1 → refcount-table-entry
+    /// with `dev_flush` between each step. A crash mid-sequence may leak
+    /// one host cluster but never corrupts the image.
+    ///
+    /// Errors with `Unsupported` when the image has no refcount table or
+    /// uses a non-u16 refcount width.
     fn allocate_cluster(&self) -> Result<u64> {
         let cluster_size = self.header.cluster_size;
         let refcount_bits = if self.header.version >= 3 {
@@ -359,30 +480,27 @@ impl Qcow2Reader {
         }
         let rt_size = rt_clusters * cluster_size;
         let mut rt_bytes = vec![0u8; rt_size as usize];
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(rt_off))?;
-            f.read_exact(&mut rt_bytes)?;
-        }
+        self.dev_read(rt_off, &mut rt_bytes)?;
 
         let rt_entries_total = (rt_size / 8) as usize;
 
+        // Pass 1: walk the table. For each present block try to claim a
+        // free slot. Remember the first absent slot in case pass 1 yields
+        // nothing.
+        let mut first_empty_block_slot: Option<usize> = None;
         for block_idx in 0..rt_entries_total {
             let entry_off = block_idx * 8;
             let block_off =
                 u64::from_be_bytes(rt_bytes[entry_off..entry_off + 8].try_into().unwrap());
             if block_off == 0 {
-                // Refcount block not present for this range. Allocating
-                // a new block is Phase D — skip for now.
+                if first_empty_block_slot.is_none() {
+                    first_empty_block_slot = Some(block_idx);
+                }
                 continue;
             }
 
             let mut block_bytes = vec![0u8; cluster_size as usize];
-            {
-                let mut f = self.file.lock().unwrap();
-                f.seek(SeekFrom::Start(block_off))?;
-                f.read_exact(&mut block_bytes)?;
-            }
+            self.dev_read(block_off, &mut block_bytes)?;
 
             for entry_idx in 0..entries_per_block as usize {
                 let off = entry_idx * 2;
@@ -393,20 +511,54 @@ impl Qcow2Reader {
                     let host_off = host_cluster_idx * cluster_size;
 
                     block_bytes[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
-                    {
-                        let mut f = self.file.lock().unwrap();
-                        f.seek(SeekFrom::Start(block_off))?;
-                        f.write_all(&block_bytes)?;
-                        f.sync_data()?;
-                    }
+                    self.dev_write(block_off, &block_bytes)?;
+                    self.dev_flush()?;
                     return Ok(host_off);
                 }
             }
         }
 
-        Err(Error::Unsupported(
-            "no free clusters in existing refcount blocks",
-        ))
+        // Pass 2: every present block is full. Grow into the first absent
+        // refcount-table slot by allocating a fresh refcount block.
+        let block_idx = first_empty_block_slot.ok_or(Error::Unsupported(
+            "refcount table is full and every block is full (refcount-table grow not implemented)",
+        ))?;
+
+        // Place the new refcount block at the device's current tail. The
+        // host cluster we pick is the one immediately past the highest
+        // cluster index covered by any populated entry — i.e. one slot past
+        // the last seen block. That corresponds to host_cluster_idx =
+        // block_idx * entries_per_block (the very first entry the new
+        // block manages), which lets the new block point at *itself* with
+        // refcount = 1 and claim a fresh host cluster from its own range
+        // for the caller.
+        //
+        // Concretely: the new refcount block lives at host cluster idx
+        // `new_block_cluster`, which is the first entry inside the slot it
+        // governs. That cluster's self-entry within the new block is at
+        // entry_idx 0; mark it refcount=1. Then pick entry_idx 1 for the
+        // caller's data cluster, mark refcount=1, and return its offset.
+        let new_block_cluster = (block_idx as u64) * entries_per_block;
+        let new_block_off = new_block_cluster * cluster_size;
+        let caller_cluster_idx = new_block_cluster + 1;
+        let caller_off = caller_cluster_idx * cluster_size;
+
+        // Step 1: zero-init the new refcount block on disk, then mark
+        // its first two entries (self + caller) as refcount=1.
+        let mut new_block_bytes = vec![0u8; cluster_size as usize];
+        new_block_bytes[0..2].copy_from_slice(&1u16.to_be_bytes());
+        new_block_bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
+        self.dev_write(new_block_off, &new_block_bytes)?;
+        self.dev_flush()?;
+
+        // Step 2: publish the new block's address into the refcount-table
+        // entry. After this flush the block is reachable; if we crash
+        // before it the only loss is two host clusters at a known offset.
+        let entry_off_in_rt = (block_idx as u64) * 8;
+        self.dev_write(rt_off + entry_off_in_rt, &new_block_off.to_be_bytes())?;
+        self.dev_flush()?;
+
+        Ok(caller_off)
     }
 
     /// Decrement the refcount of the host cluster containing `host_off`.
@@ -453,11 +605,7 @@ impl Qcow2Reader {
         }
 
         let mut rt_entry_bytes = [0u8; 8];
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(rt_off + block_idx * 8))?;
-            f.read_exact(&mut rt_entry_bytes)?;
-        }
+        self.dev_read(rt_off + block_idx * 8, &mut rt_entry_bytes)?;
         let block_off = u64::from_be_bytes(rt_entry_bytes);
         if block_off == 0 {
             return Err(Error::Corrupt(
@@ -466,11 +614,7 @@ impl Qcow2Reader {
         }
 
         let mut block_bytes = vec![0u8; cluster_size as usize];
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(block_off))?;
-            f.read_exact(&mut block_bytes)?;
-        }
+        self.dev_read(block_off, &mut block_bytes)?;
 
         let off = (entry_idx as usize) * 2;
         let cur = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
@@ -482,25 +626,70 @@ impl Qcow2Reader {
         let new_refcount = cur - 1;
         block_bytes[off..off + 2].copy_from_slice(&new_refcount.to_be_bytes());
 
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(block_off))?;
-            f.write_all(&block_bytes)?;
-            f.sync_data()?;
-        }
+        self.dev_write(block_off, &block_bytes)?;
+        self.dev_flush()?;
         Ok(())
     }
 
-    /// Write `cluster_size` zero bytes to `host_off` and `sync_data`.
+    /// Read the refcount of the host cluster containing `host_off`.
+    /// Mirror of [`Qcow2Reader::decrement_refcount`] but read-only — used
+    /// to decide whether a write needs copy-on-write before touching a
+    /// shared cluster.
+    ///
+    /// Returns 0 when the refcount block isn't allocated for this range
+    /// (treats absence as "no share to worry about" — the cluster also
+    /// isn't really live, and the caller will alloc fresh either way).
+    fn read_refcount(&self, host_off: u64) -> Result<u16> {
+        let cluster_size = self.header.cluster_size;
+        let refcount_bits = if self.header.version >= 3 {
+            1u32 << self.header.refcount_order
+        } else {
+            16
+        };
+        if refcount_bits != 16 {
+            return Err(Error::Unsupported(
+                "non-16-bit refcount entries (refcount_order != 4)",
+            ));
+        }
+        let entries_per_block = cluster_size / 2;
+
+        let host_cluster_idx = host_off / cluster_size;
+        let block_idx = host_cluster_idx / entries_per_block;
+        let entry_idx = host_cluster_idx % entries_per_block;
+
+        let rt_off = self.header.refcount_table_offset;
+        let rt_clusters = self.header.refcount_table_clusters as u64;
+        if rt_off == 0 || rt_clusters == 0 {
+            return Err(Error::Unsupported(
+                "no refcount table (cannot read refcount)",
+            ));
+        }
+        let rt_size = rt_clusters * cluster_size;
+        if block_idx * 8 >= rt_size {
+            return Ok(0);
+        }
+
+        let mut rt_entry_bytes = [0u8; 8];
+        self.dev_read(rt_off + block_idx * 8, &mut rt_entry_bytes)?;
+        let block_off = u64::from_be_bytes(rt_entry_bytes);
+        if block_off == 0 {
+            return Ok(0);
+        }
+
+        let off_in_block = (entry_idx as usize) * 2;
+        let mut entry_bytes = [0u8; 2];
+        self.dev_read(block_off + off_in_block as u64, &mut entry_bytes)?;
+        Ok(u16::from_be_bytes(entry_bytes))
+    }
+
+    /// Write `cluster_size` zero bytes to `host_off` and flush.
     /// Used to initialise a freshly-allocated cluster before the user's
     /// payload lands inside it.
     fn zero_cluster(&self, host_off: u64) -> Result<()> {
         let cluster_size = self.header.cluster_size as usize;
         let zeros = vec![0u8; cluster_size];
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(host_off))?;
-        f.write_all(&zeros)?;
-        f.sync_data()?;
+        self.dev_write(host_off, &zeros)?;
+        self.dev_flush()?;
         Ok(())
     }
 
@@ -523,21 +712,13 @@ impl Qcow2Reader {
 
         let cluster_size = self.header.cluster_size as usize;
         let mut l2_bytes = vec![0u8; cluster_size];
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(l2_table_off))?;
-            f.read_exact(&mut l2_bytes)?;
-        }
+        self.dev_read(l2_table_off, &mut l2_bytes)?;
 
         let off = (l2_idx as usize) * 8;
         l2_bytes[off..off + 8].copy_from_slice(&new_entry.to_be_bytes());
 
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(l2_table_off))?;
-            f.write_all(&l2_bytes)?;
-            f.sync_data()?;
-        }
+        self.dev_write(l2_table_off, &l2_bytes)?;
+        self.dev_flush()?;
 
         // Invalidate caches keyed off this L2 cluster.
         *self.l2_cache.lock().unwrap() = None;
@@ -550,10 +731,7 @@ impl Qcow2Reader {
         if !self.writable {
             return Ok(());
         }
-        let mut f = self.file.lock().unwrap();
-        f.flush()?;
-        f.sync_data()?;
-        Ok(())
+        self.dev_flush()
     }
 
     /// Allocate a host cluster, zero-initialise it, and point L1 at it as
@@ -575,12 +753,8 @@ impl Qcow2Reader {
             return Err(Error::Corrupt("l1_idx out of range"));
         }
         let l1_offset_on_disk = self.header.l1_table_offset + (l1_idx as u64) * 8;
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(l1_offset_on_disk))?;
-            f.write_all(&new_entry.to_be_bytes())?;
-            f.sync_data()?;
-        }
+        self.dev_write(l1_offset_on_disk, &new_entry.to_be_bytes())?;
+        self.dev_flush()?;
         l1[l1_idx as usize] = new_entry;
         Ok(())
     }
@@ -616,10 +790,8 @@ impl Qcow2Reader {
             let dst = &mut buf[written..written + chunk];
 
             match map {
-                ClusterMap::Plain { host_off } => {
-                    let mut f = self.file.lock().unwrap();
-                    f.seek(SeekFrom::Start(host_off + in_cluster))?;
-                    f.read_exact(dst)?;
+                ClusterMap::Plain { host_off, .. } => {
+                    self.dev_read(host_off + in_cluster, dst)?;
                 }
                 ClusterMap::Compressed { host_off, byte_len } => {
                     let virt_cluster = cursor / cluster_size;
@@ -705,7 +877,11 @@ impl Qcow2Reader {
         if host == 0 {
             return Ok(ClusterMap::Unallocated);
         }
-        Ok(ClusterMap::Plain { host_off: host })
+        let copied = l2_entry & L2_FLAG_COPIED != 0;
+        Ok(ClusterMap::Plain {
+            host_off: host,
+            copied,
+        })
     }
 
     fn read_l2_entry(&self, l1_index: u32, l2_table_off: u64, l2_index: u32) -> Result<u64> {
@@ -719,9 +895,7 @@ impl Qcow2Reader {
 
         if need_load {
             let mut buf = vec![0u8; cluster_size];
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(l2_table_off))?;
-            f.read_exact(&mut buf)?;
+            self.dev_read(l2_table_off, &mut buf)?;
             *cache = Some((l1_index, buf));
         }
 
@@ -756,18 +930,44 @@ impl Qcow2Reader {
 
         // Read compressed bytes.
         let mut compressed = vec![0u8; byte_len];
-        {
-            let mut f = self.file.lock().unwrap();
-            f.seek(SeekFrom::Start(host_off))?;
-            f.read_exact(&mut compressed)?;
-        }
+        self.dev_read(host_off, &mut compressed)?;
 
-        // Raw deflate (no zlib header) per qcow2 spec.
-        let mut decoder = DeflateDecoder::new(&compressed[..]);
+        // Dispatch on the v3 compression_type field. 0 = zlib (raw
+        // deflate per the qcow2 spec — no zlib header), 1 = zstd. v2
+        // images leave the field at the default 0.
         let mut decoded = vec![0u8; cluster_size];
-        decoder
-            .read_exact(&mut decoded)
-            .map_err(|e| Error::Decompress(e.to_string()))?;
+        match self.header.compression_type {
+            0 => {
+                let mut decoder = DeflateDecoder::new(&compressed[..]);
+                decoder
+                    .read_exact(&mut decoded)
+                    .map_err(|e| Error::Decompress(e.to_string()))?;
+            }
+            1 => {
+                // ruzstd's StreamingDecoder reads one or more zstd frames
+                // and yields the decoded byte stream. read_to_end is
+                // used (not read_exact) because zstd frames know their
+                // own decompressed length; we then check it matches the
+                // cluster size we expected.
+                let mut decoder = ruzstd::decoding::StreamingDecoder::new(&compressed[..])
+                    .map_err(|e| Error::Decompress(e.to_string()))?;
+                let mut out = Vec::with_capacity(cluster_size);
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(|e| Error::Decompress(e.to_string()))?;
+                if out.len() != cluster_size {
+                    return Err(Error::Decompress(format!(
+                        "zstd frame produced {} bytes, expected {}",
+                        out.len(),
+                        cluster_size
+                    )));
+                }
+                decoded.copy_from_slice(&out);
+            }
+            _ => {
+                return Err(Error::Unsupported("unknown compression_type"));
+            }
+        }
 
         dst.copy_from_slice(&decoded[skip..skip + dst.len()]);
 
@@ -795,14 +995,18 @@ fn decode_compressed_descriptor(entry: u64, cluster_bits: u32) -> (u64, usize) {
 
 /// Read the backing-file path from the header and resolve it relative to the
 /// child image's directory if it isn't absolute.
-fn read_backing_path(file: &mut File, header: &Header, child_path: &Path) -> Result<PathBuf> {
+fn read_backing_path(
+    dev: &Arc<dyn BlockDevice>,
+    header: &Header,
+    child_path: &Path,
+) -> Result<PathBuf> {
     let len = header.backing_file_size as usize;
     if len > 1024 {
         return Err(Error::Corrupt("backing_file_size > 1024 bytes"));
     }
     let mut bytes = vec![0u8; len];
-    file.seek(SeekFrom::Start(header.backing_file_offset))?;
-    file.read_exact(&mut bytes)?;
+    dev.read_at(header.backing_file_offset, &mut bytes)
+        .map_err(fs_core_to_qcow2_error)?;
     let s = std::str::from_utf8(&bytes).map_err(|_| Error::BadBackingPath)?;
     let p = Path::new(s);
     if p.is_absolute() {
@@ -854,5 +1058,20 @@ fn qcow2_to_fs_core_error(e: Error) -> fs_core::Error {
         }
         Error::ReadOnly => fs_core::Error::ReadOnly,
         other => fs_core::Error::Custom(other.to_string()),
+    }
+}
+
+fn fs_core_to_qcow2_error(e: fs_core::Error) -> Error {
+    match e {
+        fs_core::Error::Io(io) => Error::Io(io),
+        fs_core::Error::ShortRead { offset, want, got } => Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("short read at {offset}: wanted {want} got {got}"),
+        )),
+        fs_core::Error::ReadOnly => Error::ReadOnly,
+        fs_core::Error::OutOfBounds { offset, len, size } => {
+            Error::OutOfBounds { offset, len, size }
+        }
+        fs_core::Error::Custom(s) => Error::Decompress(s),
     }
 }

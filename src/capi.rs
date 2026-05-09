@@ -37,6 +37,70 @@ pub unsafe extern "C" fn qcow2_open_rw(path: *const c_char) -> *mut FsCoreDevice
     open_path(path, true)
 }
 
+/// Open a QCOW2 image whose backing storage is an existing
+/// [`FsCoreDevice`] handle. Use this when the caller already holds the
+/// device (e.g. an FSKit `FSBlockDeviceResource` lifted into an
+/// `FsCoreDevice` via `fs_core_device_from_callbacks`) and wants the
+/// qcow2 layer to sit on top of it.
+///
+/// Takes ownership of the input `inner` handle on success — the caller
+/// must NOT call `fs_core_device_close` on it afterwards. On failure the
+/// input is freed automatically and the function returns NULL.
+///
+/// Backing-file resolution is unavailable through this entry point
+/// because there is no path to anchor a relative parent against; an
+/// image with `backing_file_size != 0` is rejected with
+/// `FS_CORE_CUSTOM`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qcow2_open_on_device(inner: *mut FsCoreDevice) -> *mut FsCoreDevice {
+    unsafe { open_on_device(inner, false) }
+}
+
+/// Read-write variant of [`qcow2_open_on_device`]. The input device must
+/// report `is_writable()`; otherwise the open fails with
+/// `FS_CORE_READ_ONLY` and the input is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qcow2_open_rw_on_device(inner: *mut FsCoreDevice) -> *mut FsCoreDevice {
+    unsafe { open_on_device(inner, true) }
+}
+
+unsafe fn open_on_device(inner: *mut FsCoreDevice, writable: bool) -> *mut FsCoreDevice {
+    if inner.is_null() {
+        set_last_error("inner device handle is null");
+        return ptr::null_mut();
+    }
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // Reclaim ownership of the boxed handle; Arc::clone the inner
+        // device so we can stack it under the qcow2 reader. The original
+        // handle box is dropped at the end of this scope (releasing the
+        // FsCoreDevice wrapper), but the underlying Arc<dyn BlockDevice>
+        // lives on inside the new Qcow2Reader.
+        let boxed = unsafe { Box::from_raw(inner) };
+        let dev_arc = boxed.inner().clone();
+        drop(boxed);
+
+        let reader = if writable {
+            Qcow2Reader::open_rw_on_device(dev_arc)
+        } else {
+            Qcow2Reader::open_on_device(dev_arc)
+        };
+        match reader {
+            Ok(r) => FsCoreDevice::into_handle(Arc::new(r)),
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    }));
+    match res {
+        Ok(p) => p,
+        Err(_) => {
+            set_last_error("panic in qcow2_open_on_device");
+            ptr::null_mut()
+        }
+    }
+}
+
 fn open_path(path: *const c_char, writable: bool) -> *mut FsCoreDevice {
     if path.is_null() {
         set_last_error("path is null");
@@ -214,5 +278,96 @@ mod tests {
             fs_core_device_close(h);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_on_device_stacks_qcow2_over_arbitrary_fs_core_device() {
+        use fs_core::ffi::fs_core_file_open;
+
+        let path = tmp_path("on_device_smoke");
+        build_image(&path);
+        let cpath = CString::new(path.to_string_lossy().to_string()).unwrap();
+
+        // Open the file as a generic FsCoreDevice, then stack the qcow2
+        // reader on top via the device-based entry point.
+        let inner = unsafe { fs_core_file_open(cpath.as_ptr(), false) };
+        assert!(!inner.is_null(), "fs_core_file_open returned NULL");
+
+        let h = unsafe { qcow2_open_on_device(inner) };
+        assert!(!h.is_null(), "qcow2_open_on_device returned NULL");
+
+        unsafe {
+            assert_eq!(fs_core_device_size_bytes(h), 16384);
+
+            let mut buf = [0u8; 4096];
+            let rc = fs_core_device_read_at(h, 0, buf.as_mut_ptr(), buf.len());
+            assert_eq!(rc, FsCoreErrorCode::Ok);
+            assert!(buf.iter().all(|&b| b == 0xAA));
+
+            fs_core_device_close(h);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rw_on_device_supports_writes() {
+        use fs_core::ffi::{
+            fs_core_device_flush, fs_core_device_is_writable, fs_core_device_write_at,
+            fs_core_file_open,
+        };
+
+        let path = tmp_path("rw_on_device_smoke");
+        build_image(&path);
+        let cpath = CString::new(path.to_string_lossy().to_string()).unwrap();
+
+        let inner = unsafe { fs_core_file_open(cpath.as_ptr(), true) };
+        assert!(!inner.is_null());
+
+        let h = unsafe { qcow2_open_rw_on_device(inner) };
+        assert!(!h.is_null(), "qcow2_open_rw_on_device returned NULL");
+
+        unsafe {
+            assert!(fs_core_device_is_writable(h));
+            let payload = [0xCAu8, 0xFE, 0xBA, 0xBE];
+            let rc = fs_core_device_write_at(h, 100, payload.as_ptr(), payload.len());
+            assert_eq!(rc, FsCoreErrorCode::Ok);
+            assert_eq!(fs_core_device_flush(h), FsCoreErrorCode::Ok);
+
+            let mut readback = [0u8; 4];
+            let rc = fs_core_device_read_at(h, 100, readback.as_mut_ptr(), readback.len());
+            assert_eq!(rc, FsCoreErrorCode::Ok);
+            assert_eq!(readback, payload);
+
+            fs_core_device_close(h);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rw_on_device_rejects_readonly_inner() {
+        use fs_core::ffi::fs_core_file_open;
+
+        let path = tmp_path("ro_inner");
+        build_image(&path);
+        let cpath = CString::new(path.to_string_lossy().to_string()).unwrap();
+
+        // Open the file RO, then try to wrap it with qcow2 RW — the
+        // wrapper must refuse so callers don't silently get a useless
+        // handle.
+        let inner = unsafe { fs_core_file_open(cpath.as_ptr(), false) };
+        assert!(!inner.is_null());
+
+        let h = unsafe { qcow2_open_rw_on_device(inner) };
+        assert!(h.is_null(), "expected NULL when wrapping a RO device RW");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_on_device_null_input_returns_null() {
+        let h = unsafe { qcow2_open_on_device(std::ptr::null_mut()) };
+        assert!(h.is_null());
+        let msg = fs_core_last_error_message();
+        assert!(!msg.is_null());
     }
 }

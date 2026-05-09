@@ -692,12 +692,32 @@ fn write_into_unallocated_l1_entry_allocates_l2_table() {
 }
 
 #[test]
-fn write_with_no_free_clusters_errors() {
-    let path = tmp_path("write_full");
+fn write_grows_refcount_block() {
+    // Phase 5a: when every populated refcount block is full, the writer
+    // must allocate a fresh refcount block, point the next free slot in
+    // the refcount table at it, then claim a host cluster from it. The
+    // fixture has a 1-cluster refcount table (512 entries, each
+    // governing one block of 2048 host clusters), but only the first
+    // entry is populated. Filling that block forces the writer down the
+    // grow path.
+    let path = tmp_path("write_grow_refcount");
     build_image(&path);
 
-    // Mark every refcount entry in the block as used so the allocator
-    // can't find a free cluster.
+    // Grow the file enough that the new refcount block + a fresh data
+    // cluster have somewhere to land. The grow path places the new
+    // block at host cluster idx (block_slot * entries_per_block) =
+    // 1 * 2048 = 2048, so the file must be at least 2050 clusters long.
+    {
+        use std::fs::OpenOptions;
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(CLUSTER_SIZE * 2100).unwrap();
+    }
+
+    // Mark every refcount entry in the existing block as used.
     {
         use std::fs::OpenOptions;
         use std::io::{Seek, SeekFrom, Write};
@@ -714,12 +734,41 @@ fn write_with_no_free_clusters_errors() {
         f.write_all(&full).unwrap();
     }
 
-    let r = Qcow2Reader::open_rw(&path).unwrap();
-    match r.write_at(4096, &[0xFFu8; 4]) {
-        Err(qcow2::Error::Unsupported(s)) => {
-            assert!(s.contains("no free clusters"), "got: {s}");
-        }
-        other => panic!("expected Unsupported(no free clusters), got {other:?}"),
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        // virt cluster 1 is unallocated — write triggers allocation,
+        // which now succeeds via refcount-block growth.
+        r.write_at(4096 + 100, &[0xAB, 0xCD, 0xEF]).unwrap();
+        r.flush().unwrap();
+    }
+
+    // Re-open RO and confirm the bytes round-trip.
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = [0u8; 3];
+    r.read_at(4096 + 100, &mut buf).unwrap();
+    assert_eq!(buf, [0xAB, 0xCD, 0xEF]);
+
+    // Confirm the new refcount block self-references with refcount=1.
+    // Per the grow logic the new block lives at host cluster 2048 (slot
+    // 1 of the refcount table * 2048 entries per block).
+    {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+        // Refcount-table slot 1 should now point at cluster 2048.
+        f.seek(SeekFrom::Start(REFCOUNT_TABLE_OFFSET + 8)).unwrap();
+        let mut entry = [0u8; 8];
+        f.read_exact(&mut entry).unwrap();
+        let block_off = u64::from_be_bytes(entry);
+        assert_eq!(block_off, CLUSTER_SIZE * 2048);
+
+        // First two entries of the new block should both read as 1
+        // (self-reference + the caller's data cluster).
+        f.seek(SeekFrom::Start(block_off)).unwrap();
+        let mut head = [0u8; 4];
+        f.read_exact(&mut head).unwrap();
+        assert_eq!(u16::from_be_bytes([head[0], head[1]]), 1);
+        assert_eq!(u16::from_be_bytes([head[2], head[3]]), 1);
     }
 
     let _ = std::fs::remove_file(&path);
@@ -802,34 +851,301 @@ fn open_rw_then_read_through_fs_core_blockdevice() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5b: snapshot-aware copy-on-write
+//
+// The check is per-cluster, not per-image: a write to a cluster whose host
+// refcount > 1 must clone the cluster before mutating it, so the snapshot's
+// view stays untouched. We simulate a snapshot by bumping the refcount of
+// virt-cluster-0's host cluster to 2.
+// ---------------------------------------------------------------------------
+
+/// Bump the on-disk refcount of `host_cluster_idx` by `delta`. Used to
+/// simulate the effect of taking an internal snapshot — every L2-referenced
+/// cluster's refcount goes up by 1 when a snapshot lands.
+fn bump_refcount(path: &PathBuf, refcount_block_off: u64, host_cluster_idx: usize, delta: u16) {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let off = refcount_block_off + (host_cluster_idx as u64) * 2;
+    f.seek(SeekFrom::Start(off)).unwrap();
+    let mut cur = [0u8; 2];
+    f.read_exact(&mut cur).unwrap();
+    let new = u16::from_be_bytes(cur) + delta;
+    f.seek(SeekFrom::Start(off)).unwrap();
+    f.write_all(&new.to_be_bytes()).unwrap();
+}
+
+/// Clear the COPIED bit (bit 63) on virt cluster 0's L2 entry. qemu does
+/// this for every L2 entry in the image when a snapshot lands, signalling
+/// that the cluster is now shared and writes need CoW.
+fn clear_copied_l2_entry_0(path: &PathBuf) {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.seek(SeekFrom::Start(L2_OFFSET)).unwrap();
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf).unwrap();
+    let mut entry = u64::from_be_bytes(buf);
+    entry &= !(1u64 << 63);
+    f.seek(SeekFrom::Start(L2_OFFSET)).unwrap();
+    f.write_all(&entry.to_be_bytes()).unwrap();
+}
+
+/// Read the L2 entry for virt cluster 0 from the synthetic image. Used to
+/// confirm that the writer repointed L2 at a fresh host cluster (CoW)
+/// rather than mutating the shared one.
+fn read_l2_entry_0(path: &PathBuf) -> u64 {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = OpenOptions::new().read(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(L2_OFFSET)).unwrap();
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf).unwrap();
+    u64::from_be_bytes(buf)
+}
+
+/// Read a u16 refcount entry at the given host cluster index from the
+/// synthetic refcount block.
+fn read_refcount_entry(path: &PathBuf, refcount_block_off: u64, host_cluster_idx: u64) -> u16 {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = OpenOptions::new().read(true).open(path).unwrap();
+    let off = refcount_block_off + host_cluster_idx * 2;
+    f.seek(SeekFrom::Start(off)).unwrap();
+    let mut buf = [0u8; 2];
+    f.read_exact(&mut buf).unwrap();
+    u16::from_be_bytes(buf)
+}
+
 #[test]
-fn snapshots_present_blocks_writes_phase_a() {
-    // Build a near-copy of build_image but with nb_snapshots set to 1 in
-    // the header. We don't need a real snapshot table for the check — the
-    // header field alone makes Phase A refuse.
-    let path = tmp_path("write_snap");
+fn write_to_shared_cluster_clones_via_cow() {
+    // virt cluster 0 starts pointed at host cluster 3 (DATA0_OFFSET).
+    // Bumping that host cluster's refcount to 2 simulates a snapshot
+    // referencing the same data. The next write must NOT mutate cluster
+    // 3 in place — it must allocate a fresh cluster, copy the existing
+    // data into it, splice in the user payload, repoint L2 there, and
+    // drop cluster 3's refcount back to 1.
+    let path = tmp_path("cow_clone");
     build_image(&path);
 
-    // Patch nb_snapshots = 1 directly (offset 60..64, big-endian).
+    // Cluster 3 (DATA0_OFFSET / CLUSTER_SIZE) currently has refcount=1.
+    // Bump to 2 and clear the L2 entry's COPIED bit to mimic the on-disk
+    // state qemu produces when an internal snapshot lands.
+    bump_refcount(&path, REFCOUNT_BLOCK_OFFSET, 3, 1);
+    assert_eq!(read_refcount_entry(&path, REFCOUNT_BLOCK_OFFSET, 3), 2);
+    clear_copied_l2_entry_0(&path);
+
+    let original_l2 = read_l2_entry_0(&path);
+
     {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        f.seek(SeekFrom::Start(60)).unwrap();
-        f.write_all(&1u32.to_be_bytes()).unwrap();
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        r.write_at(64, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        r.flush().unwrap();
     }
 
-    let r = Qcow2Reader::open_rw(&path).unwrap();
-    match r.write_at(64, &[0x11; 4]) {
-        Err(qcow2::Error::Unsupported(s)) => {
-            assert!(s.contains("snapshots"), "got: {s}");
-        }
-        other => panic!("expected Unsupported(snapshots), got {other:?}"),
+    // L2 entry must now point at a NEW host cluster, not cluster 3.
+    let new_l2 = read_l2_entry_0(&path);
+    assert_ne!(
+        new_l2 & 0x00ff_ffff_ffff_fe00,
+        original_l2 & 0x00ff_ffff_ffff_fe00,
+        "L2 entry must be repointed at a fresh cluster after CoW"
+    );
+
+    // Old cluster's refcount drops back to 1 (the snapshot still holds it).
+    assert_eq!(
+        read_refcount_entry(&path, REFCOUNT_BLOCK_OFFSET, 3),
+        1,
+        "old cluster's refcount must drop by 1 after CoW"
+    );
+
+    // The new cluster's refcount should be 1.
+    let new_host_cluster_idx = (new_l2 & 0x00ff_ffff_ffff_fe00) / CLUSTER_SIZE;
+    assert_eq!(
+        read_refcount_entry(&path, REFCOUNT_BLOCK_OFFSET, new_host_cluster_idx),
+        1,
+        "freshly-allocated CoW cluster must have refcount=1"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn snapshot_view_unchanged_after_cow_write() {
+    // After the write CoW's the cluster, an outsider reading the OLD
+    // host cluster directly (the snapshot's view) must still see the
+    // original 0xAA bytes — the writer must not have touched it.
+    let path = tmp_path("cow_snap_view");
+    build_image(&path);
+    bump_refcount(&path, REFCOUNT_BLOCK_OFFSET, 3, 1);
+    clear_copied_l2_entry_0(&path);
+
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        r.write_at(64, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        r.flush().unwrap();
     }
+
+    // Read the original host cluster directly off disk (DATA0_OFFSET).
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start(DATA0_OFFSET)).unwrap();
+    let mut buf = vec![0u8; CLUSTER_SIZE as usize];
+    f.read_exact(&mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0xAA),
+        "snapshot's host cluster must remain untouched after CoW write"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn live_view_sees_cow_write() {
+    // Mirror of the previous test: the live image's view at virt 0 must
+    // reflect the new bytes (CoW means the writer points L2 at a fresh
+    // cluster carrying the spliced data).
+    let path = tmp_path("cow_live_view");
+    build_image(&path);
+    bump_refcount(&path, REFCOUNT_BLOCK_OFFSET, 3, 1);
+    clear_copied_l2_entry_0(&path);
+
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        r.write_at(64, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        r.flush().unwrap();
+    }
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = [0u8; 8];
+    r.read_at(60, &mut buf).unwrap();
+    assert_eq!(buf, [0xAA, 0xAA, 0xAA, 0xAA, 0x11, 0x22, 0x33, 0x44]);
+
+    // Bytes outside the spliced range stay 0xAA — proves the rest of
+    // the cluster was copied verbatim from the original.
+    let mut tail = [0u8; 4];
+    r.read_at(72, &mut tail).unwrap();
+    assert_eq!(tail, [0xAA; 4]);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5c: zstd-compressed clusters
+// ---------------------------------------------------------------------------
+
+/// Bit 3 of `incompatible_features` — the spec mandates it when
+/// `compression_type != 0`.
+const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
+
+/// Build a qcow2 v3 image whose virt cluster 0 holds a *zstd-compressed*
+/// cluster of `pattern`-filled bytes. The header sets compression_type=1
+/// at byte 104 and the matching incompatible-features bit. Layout mirrors
+/// `build_compressed_image`.
+fn build_zstd_compressed_image(path: &PathBuf, pattern: u8) {
+    // Compress 4096 bytes of `pattern` with zstd. Default level is fine —
+    // payload pattern is highly compressible.
+    let plain = vec![pattern; CLUSTER_SIZE as usize];
+    let compressed = zstd::stream::encode_all(&plain[..], 0).unwrap();
+    assert!(
+        compressed.len() < CLUSTER_SIZE as usize,
+        "compressed payload should be smaller than a cluster"
+    );
+
+    let comp_host_off: u64 = CLUSTER_SIZE * 3;
+    let span_bytes = compressed.len().div_ceil(512) * 512;
+    let n_sectors_minus1 = ((span_bytes / 512) - 1) as u64;
+
+    let x: u64 = 62 - (12 - 8);
+    let descriptor = comp_host_off | (n_sectors_minus1 << x);
+    let l2_entry_compressed = COPIED | L2_FLAG_COMPRESSED | descriptor;
+
+    let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
+    let comp_end_cluster = 3 + span_clusters;
+    let rt_cluster = comp_end_cluster;
+    let rb_cluster = comp_end_cluster + 1;
+    let total_clusters = (rb_cluster + 8).max(16);
+    let total = CLUSTER_SIZE * total_clusters;
+    let mut f = File::create(path).unwrap();
+    f.set_len(total).unwrap();
+
+    // Header — note compression_type=1 at byte 104, header_length=112,
+    // and the incompatible-features bit set.
+    let mut hdr = [0u8; 4096];
+    hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+    hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
+    hdr[20..24].copy_from_slice(&12u32.to_be_bytes());
+    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes());
+    hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
+    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes());
+    let rt_off = rt_cluster * CLUSTER_SIZE;
+    hdr[48..56].copy_from_slice(&rt_off.to_be_bytes());
+    hdr[56..60].copy_from_slice(&1u32.to_be_bytes());
+    hdr[72..80].copy_from_slice(&INCOMPAT_COMPRESSION_TYPE.to_be_bytes());
+    hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
+    hdr[100..104].copy_from_slice(&112u32.to_be_bytes()); // header_length=112
+    hdr[104] = 1; // compression_type = zstd
+    f.write_all_at(&hdr, 0).unwrap();
+
+    // L1 → L2.
+    let mut l1 = [0u8; 4096];
+    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
+    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
+    f.write_all_at(&l1, L1_OFFSET).unwrap();
+
+    // L2 — entry 0 is compressed, rest unallocated.
+    let mut l2 = [0u8; 4096];
+    l2[0..8].copy_from_slice(&l2_entry_compressed.to_be_bytes());
+    f.write_all_at(&l2, L2_OFFSET).unwrap();
+
+    // Compressed bytes (zero-padded to span_bytes).
+    let mut sector_buf = vec![0u8; span_bytes];
+    sector_buf[..compressed.len()].copy_from_slice(&compressed);
+    f.write_all_at(&sector_buf, comp_host_off).unwrap();
+
+    // Refcount table.
+    let mut rt = [0u8; 4096];
+    let rb_off = rb_cluster * CLUSTER_SIZE;
+    rt[0..8].copy_from_slice(&rb_off.to_be_bytes());
+    f.write_all_at(&rt, rt_off).unwrap();
+
+    // Refcount block.
+    let mut rb = [0u8; 4096];
+    for cluster_idx in 0..=rb_cluster {
+        let off = (cluster_idx as usize) * 2;
+        rb[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
+    }
+    f.write_all_at(&rb, rb_off).unwrap();
+}
+
+#[test]
+fn zstd_compressed_cluster_round_trip() {
+    let path = tmp_path("zstd_compressed");
+    build_zstd_compressed_image(&path, 0xCC);
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    assert_eq!(r.header().compression_type, 1);
+
+    let mut buf = vec![0u8; 4096];
+    r.read_at(0, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0xCC),
+        "zstd-decompressed cluster must match input pattern"
+    );
+
+    // Cache hit: read again, smaller window.
+    let mut buf2 = vec![0u8; 16];
+    r.read_at(2048, &mut buf2).unwrap();
+    assert!(buf2.iter().all(|&b| b == 0xCC));
 
     let _ = std::fs::remove_file(&path);
 }
