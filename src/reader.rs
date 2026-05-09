@@ -207,8 +207,7 @@ impl Qcow2Reader {
             let backing_path = read_backing_path(&dev, &header, &child_path)?;
             // Backing parents always open read-only — writes only land in
             // the leaf image's own cluster store.
-            let parent_dev =
-                FileDevice::open(&backing_path).map_err(fs_core_to_qcow2_error)?;
+            let parent_dev = FileDevice::open(&backing_path).map_err(fs_core_to_qcow2_error)?;
             Some(Box::new(Self::open_inner(
                 Arc::new(parent_dev),
                 false,
@@ -364,8 +363,7 @@ impl Qcow2Reader {
                         let virt_cluster = cursor / cluster_size;
                         let mut full = vec![0u8; cluster_size as usize];
                         self.dev_read(host_off, &mut full)?;
-                        full[in_cluster as usize..in_cluster as usize + chunk]
-                            .copy_from_slice(src);
+                        full[in_cluster as usize..in_cluster as usize + chunk].copy_from_slice(src);
 
                         // Crash-safety order:
                         //   data → refcount(new=1) → L2 → refcount(old-1).
