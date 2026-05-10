@@ -41,6 +41,25 @@ extern "C" {
 FsCoreDevice *qcow2_open(const char *path);
 FsCoreDevice *qcow2_open_rw(const char *path);
 
+/*
+ * Open a QCOW2 image whose backing storage is an existing FsCoreDevice
+ * (e.g. an FSKit FSBlockDeviceResource lifted via
+ * `fs_core_device_from_callbacks`, a slice reader, or any other
+ * device the caller already holds). Use this when the qcow2 layer
+ * needs to sit on top of host-managed storage that isn't a path.
+ *
+ * Ownership: the returned handle takes over the input device. Do NOT
+ * call `fs_core_device_close` on `inner` afterwards. On failure the
+ * input is freed automatically and the function returns NULL.
+ *
+ * Backing-file resolution is unavailable through this entry point —
+ * there is no path to anchor a relative backing parent against. An
+ * image with `backing_file_size != 0` is rejected with
+ * FS_CORE_CUSTOM; use `qcow2_open` / `qcow2_open_rw` for those.
+ */
+FsCoreDevice *qcow2_open_on_device(FsCoreDevice *inner);
+FsCoreDevice *qcow2_open_rw_on_device(FsCoreDevice *inner);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

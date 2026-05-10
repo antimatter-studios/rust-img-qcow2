@@ -20,6 +20,9 @@
 //!  88   u64  autoclear_features
 //!  96   u32  refcount_order      (refcount_bits = 1 << refcount_order)
 //! 100   u32  header_length
+//!  --- v3 additional fields (only present when header_length > 104) ---
+//! 104   u8   compression_type    (0 = zlib, 1 = zstd)
+//! 105   7B   padding
 //! ```
 //!
 //! All multi-byte fields are big-endian.
@@ -63,6 +66,11 @@ pub struct Header {
     pub autoclear_features: u64,
     pub refcount_order: u32,
     pub header_length: u32,
+
+    /// v3 additional field at byte 104. Present only when
+    /// `header_length > 104`; defaults to 0 (zlib) otherwise.
+    /// Spec values: 0 = zlib (deflate), 1 = zstd.
+    pub compression_type: u8,
 }
 
 impl Header {
@@ -122,6 +130,15 @@ impl Header {
             (0, 0, 0, 4, 72)
         };
 
+        // v3 additional-fields region starts at byte 104. The first byte is
+        // `compression_type` (0 = zlib, 1 = zstd). Older v3 images set
+        // header_length to 104 and omit this byte; treat as zlib.
+        let compression_type = if version >= 3 && header_length > 104 && bytes.len() > 104 {
+            bytes[104]
+        } else {
+            0
+        };
+
         // Sanity: l1 must be large enough to address the whole virtual disk.
         let l2_entries_per_cluster = cluster_size / 8;
         let bytes_per_l1_entry = cluster_size * l2_entries_per_cluster;
@@ -149,6 +166,7 @@ impl Header {
             autoclear_features,
             refcount_order,
             header_length,
+            compression_type,
         })
     }
 
@@ -158,26 +176,32 @@ impl Header {
     }
 
     /// Reject feature combinations the reader does not yet handle. Currently
-    /// supported: uncompressed clusters, zlib-compressed clusters, backing
-    /// files. Refused: encryption, external data file, non-zlib compression,
-    /// extended L2 entries.
+    /// supported: uncompressed clusters, zlib- and zstd-compressed clusters,
+    /// backing files. Refused: encryption, external data file, extended L2
+    /// entries, unknown compression types.
     pub fn check_supported(&self) -> Result<()> {
         if self.crypt_method != 0 {
             return Err(Error::Unsupported("encryption (AES or LUKS)"));
         }
         if self.version >= 3 {
-            let unknown = self.incompatible_features & !(incompat::DIRTY | incompat::CORRUPT);
+            // COMPRESSION_TYPE in incompatible_features means "compression
+            // is something other than the default (zlib)". We honour it as
+            // long as compression_type itself is a value we implement.
+            let known = incompat::DIRTY | incompat::CORRUPT | incompat::COMPRESSION_TYPE;
+            let unknown = self.incompatible_features & !known;
             if unknown != 0 {
                 if self.incompatible_features & incompat::DATA_FILE != 0 {
                     return Err(Error::Unsupported("external data file"));
-                }
-                if self.incompatible_features & incompat::COMPRESSION_TYPE != 0 {
-                    return Err(Error::Unsupported("non-zlib compression"));
                 }
                 if self.incompatible_features & incompat::EXTENDED_L2 != 0 {
                     return Err(Error::Unsupported("extended L2 entries"));
                 }
                 return Err(Error::Unsupported("unknown incompatible_features bit"));
+            }
+            // 0 = zlib, 1 = zstd. Anything else is something we don't know
+            // how to decode.
+            if self.compression_type > 1 {
+                return Err(Error::Unsupported("unknown compression_type"));
             }
         }
         Ok(())
