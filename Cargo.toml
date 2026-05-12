@@ -26,12 +26,12 @@ flate2 = "1"
 ruzstd = "0.8"
 # Block-device trait surface. Local path dep until both crates are
 # published; flip to a published version on the first crates.io release.
-am-fs-core = { path = "../rust-fs-core", version = "0.1" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2" }
 
 [dev-dependencies]
 # Partition probe + FS sniff, used by the `inspect` example to demonstrate
 # the qcow2 -> partitions -> sniff stack.
-am-partitions = { path = "../rust-partitions", version = "0.1" }
+am-partitions = { path = "../rust-partitions", version = "0.2" }
 # Zstd encoder used only by the synthetic-image test harness to build
 # fixture clusters; never linked into the runtime crate.
 zstd = "0.13"
