@@ -1149,3 +1149,106 @@ fn zstd_compressed_cluster_round_trip() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn cluster_status_classifies_each_virtual_cluster() {
+    use qcow2::ClusterStatus;
+    let path = tmp_path("cluster_status");
+    build_image(&path);
+    let r = Qcow2Reader::open(&path).unwrap();
+
+    // Layout: virt 0 = allocated, virt 1 = unallocated, virt 2 = allocated, virt 3 = zero.
+    assert_eq!(r.cluster_status_at(0).unwrap(), ClusterStatus::Allocated);
+    assert_eq!(
+        r.cluster_status_at(CLUSTER_SIZE).unwrap(),
+        ClusterStatus::Unallocated
+    );
+    assert_eq!(
+        r.cluster_status_at(CLUSTER_SIZE * 2).unwrap(),
+        ClusterStatus::Allocated
+    );
+    assert_eq!(
+        r.cluster_status_at(CLUSTER_SIZE * 3).unwrap(),
+        ClusterStatus::Zero
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cluster_status_rejects_out_of_bounds_offset() {
+    let path = tmp_path("cluster_status_oob");
+    build_image(&path);
+    let r = Qcow2Reader::open(&path).unwrap();
+
+    assert!(r.cluster_status_at(VIRT_SIZE).is_err());
+    assert!(r.cluster_status_at(VIRT_SIZE * 2).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn extents_iter_yields_run_length_encoded_status_runs() {
+    use qcow2::ClusterStatus;
+    let path = tmp_path("extents");
+    build_image(&path);
+    let r = Qcow2Reader::open(&path).unwrap();
+
+    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
+
+    // Expected, from the layout comment at the top of the file:
+    //   virt 0 = Allocated, virt 1 = Unallocated,
+    //   virt 2 = Allocated, virt 3 = Zero.
+    // No two adjacent clusters share a status, so each cluster is its
+    // own extent: 4 extents total, each 1 cluster long.
+    assert_eq!(extents.len(), 4);
+
+    assert_eq!(extents[0].virt_offset, 0);
+    assert_eq!(extents[0].length, CLUSTER_SIZE);
+    assert_eq!(extents[0].status, ClusterStatus::Allocated);
+
+    assert_eq!(extents[1].virt_offset, CLUSTER_SIZE);
+    assert_eq!(extents[1].length, CLUSTER_SIZE);
+    assert_eq!(extents[1].status, ClusterStatus::Unallocated);
+
+    assert_eq!(extents[2].virt_offset, CLUSTER_SIZE * 2);
+    assert_eq!(extents[2].length, CLUSTER_SIZE);
+    assert_eq!(extents[2].status, ClusterStatus::Allocated);
+
+    assert_eq!(extents[3].virt_offset, CLUSTER_SIZE * 3);
+    assert_eq!(extents[3].length, CLUSTER_SIZE);
+    assert_eq!(extents[3].status, ClusterStatus::Zero);
+
+    // Lengths sum to virtual size.
+    let total: u64 = extents.iter().map(|e| e.length).sum();
+    assert_eq!(total, VIRT_SIZE);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn extents_iter_handles_freshly_created_all_unallocated_image() {
+    use qcow2::ClusterStatus;
+    use std::process::Command;
+    if Command::new("qemu-img").arg("--version").output().is_err() {
+        return;
+    }
+    let p = tmp_path("freshly_created");
+    let status = Command::new("qemu-img")
+        .args(["create", "-f", "qcow2", p.to_str().unwrap(), "1M"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let r = Qcow2Reader::open(&p).unwrap();
+    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
+
+    // Brand-new qcow2 has no allocated clusters at all — the iterator
+    // collapses the whole virtual disk into one Unallocated extent.
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].virt_offset, 0);
+    assert_eq!(extents[0].length, r.virtual_size());
+    assert_eq!(extents[0].status, ClusterStatus::Unallocated);
+
+    let _ = std::fs::remove_file(&p);
+}

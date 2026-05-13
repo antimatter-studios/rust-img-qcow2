@@ -61,6 +61,94 @@ enum ClusterMap {
     Compressed { host_off: u64, byte_len: usize },
 }
 
+/// Public-facing status of a virtual cluster. Coarser than the
+/// internal [`ClusterMap`] (which carries host offsets and compressed-
+/// span sizes): the consumer of `extents()` only needs to know whether
+/// to read, zero-fill, or defer to a backing reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterStatus {
+    /// Cluster holds user data — uncompressed or compressed. Consumer
+    /// should call [`Qcow2Reader::read_at`] to materialise the bytes.
+    Allocated,
+    /// v3 zero flag — guaranteed zeros, never defers to backing.
+    /// Consumer can zero-fill its buffer without invoking the reader.
+    Zero,
+    /// L1 or L2 entry is zero. With no backing image this also reads
+    /// as zeros; with a backing image the backing's data would be
+    /// returned. Consumer that wants to honour backing chains must
+    /// still call `read_at` for this kind; consumer that doesn't care
+    /// (e.g. burns from a single-image source) can treat it like Zero.
+    Unallocated,
+}
+
+/// A run of contiguous virtual clusters with the same status. Yielded
+/// by [`Qcow2Reader::extents`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extent {
+    /// Byte offset from the start of the virtual disk.
+    pub virt_offset: u64,
+    /// Length in bytes. Always cluster-aligned except possibly the
+    /// final extent, which may be shorter when virtual_size is not a
+    /// multiple of cluster_size.
+    pub length: u64,
+    pub status: ClusterStatus,
+}
+
+/// Iterator over [`Extent`]s for the whole virtual disk. See
+/// [`Qcow2Reader::extents`] for the high-level intent.
+pub struct ExtentIter<'a> {
+    reader: &'a Qcow2Reader,
+    cursor: u64,
+}
+
+impl<'a> ExtentIter<'a> {
+    fn new(reader: &'a Qcow2Reader) -> Self {
+        Self { reader, cursor: 0 }
+    }
+}
+
+impl<'a> Iterator for ExtentIter<'a> {
+    type Item = Result<Extent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let total = self.reader.virtual_size();
+        if self.cursor >= total {
+            return None;
+        }
+        let cluster_size = self.reader.cluster_size();
+        let start = self.cursor;
+
+        let status = match self.reader.cluster_status_at(start) {
+            Ok(s) => s,
+            Err(e) => {
+                self.cursor = total;
+                return Some(Err(e));
+            }
+        };
+
+        let mut end = (start + cluster_size).min(total);
+        while end < total {
+            match self.reader.cluster_status_at(end) {
+                Ok(s) if s == status => {
+                    end = (end + cluster_size).min(total);
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    self.cursor = total;
+                    return Some(Err(e));
+                }
+            }
+        }
+
+        self.cursor = end;
+        Some(Ok(Extent {
+            virt_offset: start,
+            length: end - start,
+            status,
+        }))
+    }
+}
+
 /// QCOW2 reader backed by a generic [`fs_core::BlockDevice`]. May own a
 /// recursive backing-file reader if the image references a parent.
 ///
@@ -257,6 +345,47 @@ impl Qcow2Reader {
     /// Whether the image was opened read-write.
     pub fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    /// Public-facing status of the cluster containing byte `virt`.
+    /// Walks L1/L2 only — does not read cluster data. Use this to
+    /// decide whether a consumer needs to invoke [`read_at`] (for
+    /// [`ClusterStatus::Allocated`]) or can skip-fill with zeros
+    /// (for [`ClusterStatus::Zero`] / [`ClusterStatus::Unallocated`]
+    /// when no backing is present).
+    ///
+    /// Returns [`Error::OutOfBounds`] if `virt >= virtual_size()`.
+    pub fn cluster_status_at(&self, virt: u64) -> Result<ClusterStatus> {
+        if virt >= self.header.virtual_size {
+            return Err(Error::OutOfBounds {
+                offset: virt,
+                len: 1,
+                size: self.header.virtual_size,
+            });
+        }
+        match self.lookup_cluster(virt)? {
+            ClusterMap::Plain { .. } | ClusterMap::Compressed { .. } => {
+                Ok(ClusterStatus::Allocated)
+            }
+            ClusterMap::Zero => Ok(ClusterStatus::Zero),
+            ClusterMap::Unallocated => Ok(ClusterStatus::Unallocated),
+        }
+    }
+
+    /// Iterate the virtual disk as a sequence of contiguous extents,
+    /// merging adjacent clusters of the same status. The iterator
+    /// stops at [`virtual_size()`]. Each yielded extent is
+    /// cluster-aligned (except possibly the last, which is clamped
+    /// to virtual_size).
+    ///
+    /// This is the cheap way to drive a sparse-aware copy: every
+    /// [`ClusterStatus::Zero`] / [`ClusterStatus::Unallocated`]
+    /// extent can be written as zeros directly on the destination
+    /// without invoking the qcow2 read path at all. For a 100 GiB
+    /// image with 12 GiB allocated, the iterator yields ~13 extents
+    /// rather than ~1.6M cluster lookups.
+    pub fn extents(&self) -> ExtentIter<'_> {
+        ExtentIter::new(self)
     }
 
     // -- internal device adapters ------------------------------------------
