@@ -19,4 +19,4 @@ pub mod reader;
 
 pub use error::{Error, Result};
 pub use header::Header;
-pub use reader::Qcow2Reader;
+pub use reader::{ClusterStatus, Extent, ExtentIter, Qcow2Reader};
