@@ -31,7 +31,7 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2" }
 [dev-dependencies]
 # Partition probe + FS sniff, used by the `inspect` example to demonstrate
 # the qcow2 -> partitions -> sniff stack.
-am-partitions = { path = "../rust-partitions", version = "0.2" }
+am-partitions = { path = "../rust-partitions", version = "0.3" }
 # Zstd encoder used only by the synthetic-image test harness to build
 # fixture clusters; never linked into the runtime crate.
 zstd = "0.13"
