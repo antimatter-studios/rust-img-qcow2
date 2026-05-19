@@ -13,21 +13,15 @@
 
 #![cfg(feature = "qemu-validation")]
 
+mod common;
+
+use common::*;
 use qcow2::Qcow2Reader;
-use std::path::{Path, PathBuf};
+use serde_json::Value;
+use std::path::Path;
 use std::process::Command;
 
 const QEMU_IMG: &str = "qemu-img";
-
-fn tmp_path(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "qcow2-validate-{name}-{}-{:p}.img",
-        std::process::id(),
-        &name as *const _
-    ));
-    p
-}
 
 fn run_qemu(args: &[&str]) -> std::process::Output {
     Command::new(QEMU_IMG)
@@ -184,4 +178,142 @@ fn qemu_can_extract_our_written_bytes() {
         out[payload.len()..].iter().all(|&b| b == 0),
         "rest of the converted raw image should be zero"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Direction 4: synthetic-builder validation. Each `build_*` in
+// `tests/common/mod.rs` writes a hand-crafted qcow2 by hand. Without
+// external validation our reader is the only judge of whether those
+// bytes are spec-valid — that's the "marking our own homework" risk.
+//
+// Each test here builds a fixture with our own code, then asks qemu-img
+// two questions:
+//
+//   1. `qemu-img check`  — are the bytes structurally consistent
+//      (header, L1/L2 reachable, refcount block sums match)?
+//   2. `qemu-img info --output=json` — does qemu parse the same fields
+//      we encoded (virtual_size, cluster_size, refcount_bits, compat,
+//      compression type, backing chain)?
+// ---------------------------------------------------------------------------
+
+fn qemu_info_json(path: &Path) -> Value {
+    let out = run_qemu(&["info", "--output=json", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "qemu-img info failed:\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("qemu-img info JSON must parse")
+}
+
+/// Look up `format-specific.data.<key>` in qemu-img info JSON.
+fn qcow_meta<'a>(info: &'a Value, key: &str) -> &'a Value {
+    info.get("format-specific")
+        .and_then(|f| f.get("data"))
+        .and_then(|d| d.get(key))
+        .unwrap_or_else(|| panic!("qemu-img info JSON missing format-specific.data.{key}"))
+}
+
+#[test]
+fn qemu_check_passes_on_our_standard_synthetic() {
+    let p = tmp_path("synth-standard");
+    build_image(&p);
+    qemu_check(&p);
+}
+
+#[test]
+fn qemu_info_matches_our_standard_synthetic() {
+    let p = tmp_path("synth-info");
+    build_image(&p);
+
+    let info = qemu_info_json(&p);
+    assert_eq!(info["format"], "qcow2");
+    assert_eq!(info["virtual-size"], VIRT_SIZE);
+    assert_eq!(info["cluster-size"], CLUSTER_SIZE);
+    // We encoded refcount_order = 4 → refcount_bits = 16. v3 image.
+    assert_eq!(qcow_meta(&info, "compat"), "1.1");
+    assert_eq!(qcow_meta(&info, "refcount-bits"), 16);
+    // No compression-type field present means default zlib, OR the field
+    // is "zlib". Accept either.
+    if let Some(ct) = info["format-specific"]["data"].get("compression-type") {
+        assert_eq!(ct, "zlib");
+    }
+    // No encryption, no backing file in build_image.
+    assert!(info.get("backing-filename").is_none());
+}
+
+#[test]
+fn qemu_check_passes_on_our_zlib_compressed_synthetic() {
+    let p = tmp_path("synth-zlib");
+    build_compressed_image(&p, 0xCC);
+    qemu_check(&p);
+}
+
+#[test]
+fn qemu_can_decompress_our_zlib_synthetic() {
+    let qcow = tmp_path("synth-zlib-conv-q");
+    let raw = tmp_path("synth-zlib-conv-r");
+    build_compressed_image(&qcow, 0xCC);
+
+    // qemu-img must decompress our compressed cluster identically.
+    qemu_convert_to_raw(&qcow, &raw);
+    let out = std::fs::read(&raw).unwrap();
+    assert!(
+        out[..CLUSTER_SIZE as usize].iter().all(|&b| b == 0xCC),
+        "qemu's view of our compressed cluster diverges from ours"
+    );
+}
+
+#[test]
+fn qemu_check_passes_on_our_zstd_compressed_synthetic() {
+    let p = tmp_path("synth-zstd");
+    build_zstd_compressed_image(&p, 0xCC);
+    qemu_check(&p);
+}
+
+#[test]
+fn qemu_info_reports_zstd_for_our_zstd_synthetic() {
+    let p = tmp_path("synth-zstd-info");
+    build_zstd_compressed_image(&p, 0xCC);
+
+    let info = qemu_info_json(&p);
+    assert_eq!(qcow_meta(&info, "compression-type"), "zstd");
+}
+
+#[test]
+fn qemu_can_decompress_our_zstd_synthetic() {
+    let qcow = tmp_path("synth-zstd-conv-q");
+    let raw = tmp_path("synth-zstd-conv-r");
+    build_zstd_compressed_image(&qcow, 0xCC);
+
+    qemu_convert_to_raw(&qcow, &raw);
+    let out = std::fs::read(&raw).unwrap();
+    assert!(
+        out[..CLUSTER_SIZE as usize].iter().all(|&b| b == 0xCC),
+        "qemu's view of our zstd cluster diverges from ours"
+    );
+}
+
+#[test]
+fn qemu_check_passes_on_our_backing_chain_pair() {
+    let (parent, child, rel) = pair_paths("synth-backing-check");
+    build_image(&parent);
+    build_child_with_backing(&child, &rel, &[]);
+
+    // Both files must independently pass qemu-img check.
+    qemu_check(&parent);
+    qemu_check(&child);
+}
+
+#[test]
+fn qemu_info_reports_backing_path_on_our_child() {
+    let (parent, child, rel) = pair_paths("synth-backing-info");
+    build_image(&parent);
+    build_child_with_backing(&child, &rel, &[]);
+
+    let info = qemu_info_json(&child);
+    let backing = info
+        .get("backing-filename")
+        .unwrap_or_else(|| panic!("child must report a backing filename"));
+    assert_eq!(backing, &Value::String(rel));
 }

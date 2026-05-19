@@ -43,6 +43,9 @@ am-partitions = { path = "../rust-partitions", version = "0.3" }
 # Zstd encoder used only by the synthetic-image test harness to build
 # fixture clusters; never linked into the runtime crate.
 zstd = "0.13"
+# JSON parsing for `qemu-img info --output=json` in the qemu-validation
+# test harness. Test-only.
+serde_json = "1"
 
 [profile.release]
 lto = true
