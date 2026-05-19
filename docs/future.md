@@ -4,17 +4,49 @@ Scope: four qcow2 spec features that the reader still refuses. Each section
 covers (a) what the feature is, (b) what needs implementing, (c) what we
 still need to research, (d) licence / IP exposure.
 
-Status snapshot (against `main`, crate v0.2.0):
+Status snapshot (against `main`, crate v0.3.2):
 
 | Feature             | Header probe        | Current behaviour          | Status        |
 |---------------------|---------------------|----------------------------|---------------|
-| zstd clusters       | `compression_type=1`| **decoded** via `ruzstd`   | **done in v0.2.0** |
+| zstd clusters       | `compression_type=1`| **decoded** via `ruzstd`   | **done in v0.2.0, cross-validated against `qemu-img` in v0.3.2** |
 | encryption          | `crypt_method != 0` | `Unsupported("encryption (AES or LUKS)")` | not started |
 | external data file  | incompat bit 2      | `Unsupported("external data file")`       | not started |
 | extended L2         | incompat bit 4      | `Unsupported("extended L2 entries")`      | not started |
 
 Reject sites: `src/header.rs:182` (`check_supported`). Cluster decode site
 that will branch on extended-L2: `src/reader.rs:866`.
+
+---
+
+## Infrastructure already in place
+
+Two pieces of test infrastructure landed in v0.3.2 that every feature
+below assumes — listing them here so we don't re-litigate the design
+in each section.
+
+1. **`tests/common/mod.rs`** — shared synthetic-image builders
+   (`build_image`, `build_compressed_image`, `build_zstd_compressed_image`,
+   `build_child_with_backing`). Each builder writes bytes by hand from
+   the qcow2 spec and is intended to be spec-valid (refcount table,
+   refcount block, header all present). Any new feature should add its
+   own `build_*` here, not re-roll fixtures inline.
+
+2. **`tests/qemu_validation.rs`** — gated behind the `qemu-validation`
+   feature, runs every synthetic builder through `qemu-img check` (for
+   structural validity) and `qemu-img info --output=json` (for
+   parsed-field equivalence). CI has a Linux-only `qemu-validation`
+   job that installs `qemu-utils` and runs these. The harness exists
+   so we never again "mark our own homework" — i.e. produce bytes
+   only our reader can read.
+
+Both are MIT-clean: `qemu-img` is invoked as a subprocess, never
+linked, never bundled. Fixtures are our own bytes.
+
+Implication for the features below: each one should land with a new
+synthetic builder in `tests/common`, exercised by reader tests in
+`tests/synthetic.rs` *and* by qemu-img cross-checks in
+`tests/qemu_validation.rs`. Test strategy paragraphs below assume
+this baseline.
 
 ---
 
@@ -48,7 +80,7 @@ rather than copy verbatim to keep distance from the upstream licence.
 
 ---
 
-## 1. zstd clusters — done, documenting for reference
+## 1. zstd clusters — done
 
 Spec: qcow2 v3 adds `compression_type` field at header byte 104; bit 3
 of `incompatible_features` (`COMPRESSION_TYPE`) must be set when value
@@ -59,8 +91,19 @@ What landed (v0.2.0):
 - `src/header.rs:73` parses `compression_type`.
 - `src/reader.rs:939–960` branches on it: deflate via `flate2`, zstd
   via `ruzstd` (streaming decoder, output capped at cluster_size).
-- Synthetic fixture in `tests/synthetic.rs` uses `zstd` (dev-dep) to
-  build a real zstd cluster, round-trips through the reader.
+- Synthetic fixture (`build_zstd_compressed_image` in `tests/common`)
+  uses `zstd` (dev-dep) to build a real zstd cluster, round-trips
+  through the reader.
+
+What landed in v0.3.2 (cross-validation):
+
+- `qemu_check_passes_on_our_zstd_compressed_synthetic` — our fixture
+  passes `qemu-img check`.
+- `qemu_info_reports_zstd_for_our_zstd_synthetic` — `qemu-img info`
+  parses `compression-type: zstd` on our fixture, matching what we
+  encoded.
+- `qemu_can_decompress_our_zstd_synthetic` — qemu-img convert of our
+  fixture round-trips to the same bytes.
 
 Licences: `ruzstd` (MIT), `flate2` (MIT/Apache-2.0), `zstd` dev-dep
 only (BSD-3 / GPLv2 dual via zstd-sys — fine as a dev-dep, must not
@@ -157,9 +200,14 @@ Licence exposure: every crypto crate proposed is RustCrypto
 (MIT/Apache-2.0 dual). `serde_json` is MIT/Apache. No GPL contact
 as long as we don't pull `cryptsetup`.
 
-Test strategy: build fixture qcow2s with `qemu-img` once, commit the
-ciphertext + the known password, decrypt in tests. Do not depend on
-having `qemu-img` at test time — pre-build and check in the fixtures.
+Test strategy: two options now available given the v0.3.2 harness.
+Either commit a pre-built ciphertext fixture (insulates regular
+`cargo test` from `qemu-img`), or generate one fresh in the
+`qemu-validation` test binary (CI already installs `qemu-utils`).
+Recommendation: commit a tiny ciphertext fixture so the *reader*
+tests run without qemu-img, and use the validation harness to
+re-verify the same fixture against a freshly-generated equivalent
+in CI.
 
 Effort estimate: this is a two-to-three week feature on its own.
 Recommend separating into PRs: (i) header-extension parser, (ii)
@@ -284,10 +332,11 @@ read path is provably correct against committed fixture images.
 - Read-only vs read-write parity: for v1 of each feature, is
   read-only acceptable? Recommendation: yes, ship read first, write
   in a follow-up.
-- Fixture provenance: we'll generate ciphertexts with `qemu-img` and
-  check them in. That's data, not GPL code — fine. Note this
-  explicitly in the test file headers so future contributors don't
-  worry.
+- Fixture provenance: with the qemu-validation harness in place
+  (v0.3.2), every new feature should add its synthetic builder to
+  `tests/common` and a corresponding `qemu-img check` /
+  `qemu-img info` test to `tests/qemu_validation.rs`. Generated
+  bytes are data, not GPL code — fine.
 - C ABI: encryption needs a password input on `open`. Decide whether
   the C side takes a `const char*` password or a callback. Callback
   is friendlier for GUI clients.
