@@ -184,7 +184,10 @@ pub fn build_compressed_image(path: &Path, pattern: u8) {
     // x = 62 - (cluster_bits - 8). For cluster_bits=12, x=58.
     let x: u64 = 62 - (12 - 8);
     let descriptor = comp_host_off | (n_sectors_minus1 << x);
-    let l2_entry_compressed = COPIED | L2_FLAG_COMPRESSED | descriptor;
+    // Per spec: COPIED (bit 63) MUST NOT be set on compressed L2
+    // entries; the COMPRESSED flag itself is the indicator. qemu-img
+    // check rejects an image that sets both.
+    let l2_entry_compressed = L2_FLAG_COMPRESSED | descriptor;
 
     let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
     let comp_end_cluster = 3 + span_clusters;
@@ -337,7 +340,10 @@ pub fn build_zstd_compressed_image(path: &Path, pattern: u8) {
 
     let x: u64 = 62 - (12 - 8);
     let descriptor = comp_host_off | (n_sectors_minus1 << x);
-    let l2_entry_compressed = COPIED | L2_FLAG_COMPRESSED | descriptor;
+    // Per spec: COPIED (bit 63) MUST NOT be set on compressed L2
+    // entries; the COMPRESSED flag itself is the indicator. qemu-img
+    // check rejects an image that sets both.
+    let l2_entry_compressed = L2_FLAG_COMPRESSED | descriptor;
 
     let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
     let comp_end_cluster = 3 + span_clusters;
