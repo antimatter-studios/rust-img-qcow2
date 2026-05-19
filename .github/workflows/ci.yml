@@ -59,3 +59,33 @@ jobs:
       - name: fmt --check
         working-directory: rust-img-qcow2
         run: cargo fmt --check
+
+  # Cross-validates our reader/writer against `qemu-img`. qemu-img is
+  # invoked as a subprocess only — never linked, never bundled. The
+  # qemu-utils package is installed only on the CI runner.
+  qemu-validation:
+    name: qemu-validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rust-img-qcow2
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          path: rust-fs-core
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-partitions
+          path: rust-partitions
+      - name: install qemu-utils
+        run: sudo apt-get update && sudo apt-get install -y qemu-utils
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-img-qcow2
+      - name: qemu cross-validation tests
+        working-directory: rust-img-qcow2
+        run: cargo test --features qemu-validation --test qemu_validation
