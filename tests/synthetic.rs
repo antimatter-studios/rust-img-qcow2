@@ -1,6 +1,16 @@
-//! End-to-end test on a hand-crafted qcow2 v3 image.
+//! End-to-end tests on hand-crafted qcow2 v3 images. The synthetic-image
+//! builders (`build_image`, `build_compressed_image`,
+//! `build_child_with_backing`, `build_zstd_compressed_image`) live in
+//! `tests/common/mod.rs` and are exercised in two places:
 //!
-//! Layout (cluster_size = 4096):
+//! 1. **Here** — open with our reader, assert observed bytes match what
+//!    the builder put in.
+//! 2. **`tests/qemu_validation.rs`** — same builders, but the output is
+//!    passed to `qemu-img check` / `qemu-img info` so we cross-check
+//!    that our hand-built bytes are actually spec-valid, not just
+//!    self-consistent with our own reader.
+//!
+//! Standard layout (cluster_size = 4096):
 //!
 //!   cluster 0   header
 //!   cluster 1   L1 table (1 entry)
@@ -13,122 +23,12 @@
 //!   virt 2  -> data at cluster 4                 (allocated)
 //!   virt 3  -> v3 zero flag                      (reads zeros)
 
+mod common;
+
+use common::*;
 use qcow2::Qcow2Reader;
 use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
-const QCOW2_MAGIC: u32 = 0x5146_49fb;
-const CLUSTER_SIZE: u64 = 4096;
-const VIRT_SIZE: u64 = CLUSTER_SIZE * 4;
-
-const L1_OFFSET: u64 = CLUSTER_SIZE;
-const L2_OFFSET: u64 = CLUSTER_SIZE * 2;
-const DATA0_OFFSET: u64 = CLUSTER_SIZE * 3;
-const DATA2_OFFSET: u64 = CLUSTER_SIZE * 4;
-const REFCOUNT_TABLE_OFFSET: u64 = CLUSTER_SIZE * 5;
-const REFCOUNT_BLOCK_OFFSET: u64 = CLUSTER_SIZE * 6;
-/// 16 clusters total: 7 in-use (header through refcount block) + 9 free
-/// host clusters available for Phase B allocation. Refcount block has
-/// room for 2048 entries so the rest stays available too.
-const TOTAL_CLUSTERS: u64 = 16;
-const TOTAL_SIZE: u64 = CLUSTER_SIZE * TOTAL_CLUSTERS;
-
-const COPIED: u64 = 1u64 << 63;
-const L2_ZERO: u64 = 1u64 << 0;
-
-fn build_image(path: &PathBuf) {
-    let mut f = File::create(path).unwrap();
-    f.set_len(TOTAL_SIZE).unwrap();
-
-    // ---- cluster 0: header ----
-    let mut hdr = [0u8; 4096];
-    hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-    hdr[4..8].copy_from_slice(&3u32.to_be_bytes()); // version 3
-    hdr[8..16].copy_from_slice(&0u64.to_be_bytes()); // backing_file_offset
-    hdr[16..20].copy_from_slice(&0u32.to_be_bytes()); // backing_file_size
-    hdr[20..24].copy_from_slice(&12u32.to_be_bytes()); // cluster_bits
-    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes()); // size
-    hdr[32..36].copy_from_slice(&0u32.to_be_bytes()); // crypt
-    hdr[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size
-    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes()); // l1_table_offset
-    hdr[48..56].copy_from_slice(&REFCOUNT_TABLE_OFFSET.to_be_bytes());
-    hdr[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
-    hdr[60..64].copy_from_slice(&0u32.to_be_bytes()); // nb_snapshots
-    hdr[64..72].copy_from_slice(&0u64.to_be_bytes()); // snapshots_offset
-    hdr[72..80].copy_from_slice(&0u64.to_be_bytes()); // incompatible_features
-    hdr[80..88].copy_from_slice(&0u64.to_be_bytes()); // compatible_features
-    hdr[88..96].copy_from_slice(&0u64.to_be_bytes()); // autoclear_features
-    hdr[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order (=> u16 refcounts)
-    hdr[100..104].copy_from_slice(&104u32.to_be_bytes()); // header_length
-    f.write_all_at(&hdr, 0).unwrap();
-
-    // ---- cluster 1: L1 table ----
-    let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
-    f.write_all_at(&l1, L1_OFFSET).unwrap();
-
-    // ---- cluster 2: L2 table ----
-    let mut l2 = [0u8; 4096];
-    let e0 = (DATA0_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    let e2 = (DATA2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    let e3 = COPIED | L2_ZERO;
-    l2[0..8].copy_from_slice(&e0.to_be_bytes());
-    // l2[8..16] left zero (unallocated)
-    l2[16..24].copy_from_slice(&e2.to_be_bytes());
-    l2[24..32].copy_from_slice(&e3.to_be_bytes());
-    f.write_all_at(&l2, L2_OFFSET).unwrap();
-
-    // ---- data clusters ----
-    let mut d0 = [0u8; 4096];
-    d0.fill(0xAA);
-    f.write_all_at(&d0, DATA0_OFFSET).unwrap();
-
-    let mut d2 = [0u8; 4096];
-    d2.fill(0xBB);
-    f.write_all_at(&d2, DATA2_OFFSET).unwrap();
-
-    // ---- cluster 5: refcount table (1 entry pointing at the block) ----
-    let mut rt = [0u8; 4096];
-    rt[0..8].copy_from_slice(&REFCOUNT_BLOCK_OFFSET.to_be_bytes());
-    f.write_all_at(&rt, REFCOUNT_TABLE_OFFSET).unwrap();
-
-    // ---- cluster 6: refcount block ----
-    // u16 entries, big-endian. Clusters 0..=6 are in use (refcount=1);
-    // clusters 7..2047 are free (refcount=0).
-    let mut rb = [0u8; 4096];
-    for cluster_idx in 0..7u16 {
-        let off = (cluster_idx as usize) * 2;
-        rb[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
-    }
-    f.write_all_at(&rb, REFCOUNT_BLOCK_OFFSET).unwrap();
-}
-
-// Tiny trait-shim so we can write at offsets without juggling Seek state.
-trait WriteAt {
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> std::io::Result<()>;
-}
-impl WriteAt for File {
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.seek(SeekFrom::Start(offset))?;
-        self.write_all(buf)
-    }
-}
-
-fn tmp_path(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "qcow2_synth_{}_{}_{name}.qcow2",
-        std::process::id(),
-        n
-    ));
-    p
-}
+use std::path::PathBuf;
 
 #[test]
 fn header_round_trip() {
@@ -223,108 +123,6 @@ fn read_past_end_errors() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2: compression + backing chain
-// ---------------------------------------------------------------------------
-
-const L2_FLAG_COMPRESSED: u64 = 1u64 << 62;
-const L2_FLAG_ZERO: u64 = 1u64 << 0;
-
-/// Build a qcow2 v3 image whose virt cluster 0 holds a *compressed* cluster
-/// of `pattern`-filled bytes; other virt clusters are unallocated.
-///
-/// Layout:
-///   cluster 0   header
-///   cluster 1   L1 table
-///   cluster 2   L2 table
-///   cluster 3+  compressed bytes (sector-padded)
-fn build_compressed_image(path: &PathBuf, pattern: u8) {
-    use flate2::write::DeflateEncoder;
-    use flate2::Compression;
-
-    // Compress 4096 bytes of `pattern` with raw deflate.
-    let plain = vec![pattern; CLUSTER_SIZE as usize];
-    let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(&plain).unwrap();
-    let compressed = enc.finish().unwrap();
-    assert!(
-        compressed.len() < CLUSTER_SIZE as usize,
-        "compressed payload should be smaller than a cluster"
-    );
-
-    // Place compressed bytes starting at the host byte offset (cluster 3, offset 0).
-    let comp_host_off: u64 = CLUSTER_SIZE * 3;
-    // Span in 512-byte sectors. n = (sectors_used - 1).
-    let span_bytes = compressed.len().div_ceil(512) * 512;
-    let n_sectors_minus1 = ((span_bytes / 512) - 1) as u64;
-
-    // Encode the compressed-cluster descriptor.
-    // x = 62 - (cluster_bits - 8). For cluster_bits=12, x=58.
-    let x: u64 = 62 - (12 - 8);
-    let descriptor = comp_host_off | (n_sectors_minus1 << x);
-    let l2_entry_compressed = COPIED | L2_FLAG_COMPRESSED | descriptor;
-
-    // Layout: header(0) + L1(1) + L2(2) + compressed(3..3+span_clusters) +
-    //         refcount table(N) + refcount block(N+1) + free space.
-    let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
-    let comp_end_cluster = 3 + span_clusters; // first cluster after compressed
-    let rt_cluster = comp_end_cluster;
-    let rb_cluster = comp_end_cluster + 1;
-    let total_clusters = (rb_cluster + 8).max(16);
-    let total = CLUSTER_SIZE * total_clusters;
-    let mut f = File::create(path).unwrap();
-    f.set_len(total).unwrap();
-
-    // Header.
-    let mut hdr = [0u8; 4096];
-    hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-    hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
-    hdr[20..24].copy_from_slice(&12u32.to_be_bytes());
-    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes());
-    hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
-    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes());
-    let rt_off = rt_cluster * CLUSTER_SIZE;
-    hdr[48..56].copy_from_slice(&rt_off.to_be_bytes());
-    hdr[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
-    hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
-    hdr[100..104].copy_from_slice(&104u32.to_be_bytes());
-    f.write_all_at(&hdr, 0).unwrap();
-
-    // L1 table → L2 cluster.
-    let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
-    f.write_all_at(&l1, L1_OFFSET).unwrap();
-
-    // L2 table — entry 0 is compressed, the rest unallocated.
-    let mut l2 = [0u8; 4096];
-    l2[0..8].copy_from_slice(&l2_entry_compressed.to_be_bytes());
-    f.write_all_at(&l2, L2_OFFSET).unwrap();
-
-    // Compressed bytes (zero-padded to span_bytes).
-    let mut sector_buf = vec![0u8; span_bytes];
-    sector_buf[..compressed.len()].copy_from_slice(&compressed);
-    f.write_all_at(&sector_buf, comp_host_off).unwrap();
-
-    // Refcount table (one entry pointing at the block).
-    let mut rt = [0u8; 4096];
-    let rb_off = rb_cluster * CLUSTER_SIZE;
-    rt[0..8].copy_from_slice(&rb_off.to_be_bytes());
-    f.write_all_at(&rt, rt_off).unwrap();
-
-    // Refcount block: clusters 0..=rb_cluster are in use; rest free.
-    let mut rb = [0u8; 4096];
-    for cluster_idx in 0..=rb_cluster {
-        let off = (cluster_idx as usize) * 2;
-        rb[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
-    }
-    // The compressed payload also occupies span_clusters host clusters
-    // starting at cluster 3 — already covered by the loop above when
-    // span=1; for span=2 they're cluster 3 and 4. Loop already includes
-    // them since rb_cluster = 3 + span.
-    f.write_all_at(&rb, rb_off).unwrap();
-}
-
 #[test]
 fn compressed_cluster_round_trip() {
     let path = tmp_path("compressed");
@@ -344,72 +142,6 @@ fn compressed_cluster_round_trip() {
     assert!(buf2.iter().all(|&b| b == 0xCC));
 
     let _ = std::fs::remove_file(&path);
-}
-
-// ---------------------------------------------------------------------------
-// Backing chain
-// ---------------------------------------------------------------------------
-
-/// Build a child qcow2 whose L1 has one allocated L2 table; entries are
-/// caller-provided so we can mix unallocated and zero-flagged. The child also
-/// sets a backing file pointing at `backing_path` (relative).
-fn build_child_with_backing(
-    path: &PathBuf,
-    backing_relative_name: &str,
-    l2_entries: &[(usize, u64)],
-) {
-    let mut f = File::create(path).unwrap();
-    f.set_len(CLUSTER_SIZE * 3).unwrap();
-
-    let backing_path_offset: u64 = 0x200;
-    let backing_bytes = backing_relative_name.as_bytes();
-
-    // Header.
-    let mut hdr = [0u8; 4096];
-    hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-    hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
-    hdr[8..16].copy_from_slice(&backing_path_offset.to_be_bytes());
-    hdr[16..20].copy_from_slice(&(backing_bytes.len() as u32).to_be_bytes());
-    hdr[20..24].copy_from_slice(&12u32.to_be_bytes());
-    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes());
-    hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
-    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes());
-    hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
-    hdr[100..104].copy_from_slice(&104u32.to_be_bytes());
-    // Backing path string lives in the header cluster at offset 0x200.
-    hdr[backing_path_offset as usize..backing_path_offset as usize + backing_bytes.len()]
-        .copy_from_slice(backing_bytes);
-    f.write_all_at(&hdr, 0).unwrap();
-
-    // L1.
-    let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
-    f.write_all_at(&l1, L1_OFFSET).unwrap();
-
-    // L2.
-    let mut l2 = [0u8; 4096];
-    for (idx, val) in l2_entries {
-        let off = idx * 8;
-        l2[off..off + 8].copy_from_slice(&val.to_be_bytes());
-    }
-    f.write_all_at(&l2, L2_OFFSET).unwrap();
-}
-
-fn pair_paths(name: &str) -> (PathBuf, PathBuf, String) {
-    let dir = std::env::temp_dir();
-    let stamp = format!(
-        "{}_{}_{name}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let parent = dir.join(format!("qcow2_parent_{stamp}.qcow2"));
-    let child = dir.join(format!("qcow2_child_{stamp}.qcow2"));
-    let rel = parent.file_name().unwrap().to_string_lossy().into_owned();
-    (parent, child, rel)
 }
 
 #[test]
@@ -470,12 +202,6 @@ fn backing_too_deep_for_self_reference() {
     }
 
     let _ = std::fs::remove_file(&path);
-}
-
-// Reference Path so test layout stays explicit even though we don't use it.
-#[allow(dead_code)]
-fn _path_helper(p: &Path) -> &Path {
-    p
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,94 +763,6 @@ fn live_view_sees_cow_write() {
     assert_eq!(tail, [0xAA; 4]);
 
     let _ = std::fs::remove_file(&path);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5c: zstd-compressed clusters
-// ---------------------------------------------------------------------------
-
-/// Bit 3 of `incompatible_features` — the spec mandates it when
-/// `compression_type != 0`.
-const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
-
-/// Build a qcow2 v3 image whose virt cluster 0 holds a *zstd-compressed*
-/// cluster of `pattern`-filled bytes. The header sets compression_type=1
-/// at byte 104 and the matching incompatible-features bit. Layout mirrors
-/// `build_compressed_image`.
-fn build_zstd_compressed_image(path: &PathBuf, pattern: u8) {
-    // Compress 4096 bytes of `pattern` with zstd. Default level is fine —
-    // payload pattern is highly compressible.
-    let plain = vec![pattern; CLUSTER_SIZE as usize];
-    let compressed = zstd::stream::encode_all(&plain[..], 0).unwrap();
-    assert!(
-        compressed.len() < CLUSTER_SIZE as usize,
-        "compressed payload should be smaller than a cluster"
-    );
-
-    let comp_host_off: u64 = CLUSTER_SIZE * 3;
-    let span_bytes = compressed.len().div_ceil(512) * 512;
-    let n_sectors_minus1 = ((span_bytes / 512) - 1) as u64;
-
-    let x: u64 = 62 - (12 - 8);
-    let descriptor = comp_host_off | (n_sectors_minus1 << x);
-    let l2_entry_compressed = COPIED | L2_FLAG_COMPRESSED | descriptor;
-
-    let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
-    let comp_end_cluster = 3 + span_clusters;
-    let rt_cluster = comp_end_cluster;
-    let rb_cluster = comp_end_cluster + 1;
-    let total_clusters = (rb_cluster + 8).max(16);
-    let total = CLUSTER_SIZE * total_clusters;
-    let mut f = File::create(path).unwrap();
-    f.set_len(total).unwrap();
-
-    // Header — note compression_type=1 at byte 104, header_length=112,
-    // and the incompatible-features bit set.
-    let mut hdr = [0u8; 4096];
-    hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-    hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
-    hdr[20..24].copy_from_slice(&12u32.to_be_bytes());
-    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes());
-    hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
-    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes());
-    let rt_off = rt_cluster * CLUSTER_SIZE;
-    hdr[48..56].copy_from_slice(&rt_off.to_be_bytes());
-    hdr[56..60].copy_from_slice(&1u32.to_be_bytes());
-    hdr[72..80].copy_from_slice(&INCOMPAT_COMPRESSION_TYPE.to_be_bytes());
-    hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
-    hdr[100..104].copy_from_slice(&112u32.to_be_bytes()); // header_length=112
-    hdr[104] = 1; // compression_type = zstd
-    f.write_all_at(&hdr, 0).unwrap();
-
-    // L1 → L2.
-    let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
-    f.write_all_at(&l1, L1_OFFSET).unwrap();
-
-    // L2 — entry 0 is compressed, rest unallocated.
-    let mut l2 = [0u8; 4096];
-    l2[0..8].copy_from_slice(&l2_entry_compressed.to_be_bytes());
-    f.write_all_at(&l2, L2_OFFSET).unwrap();
-
-    // Compressed bytes (zero-padded to span_bytes).
-    let mut sector_buf = vec![0u8; span_bytes];
-    sector_buf[..compressed.len()].copy_from_slice(&compressed);
-    f.write_all_at(&sector_buf, comp_host_off).unwrap();
-
-    // Refcount table.
-    let mut rt = [0u8; 4096];
-    let rb_off = rb_cluster * CLUSTER_SIZE;
-    rt[0..8].copy_from_slice(&rb_off.to_be_bytes());
-    f.write_all_at(&rt, rt_off).unwrap();
-
-    // Refcount block.
-    let mut rb = [0u8; 4096];
-    for cluster_idx in 0..=rb_cluster {
-        let off = (cluster_idx as usize) * 2;
-        rb[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
-    }
-    f.write_all_at(&rb, rb_off).unwrap();
 }
 
 #[test]
