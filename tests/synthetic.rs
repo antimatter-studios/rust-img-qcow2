@@ -890,3 +890,43 @@ fn extents_iter_handles_freshly_created_all_unallocated_image() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+/// Patch `len` big-endian bytes of `val` into `path` at byte `off`.
+fn patch_be(path: &PathBuf, off: u64, val: u64, len: usize) {
+    use std::io::{Seek, SeekFrom, Write};
+    debug_assert!(len <= 8, "patch_be len must be <= 8, got {len}");
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(off)).unwrap();
+    f.write_all(&val.to_be_bytes()[8 - len..]).unwrap();
+    f.flush().unwrap();
+}
+
+/// open() must enforce Header::check_supported — build a spec-valid image
+/// and flip crypt_method to AES; the reader must refuse it rather than
+/// hand back a handle that would read ciphertext as plaintext.
+#[test]
+fn open_rejects_encrypted_image() {
+    let p = tmp_path("encrypted");
+    build_image(&p);
+    patch_be(&p, 32, 1, 4); // crypt_method = AES at header offset 32
+    match Qcow2Reader::open(&p).err() {
+        Some(qcow2::Error::Unsupported(m)) => assert!(m.contains("encryption")),
+        other => panic!("expected Unsupported(encryption), got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&p);
+}
+
+/// open() must also refuse an image declaring the external-data-file
+/// incompatible feature.
+#[test]
+fn open_rejects_external_data_file_image() {
+    let p = tmp_path("data-file");
+    build_image(&p);
+    // incompatible_features at header offset 72; bit 2 = DATA_FILE.
+    patch_be(&p, 72, 1 << 2, 8);
+    match Qcow2Reader::open(&p).err() {
+        Some(qcow2::Error::Unsupported(m)) => assert_eq!(m, "external data file"),
+        other => panic!("expected Unsupported(external data file), got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&p);
+}
