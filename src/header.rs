@@ -419,6 +419,23 @@ mod tests {
     }
 
     #[test]
+    fn check_supported_rejects_bad_compression_type_even_without_the_flag() {
+        // check_supported gates `compression_type > 1` unconditionally for
+        // v3, independent of whether the COMPRESSION_TYPE incompatible bit
+        // is declared. Exercise the flag-absent path: an out-of-range byte
+        // at offset 104 must still be refused even though
+        // incompatible_features is zero.
+        let mut b = valid_v3_header();
+        // incompatible_features left at 0 (no COMPRESSION_TYPE flag).
+        b[104] = 2; // neither zlib(0) nor zstd(1)
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "unknown compression_type"),
+            other => panic!("expected Unsupported(unknown compression_type), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn check_supported_tolerates_dirty_and_corrupt_advisory_bits() {
         // DIRTY and CORRUPT are recognised (and tolerated) incompatible
         // bits — they must not trip the unknown-bit rejection.

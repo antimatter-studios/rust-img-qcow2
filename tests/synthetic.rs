@@ -894,6 +894,7 @@ fn extents_iter_handles_freshly_created_all_unallocated_image() {
 /// Patch `len` big-endian bytes of `val` into `path` at byte `off`.
 fn patch_be(path: &PathBuf, off: u64, val: u64, len: usize) {
     use std::io::{Seek, SeekFrom, Write};
+    debug_assert!(len <= 8, "patch_be len must be <= 8, got {len}");
     let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     f.seek(SeekFrom::Start(off)).unwrap();
     f.write_all(&val.to_be_bytes()[8 - len..]).unwrap();
