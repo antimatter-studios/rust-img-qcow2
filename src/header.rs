@@ -245,4 +245,186 @@ mod tests {
             Err(Error::UnsupportedVersion(7))
         ));
     }
+
+    /// Build a parseable v3 header (112 bytes so the compression_type
+    /// byte at offset 104 is read). cluster_bits = 16 (64 KiB clusters),
+    /// virtual_size = 1 MiB, l1_size = 1 (the minimum that addresses it).
+    fn valid_v3_header() -> Vec<u8> {
+        let mut b = vec![0u8; 112];
+        b[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        b[4..8].copy_from_slice(&3u32.to_be_bytes()); // version 3
+        b[20..24].copy_from_slice(&16u32.to_be_bytes()); // cluster_bits
+        b[24..32].copy_from_slice(&(1u64 << 20).to_be_bytes()); // virtual_size = 1 MiB
+        b[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size
+        b[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order
+        b[100..104].copy_from_slice(&112u32.to_be_bytes()); // header_length
+        b
+    }
+
+    fn set_u32(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    fn set_u64(b: &mut [u8], off: usize, v: u64) {
+        b[off..off + 8].copy_from_slice(&v.to_be_bytes());
+    }
+
+    #[test]
+    fn parses_valid_v3_header_fields() {
+        let h = Header::parse(&valid_v3_header()).unwrap();
+        assert_eq!(h.version, 3);
+        assert_eq!(h.cluster_bits, 16);
+        assert_eq!(h.cluster_size, 1 << 16);
+        assert_eq!(h.virtual_size, 1 << 20);
+        assert_eq!(h.refcount_order, 4);
+        assert_eq!(h.l2_entries(), (1 << 16) / 8);
+        h.check_supported().unwrap();
+    }
+
+    #[test]
+    fn v2_header_uses_implicit_defaults() {
+        let mut b = valid_v3_header();
+        set_u32(&mut b, 4, 2); // version 2
+        let h = Header::parse(&b).unwrap();
+        // v2 has no feature fields; spec defaults apply.
+        assert_eq!(h.incompatible_features, 0);
+        assert_eq!(h.refcount_order, 4);
+        assert_eq!(h.header_length, 72);
+        assert_eq!(h.compression_type, 0);
+        h.check_supported().unwrap();
+    }
+
+    #[test]
+    fn rejects_cluster_bits_outside_9_to_21() {
+        for bad in [0u32, 8, 22, 31] {
+            let mut b = valid_v3_header();
+            set_u32(&mut b, 20, bad);
+            match Header::parse(&b) {
+                Err(Error::InvalidClusterBits(v)) => assert_eq!(v, bad),
+                other => panic!("cluster_bits {bad}: expected InvalidClusterBits, got {other:?}"),
+            }
+        }
+        // Boundaries 9 and 21 are accepted. Use a small virtual_size so
+        // l1_size = 1 addresses it even at cluster_bits = 9 (where one L1
+        // entry only maps 32 KiB).
+        for ok in [9u32, 21] {
+            let mut b = valid_v3_header();
+            set_u32(&mut b, 20, ok);
+            set_u64(&mut b, 24, 16 * 1024); // 16 KiB virtual disk
+            Header::parse(&b).unwrap_or_else(|e| panic!("cluster_bits {ok} should parse: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn rejects_l1_size_too_small_for_virtual_size() {
+        let mut b = valid_v3_header();
+        // Keep l1_size = 1 but blow up virtual_size so one L1 entry can't
+        // cover it. At cluster_bits=16 one L1 entry maps 512 MiB, so ask
+        // for 2 GiB.
+        set_u64(&mut b, 24, 2u64 << 30);
+        match Header::parse(&b) {
+            Err(Error::Corrupt(_)) => {}
+            other => panic!("expected Corrupt(l1_size too small), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_v3_header_shorter_than_104_bytes() {
+        let mut b = valid_v3_header();
+        b.truncate(96);
+        match Header::parse(&b) {
+            Err(Error::Corrupt(_)) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_type_byte_only_read_when_header_is_long_enough() {
+        // header_length = 104 → the compression_type byte is omitted and
+        // defaults to zlib (0) even if byte 104 happens to be non-zero.
+        let mut b = valid_v3_header();
+        set_u32(&mut b, 100, 104); // header_length = 104
+        b[104] = 1; // would be zstd if it were read
+        let h = Header::parse(&b).unwrap();
+        assert_eq!(
+            h.compression_type, 0,
+            "byte past header_length must be ignored"
+        );
+    }
+
+    #[test]
+    fn check_supported_rejects_encryption() {
+        let mut b = valid_v3_header();
+        set_u32(&mut b, 32, 1); // crypt_method = AES
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert!(m.contains("encryption")),
+            other => panic!("expected Unsupported(encryption), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_supported_rejects_external_data_file() {
+        let mut b = valid_v3_header();
+        set_u64(&mut b, 72, incompat::DATA_FILE);
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "external data file"),
+            other => panic!("expected Unsupported(external data file), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_supported_rejects_extended_l2() {
+        let mut b = valid_v3_header();
+        set_u64(&mut b, 72, incompat::EXTENDED_L2);
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "extended L2 entries"),
+            other => panic!("expected Unsupported(extended L2 entries), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_supported_rejects_unknown_incompatible_bit() {
+        let mut b = valid_v3_header();
+        set_u64(&mut b, 72, 1 << 20); // a bit we don't recognise
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "unknown incompatible_features bit"),
+            other => panic!("expected Unsupported(unknown bit), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_supported_rejects_unknown_compression_type() {
+        let mut b = valid_v3_header();
+        // Declare COMPRESSION_TYPE and an out-of-range compression byte.
+        set_u64(&mut b, 72, incompat::COMPRESSION_TYPE);
+        b[104] = 2; // neither zlib(0) nor zstd(1)
+        let h = Header::parse(&b).unwrap();
+        match h.check_supported() {
+            Err(Error::Unsupported(m)) => assert_eq!(m, "unknown compression_type"),
+            other => panic!("expected Unsupported(unknown compression_type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_supported_accepts_zstd_with_compression_type_bit() {
+        let mut b = valid_v3_header();
+        set_u64(&mut b, 72, incompat::COMPRESSION_TYPE);
+        b[104] = 1; // zstd
+        let h = Header::parse(&b).unwrap();
+        assert_eq!(h.compression_type, 1);
+        h.check_supported().expect("zstd is supported");
+    }
+
+    #[test]
+    fn check_supported_tolerates_dirty_and_corrupt_advisory_bits() {
+        // DIRTY and CORRUPT are recognised (and tolerated) incompatible
+        // bits — they must not trip the unknown-bit rejection.
+        let mut b = valid_v3_header();
+        set_u64(&mut b, 72, incompat::DIRTY | incompat::CORRUPT);
+        let h = Header::parse(&b).unwrap();
+        h.check_supported().expect("dirty/corrupt are tolerated");
+    }
 }
