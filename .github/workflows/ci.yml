@@ -30,7 +30,7 @@ jobs:
           path: rust-partitions
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
+          toolchain: 1.95.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
@@ -54,7 +54,7 @@ jobs:
           path: rust-img-qcow2
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
+          toolchain: 1.95.0
           components: rustfmt
       - name: fmt --check
         working-directory: rust-img-qcow2
@@ -82,7 +82,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-utils
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-img-qcow2
