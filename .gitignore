@@ -2,3 +2,10 @@
 **/*.rs.bk
 .DS_Store
 /test-images
+
+# Build output. `chore staticlib` writes the archive and headers here for a
+# consumer to copy out of (`chore artifact` prints this directory).
+/dist/
+
+# chore fingerprint cache (sources:/generates: checksums). Derived data.
+.chore/
