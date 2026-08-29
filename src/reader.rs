@@ -61,6 +61,52 @@ enum ClusterMap {
     Compressed { host_off: u64, byte_len: usize },
 }
 
+/// What a freshly allocated cluster has to be filled with *before* the
+/// caller's payload is spliced into it — that is, whatever a reader sees
+/// at that virtual offset today.
+///
+/// This is the copy-up step, and it is the only thing that differs
+/// between the allocating cases in [`Qcow2Reader::write_at`]. It has to
+/// be exhaustive: repointing L2 stops the old source from ever being
+/// consulted again, so anything the seed fails to reproduce is lost.
+#[derive(Debug, Clone, Copy)]
+enum ClusterSeed {
+    /// The v3 zero flag: the cluster reads as zeros on its own account
+    /// and never defers to the backing chain, so zeros are the whole
+    /// truth about what it holds.
+    Zeros,
+    /// An unallocated cluster reads *through* to the backing chain, so
+    /// the parent's cluster has to be copied up. With no parent this
+    /// still yields zeros — but for a different reason than [`Zeros`],
+    /// which is why the two are not one case.
+    ///
+    /// [`Zeros`]: ClusterSeed::Zeros
+    BackingChain,
+    /// A plain host cluster being cloned because it is shared
+    /// (copy-on-write).
+    HostCluster(u64),
+    /// A compressed cluster being rewritten as an uncompressed one.
+    Compressed { host_off: u64, byte_len: usize },
+}
+
+/// How [`Qcow2Reader::write_at`] lands one chunk into the cluster that
+/// holds it. Exactly one case writes through; every other case is the
+/// same allocate-seed-splice-publish sequence with a different
+/// [`ClusterSeed`].
+#[derive(Debug, Clone, Copy)]
+enum WritePlan {
+    /// The cluster is allocated, uncompressed and ours alone — write
+    /// straight into it, no allocation and no seed.
+    InPlace { host_off: u64 },
+    /// The cluster cannot be written through, so a fresh one is
+    /// allocated and seeded. `release` names the host cluster whose
+    /// refcount is dropped once L2 points at the replacement.
+    Reallocate {
+        seed: ClusterSeed,
+        release: Option<u64>,
+    },
+}
+
 /// Public-facing status of a virtual cluster. Coarser than the
 /// internal [`ClusterMap`] (which carries host offsets and compressed-
 /// span sizes): the consumer of `extents()` only needs to know whether
@@ -402,20 +448,21 @@ impl Qcow2Reader {
         self.dev.flush().map_err(fs_core_to_qcow2_error)
     }
 
-    /// Write to the image. Behaviour by cluster state:
+    /// Write to the image. Every cluster state is handled by the same
+    /// two-case shape, decided by [`Qcow2Reader::plan_write`]:
     ///
     /// - **Allocated, uncompressed, single-ref**: direct write to the
-    ///   existing host cluster.
-    /// - **Unallocated or v3-zero-flagged**: allocate a fresh host
-    ///   cluster, zero-initialise it, write the user payload at the
-    ///   in-cluster offset, update L2 (with COPIED set). If the L1 entry
-    ///   was unallocated, an L2 table is allocated first.
-    /// - **Compressed**: decompress into a full-cluster buffer, splice
-    ///   the user payload in, allocate a fresh uncompressed host
-    ///   cluster, write the modified buffer, repoint L2. The old
-    ///   compressed cluster's refcount is currently left in place —
-    ///   `qemu-img check` will report it as a leak; Phase D adds the
-    ///   decrement.
+    ///   existing host cluster. Nothing is allocated.
+    /// - **Everything else** — shared, compressed, zero-flagged or
+    ///   unallocated: allocate a fresh host cluster, *seed* it with the
+    ///   bytes a reader sees at this offset today, splice the caller's
+    ///   payload in, repoint L2 (with COPIED set), then drop the old
+    ///   cluster's refcount if it had one. If the L1 entry was
+    ///   unallocated, an L2 table is allocated first.
+    ///
+    /// The seed is the only step that differs between those cases; see
+    /// [`ClusterSeed`] for what each state has to be seeded with and why
+    /// zero-flagged and unallocated clusters are not the same case.
     ///
     /// Crash-safety ordering: refcount → data → metadata, with
     /// `dev.flush()` between each step. A crash mid-allocation may leak a
@@ -458,99 +505,42 @@ impl Qcow2Reader {
 
         let cluster_size = self.header.cluster_size;
         let cluster_mask = cluster_size - 1;
-        let l2_entries = self.header.l2_entries();
 
         let mut cursor = offset;
         let mut written = 0usize;
 
         while cursor < end {
-            let in_cluster = cursor & cluster_mask;
-            let chunk = std::cmp::min(cluster_size - in_cluster, end - cursor) as usize;
+            let in_cluster = (cursor & cluster_mask) as usize;
+            let chunk = std::cmp::min(cluster_size - in_cluster as u64, end - cursor) as usize;
             let src = &buf[written..written + chunk];
 
-            let map = self.lookup_cluster(cursor)?;
-            match map {
-                ClusterMap::Plain { host_off, copied } => {
-                    // COPIED bit (L2 bit 63) is the spec's promise that
-                    // refcount == 1, so we can write in place without
-                    // touching the refcount table. When it's clear we have
-                    // to consult the actual refcount: a value > 1 means
-                    // the cluster is shared (with an internal snapshot,
-                    // with another L2 entry, etc.) and writing through
-                    // would mutate the snapshot's view. In that case we
-                    // CoW: allocate a fresh cluster, duplicate the
-                    // contents, splice in the user payload, repoint L2,
-                    // then drop the old refcount.
-                    let needs_cow = if copied {
-                        false
-                    } else {
-                        self.read_refcount(host_off)? > 1
-                    };
-                    if !needs_cow {
-                        self.dev_write(host_off + in_cluster, src)?;
-                    } else {
-                        let virt_cluster = cursor / cluster_size;
-                        let mut full = vec![0u8; cluster_size as usize];
-                        self.dev_read(host_off, &mut full)?;
-                        full[in_cluster as usize..in_cluster as usize + chunk].copy_from_slice(src);
-
-                        // Crash-safety order:
-                        //   data → refcount(new=1) → L2 → refcount(old-1).
-                        // allocate_cluster already wrote refcount=1 for
-                        // the new cluster; the data write follows; only
-                        // after L2 is repointed do we drop the old refcount.
-                        let new_host = self.allocate_cluster()?;
-                        self.dev_write(new_host, &full)?;
-                        self.dev_flush()?;
-                        let l1_idx = (virt_cluster / l2_entries) as u32;
-                        let l2_idx = (virt_cluster % l2_entries) as u32;
-                        let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
-                        self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
-
-                        // Drop the snapshot's outstanding share by 1.
-                        // Failure here leaks one refcount but never
-                        // corrupts data — fsck-recoverable.
-                        let _ = self.decrement_refcount(host_off);
-                    }
+            match self.plan_write(self.lookup_cluster(cursor)?)? {
+                WritePlan::InPlace { host_off } => {
+                    self.dev_write(host_off + in_cluster as u64, src)?;
                 }
-                ClusterMap::Compressed { host_off, byte_len } => {
-                    // Read+decompress the existing cluster, splice in the
-                    // user's slice, allocate a fresh uncompressed host
-                    // cluster, write, repoint L2, then decrement the old
-                    // compressed cluster's refcount so its host cluster
-                    // is reusable. Crash-safety order:
+                WritePlan::Reallocate { seed, release } => {
+                    // Seed the new cluster with what a reader sees at
+                    // `cursor` today, splice the caller's bytes into it,
+                    // publish it, then drop the old cluster's share.
+                    //
+                    // Crash-safety order:
                     //   data → refcount(new=1) → L2 → refcount(old-1).
-                    let virt_cluster = cursor / cluster_size;
-                    let mut full = vec![0u8; cluster_size as usize];
-                    self.read_decompressed_slice(virt_cluster, host_off, byte_len, 0, &mut full)?;
-                    full[in_cluster as usize..in_cluster as usize + chunk].copy_from_slice(src);
+                    // allocate_cluster already wrote refcount=1 for the
+                    // new cluster; the data write follows; only once L2
+                    // is repointed do we drop the old refcount. Failing
+                    // that last step leaks one refcount but never
+                    // corrupts data — fsck-recoverable.
+                    let mut full = self.seed_cluster(cursor, seed)?;
+                    full[in_cluster..in_cluster + chunk].copy_from_slice(src);
 
                     let new_host = self.allocate_cluster()?;
                     self.dev_write(new_host, &full)?;
                     self.dev_flush()?;
-                    let l1_idx = (virt_cluster / l2_entries) as u32;
-                    let l2_idx = (virt_cluster % l2_entries) as u32;
-                    let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
-                    self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
+                    self.repoint_l2(cursor, new_host)?;
 
-                    // Old cluster has no L2 reference now; release it.
-                    // If decrement fails the cluster leaks but the image
-                    // stays consistent — fsck-recoverable.
-                    let _ = self.decrement_refcount(host_off);
-                }
-                ClusterMap::Zero | ClusterMap::Unallocated => {
-                    // Phase B: allocate a fresh cluster, zero-init it,
-                    // write the slice the caller asked for, point L2 at
-                    // it.
-                    let new_host = self.allocate_cluster()?;
-                    self.zero_cluster(new_host)?;
-                    self.dev_write(new_host + in_cluster, src)?;
-                    self.dev_flush()?;
-                    let virt_cluster = cursor / cluster_size;
-                    let l1_idx = (virt_cluster / l2_entries) as u32;
-                    let l2_idx = (virt_cluster % l2_entries) as u32;
-                    let new_entry = (new_host & OFFSET_MASK) | L2_FLAG_COPIED;
-                    self.update_l2_entry(l1_idx, l2_idx, new_entry)?;
+                    if let Some(old_host) = release {
+                        let _ = self.decrement_refcount(old_host);
+                    }
                 }
             }
 
@@ -558,6 +548,84 @@ impl Qcow2Reader {
             written += chunk;
         }
         Ok(())
+    }
+
+    /// Decide how a chunk lands in a cluster whose L2 lookup gave `map`.
+    ///
+    /// Every case but the first allocates, and they differ in exactly one
+    /// thing — the seed. Making that decision here, once, rather than
+    /// inline in a branch per cluster state, is what keeps it visible
+    /// that [`ClusterMap::Zero`] and [`ClusterMap::Unallocated`] do *not*
+    /// seed the same way.
+    fn plan_write(&self, map: ClusterMap) -> Result<WritePlan> {
+        Ok(match map {
+            ClusterMap::Plain { host_off, copied } => {
+                // COPIED (L2 bit 63) is the spec's promise that
+                // refcount == 1, so we can write in place without
+                // touching the refcount table. When it's clear we have to
+                // consult the actual refcount: a value > 1 means the
+                // cluster is shared (with an internal snapshot, with
+                // another L2 entry, etc.) and writing through would
+                // mutate the sharer's view.
+                let shared = !copied && self.read_refcount(host_off)? > 1;
+                if shared {
+                    WritePlan::Reallocate {
+                        seed: ClusterSeed::HostCluster(host_off),
+                        release: Some(host_off),
+                    }
+                } else {
+                    WritePlan::InPlace { host_off }
+                }
+            }
+            // The replacement is uncompressed, so the old compressed
+            // cluster loses its only L2 reference and can be released.
+            ClusterMap::Compressed { host_off, byte_len } => WritePlan::Reallocate {
+                seed: ClusterSeed::Compressed { host_off, byte_len },
+                release: Some(host_off),
+            },
+            ClusterMap::Zero => WritePlan::Reallocate {
+                seed: ClusterSeed::Zeros,
+                release: None,
+            },
+            ClusterMap::Unallocated => WritePlan::Reallocate {
+                seed: ClusterSeed::BackingChain,
+                release: None,
+            },
+        })
+    }
+
+    /// Materialise a whole cluster holding exactly what a reader sees at
+    /// virtual offset `virt` right now, ready for the caller's payload to
+    /// be spliced into it. See [`ClusterSeed`] for why each state seeds
+    /// the way it does.
+    fn seed_cluster(&self, virt: u64, seed: ClusterSeed) -> Result<Vec<u8>> {
+        let cluster_size = self.header.cluster_size;
+        let mut full = vec![0u8; cluster_size as usize];
+        match seed {
+            ClusterSeed::Zeros => {}
+            ClusterSeed::HostCluster(host_off) => self.dev_read(host_off, &mut full)?,
+            ClusterSeed::Compressed { host_off, byte_len } => {
+                self.read_decompressed_slice(virt / cluster_size, host_off, byte_len, 0, &mut full)?
+            }
+            // Cluster-aligned on purpose: we are reproducing the entire
+            // cluster the backing chain would have served, not just the
+            // slice the caller happens to be overwriting.
+            ClusterSeed::BackingChain => {
+                self.read_unallocated(virt & !(cluster_size - 1), &mut full)?
+            }
+        }
+        Ok(full)
+    }
+
+    /// Point the L2 entry covering virtual offset `virt` at a host
+    /// cluster we have just allocated. Such a cluster has refcount 1 by
+    /// construction, which is exactly what COPIED asserts.
+    fn repoint_l2(&self, virt: u64, new_host: u64) -> Result<()> {
+        let virt_cluster = virt / self.header.cluster_size;
+        let l2_entries = self.header.l2_entries();
+        let l1_idx = (virt_cluster / l2_entries) as u32;
+        let l2_idx = (virt_cluster % l2_entries) as u32;
+        self.update_l2_entry(l1_idx, l2_idx, (new_host & OFFSET_MASK) | L2_FLAG_COPIED)
     }
 
     /// Find a host cluster with refcount = 0, increment it to 1, and

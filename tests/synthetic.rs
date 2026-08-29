@@ -268,6 +268,89 @@ fn write_to_unallocated_cluster_allocates_phase_b() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Allocating on write must copy the backing chain up first.
+///
+/// While the child's L2 entry is zero, virt cluster 0 reads *through* to
+/// the parent. The instant the write repoints that entry at a real host
+/// cluster the fall-through stops, so every byte the caller did not write
+/// has to already be sitting in the new cluster. Zero-filling it instead
+/// silently throws the parent's data away.
+#[test]
+fn write_to_unallocated_cluster_of_backed_image_copies_up_from_parent() {
+    let (parent, child, rel) = pair_paths("backed_copy_up");
+    // Parent's virt cluster 0 is a full cluster of 0xAA.
+    build_image(&parent);
+    // Child has no L2 entries at all, so virt cluster 0 is unallocated.
+    build_child_with_backing(&child, &rel, &[]);
+
+    {
+        let r = Qcow2Reader::open_rw(&child).unwrap();
+        assert!(r.has_backing());
+        r.write_at(200, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        r.flush().unwrap();
+    }
+
+    let r = Qcow2Reader::open(&child).unwrap();
+    assert_eq!(
+        r.cluster_status_at(0).unwrap(),
+        qcow2::ClusterStatus::Allocated,
+        "the write must have allocated the cluster in the child"
+    );
+
+    let mut cluster = vec![0u8; CLUSTER_SIZE as usize];
+    r.read_at(0, &mut cluster).unwrap();
+
+    assert_eq!(
+        &cluster[200..204],
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+        "the caller's payload"
+    );
+    assert!(
+        cluster[..200].iter().all(|&b| b == 0xAA),
+        "head of the cluster must still hold the parent's 0xAA, got {:02x?}",
+        &cluster[..8]
+    );
+    assert!(
+        cluster[204..].iter().all(|&b| b == 0xAA),
+        "tail of the cluster must still hold the parent's 0xAA, got {:02x?}",
+        &cluster[204..212]
+    );
+
+    let _ = std::fs::remove_file(&parent);
+    let _ = std::fs::remove_file(&child);
+}
+
+/// The flip side: a v3 zero-flagged cluster genuinely reads as zeros and
+/// must *not* pick the parent's data up on write, even though the parent
+/// has data at that offset. Zero and Unallocated are not the same case.
+#[test]
+fn write_to_zero_flagged_cluster_of_backed_image_does_not_copy_up() {
+    let (parent, child, rel) = pair_paths("backed_zero_no_copy_up");
+    // Parent's virt cluster 0 is a full cluster of 0xAA.
+    build_image(&parent);
+    // Child explicitly zeroes virt cluster 0, overriding the chain.
+    build_child_with_backing(&child, &rel, &[(0, COPIED | L2_FLAG_ZERO)]);
+
+    {
+        let r = Qcow2Reader::open_rw(&child).unwrap();
+        r.write_at(200, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        r.flush().unwrap();
+    }
+
+    let r = Qcow2Reader::open(&child).unwrap();
+    let mut cluster = vec![0xFFu8; CLUSTER_SIZE as usize];
+    r.read_at(0, &mut cluster).unwrap();
+
+    assert_eq!(&cluster[200..204], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert!(
+        cluster[..200].iter().all(|&b| b == 0) && cluster[204..].iter().all(|&b| b == 0),
+        "a zero-flagged cluster must stay zeros around the payload, not adopt the parent's 0xAA"
+    );
+
+    let _ = std::fs::remove_file(&parent);
+    let _ = std::fs::remove_file(&child);
+}
+
 #[test]
 fn write_to_zero_flagged_cluster_allocates_phase_b() {
     let path = tmp_path("write_alloc_b_zero");
