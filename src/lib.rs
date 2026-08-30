@@ -1,9 +1,11 @@
-//! Pure-Rust QCOW2 reader.
+//! Pure-Rust QCOW2 reader and writer.
 //!
 //! Supported now:
-//! - Uncompressed and zlib-compressed clusters
-//! - Backing-file chain (recursive)
+//! - Uncompressed clusters, read and written
+//! - zlib- and zstd-compressed clusters, read
+//! - Backing-file chain (recursive), including copy-up on write
 //! - Sparse / v3 zero-flagged clusters
+//! - Cluster allocation and refcount maintenance (`open_rw`)
 //!
 //! Implements [`fs_core::BlockRead`] so any consumer that takes a
 //! `BlockRead` (partition probe, fs driver, slice adapter) can drive a
