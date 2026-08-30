@@ -25,18 +25,28 @@ extern "C" {
  *
  * Currently supported features (matching the Rust reader):
  *   - QCOW2 v2 and v3
- *   - Uncompressed and zlib-compressed clusters
+ *   - Uncompressed clusters, read and written
+ *   - zlib- and zstd-compressed clusters, read
  *   - Sparse / v3 zero-flagged clusters
- *   - Backing-file chains (recursive, depth-limited)
+ *   - Backing-file chains (recursive, depth-limited), with copy-up on
+ *     write
  *
  * `qcow2_open` opens read-only — `fs_core_device_write_at` returns
  * FS_CORE_READ_ONLY.
  *
- * `qcow2_open_rw` opens read-write under Phase A constraints: writes
- * succeed only against already-allocated, single-reference,
- * uncompressed clusters; everything else (allocation, decompress-rewrite,
- * snapshot CoW) returns FS_CORE_CUSTOM with detail in
- * fs_core_last_error_message().
+ * `qcow2_open_rw` opens read-write. Writes allocate clusters as needed,
+ * maintain refcounts, and copy a cluster up from the backing chain
+ * before overwriting part of it.
+ *
+ * Still refused, with FS_CORE_CUSTOM and detail in
+ * fs_core_last_error_message():
+ *   - images with internal snapshots (nb_snapshots > 0)
+ *   - refcount_order != 4 (only u16 refcounts are handled)
+ *   - images with no refcount table, or whose refcount blocks are all
+ *     full (refcount-block growth is not implemented)
+ *
+ * A write to a COMPRESSED cluster allocates an uncompressed one in its
+ * place rather than re-compressing.
  */
 FsCoreDevice *qcow2_open(const char *path);
 FsCoreDevice *qcow2_open_rw(const char *path);

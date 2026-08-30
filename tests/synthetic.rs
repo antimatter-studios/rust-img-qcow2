@@ -1013,3 +1013,52 @@ fn open_rejects_external_data_file_image() {
     }
     let _ = std::fs::remove_file(&p);
 }
+
+/// A malformed image whose refcount block marks host cluster 0 free must
+/// not be handed that cluster by the allocator.
+///
+/// Cluster 0 holds the header. `allocate_cluster` scans from block 0,
+/// entry 0, so a refcount of zero there made it the first free cluster
+/// found — and the caller immediately zero-fills what it is given, which
+/// wipes the header. The L2 entry written afterwards is `0 | COPIED`,
+/// which `lookup_cluster` reads straight back as `Unallocated`, so the
+/// write is lost as well.
+///
+/// Every well-formed image marks cluster 0 in use, which is why no
+/// fixture reached this and why it has to be built deliberately.
+#[test]
+fn allocator_refuses_the_header_cluster() {
+    let path = tmp_path("refcount_zero_cluster0");
+    build_image(&path);
+
+    // Clear the refcount for host cluster 0 only, leaving 1..=6 in use.
+    // `WriteAt` is the portable seek-then-write in `tests/common`; the
+    // positional syscalls it stands in for are Unix-only, and CI runs
+    // this on Windows too.
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&0u16.to_be_bytes(), REFCOUNT_BLOCK_OFFSET)
+            .unwrap();
+    }
+
+    let r = Qcow2Reader::open_rw(&path).unwrap();
+
+    // Writing into an unallocated virtual cluster forces an allocation.
+    let err = r
+        .write_at(CLUSTER_SIZE * 3, &[0xEEu8; 512])
+        .expect_err("the allocator must not hand out the header cluster");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cluster 0"),
+        "the refusal should name the cluster, got: {msg}"
+    );
+
+    // And the header survived.
+    drop(r);
+    let mut magic = [0u8; 4];
+    let mut hf = std::fs::File::open(&path).unwrap();
+    hf.read_exact_at(&mut magic, 0).unwrap();
+    assert_eq!(&magic, b"QFI\xfb", "the header was overwritten");
+
+    let _ = std::fs::remove_file(&path);
+}

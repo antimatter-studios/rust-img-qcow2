@@ -1,15 +1,19 @@
 //! Read path: virtual offset -> L1 -> L2 -> host offset -> file read.
 //!
 //! Supported now:
-//! - Uncompressed clusters
-//! - Zlib-compressed clusters (raw deflate per the spec)
+//! - Uncompressed clusters, read and written
+//! - Zlib-compressed clusters (raw deflate per the spec), read
+//! - Zstd-compressed clusters (v3 `compression_type = 1`), read
 //! - Backing-file chain (recursive, only when opened by path — the
-//!   on-device API has no path context to resolve a parent against)
+//!   on-device API has no path context to resolve a parent against),
+//!   with copy-up when a write lands on a cluster the parent supplies
 //! - Sparse / v3 zero-flagged clusters
+//! - Cluster allocation and refcount maintenance
 //!
 //! Not yet:
-//! - Internal snapshots, encryption, external data file, non-zlib
-//!   compression types (zstd), extended L2.
+//! - Internal snapshots, encryption, external data file, extended L2
+//! - Writing compressed clusters: a write to a compressed cluster
+//!   allocates an uncompressed one in its place.
 //!
 //! ## Backing storage
 //!
@@ -703,6 +707,22 @@ impl Qcow2Reader {
                 if refcount == 0 {
                     let host_cluster_idx =
                         (block_idx as u64) * entries_per_block + (entry_idx as u64);
+
+                    // Host cluster 0 holds the header. A well-formed
+                    // image always marks it in use, so the scan never
+                    // reaches here — but this crate reads images it does
+                    // not trust, and a malformed one that leaves its
+                    // refcount at zero would be handed cluster 0, which
+                    // the caller immediately zero-fills. That wipes the
+                    // header, and the L2 entry written afterwards is
+                    // `0 | COPIED`, which `lookup_cluster` reads straight
+                    // back as Unallocated.
+                    if host_cluster_idx == 0 {
+                        return Err(Error::Corrupt(
+                            "refcount table marks host cluster 0 (the header) as free",
+                        ));
+                    }
+
                     let host_off = host_cluster_idx * cluster_size;
 
                     block_bytes[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
