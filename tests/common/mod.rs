@@ -43,6 +43,13 @@ pub const L2_FLAG_COMPRESSED: u64 = 1u64 << 62;
 /// `compression_type != 0`.
 pub const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
 
+/// Positional I/O that works on every target.
+///
+/// `std::os::unix::fs::FileExt` has `write_all_at` and `read_exact_at`,
+/// and does not exist on Windows — where CI also runs. Seek-then-read
+/// is the portable equivalent, which is why these take `&mut self`: the
+/// file cursor moves, so the same handle cannot be shared across
+/// threads the way the positional syscalls can.
 pub trait WriteAt {
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> std::io::Result<()>;
 }
@@ -51,6 +58,18 @@ impl WriteAt for File {
         use std::io::{Seek, SeekFrom};
         self.seek(SeekFrom::Start(offset))?;
         self.write_all(buf)
+    }
+}
+
+/// The reading half of [`WriteAt`], for the same reason.
+pub trait ReadAt {
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+}
+impl ReadAt for File {
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.seek(SeekFrom::Start(offset))?;
+        self.read_exact(buf)
     }
 }
 

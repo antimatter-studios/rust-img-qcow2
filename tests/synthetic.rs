@@ -1028,14 +1028,15 @@ fn open_rejects_external_data_file_image() {
 /// fixture reached this and why it has to be built deliberately.
 #[test]
 fn allocator_refuses_the_header_cluster() {
-    use std::os::unix::fs::FileExt;
-
     let path = tmp_path("refcount_zero_cluster0");
     build_image(&path);
 
     // Clear the refcount for host cluster 0 only, leaving 1..=6 in use.
+    // `WriteAt` is the portable seek-then-write in `tests/common`; the
+    // positional syscalls it stands in for are Unix-only, and CI runs
+    // this on Windows too.
     {
-        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.write_all_at(&0u16.to_be_bytes(), REFCOUNT_BLOCK_OFFSET)
             .unwrap();
     }
@@ -1055,10 +1056,8 @@ fn allocator_refuses_the_header_cluster() {
     // And the header survived.
     drop(r);
     let mut magic = [0u8; 4];
-    std::fs::File::open(&path)
-        .unwrap()
-        .read_exact_at(&mut magic, 0)
-        .unwrap();
+    let mut hf = std::fs::File::open(&path).unwrap();
+    hf.read_exact_at(&mut magic, 0).unwrap();
     assert_eq!(&magic, b"QFI\xfb", "the header was overwritten");
 
     let _ = std::fs::remove_file(&path);
