@@ -81,17 +81,42 @@ Corrected, including what is genuinely still missing.
 
 ### M12 — the allocator could hand out the header cluster — **fixed**, see above.
 
-### M1, M2, M5, M6, M7, M8, M9 — duplication and bare literals — **fixable, not yet done**
+### M2 — `decrement_refcount` and `read_refcount` were thirty near-identical lines — **fixed**
 
-All genuine: the refcount-width preamble three times; `decrement_refcount` and
-`read_refcount` differing only in a final step; `8` as the table-entry size at
-13 sites; header offsets open-coded six ways; the two fixture builders 95%
-identical; `OFFSET_MASK`'s value written longhand 11 times; and the
+Both locate a cluster's refcount entry the same way: width check, entries per
+block, block and entry index, table bounds, block pointer. Then they diverge —
+and **the divergence is correct**, which is what made this worth care rather than
+a mechanical merge:
+
+| when the entry is absent | `read_refcount` | `decrement_refcount` |
+|---|---|---|
+| past the table's coverage | `Ok(0)` | `Corrupt` |
+| block not allocated | `Ok(0)` | `Corrupt` |
+
+Reading a refcount for an uncovered cluster legitimately means *no references* —
+the cluster is not live, so there is no share to copy away from. Decrementing one
+means the caller is releasing something never recorded as taken.
+
+A reader had to diff the two functions to discover that. `locate_refcount_entry`
+now returns a `RefcountEntryLocation` with the absent cases as **separate
+variants**, and each caller answers them in its own words. Nothing got vaguer in
+order to be shared, which is the line worth holding.
+
+**The probe found a real coverage gap**, recorded here rather than papered over.
+Changing `entries_per_block` from `cluster_size / 2` to `/ 4` in
+`decrement_refcount` failed **nothing**: every fixture is small enough that
+`host_cluster_idx < entries_per_block`, so `block_idx` is always 0 and the
+divisor never shows. **No test image spans two refcount blocks**, and reaching
+one needs a fixture over 2048 clusters. The consolidation at least means the two
+functions can no longer disagree about it — mutating the shared arithmetic now
+fails 3 tests where the duplicated copy failed 0.
+
+### M1, M5, M6, M7, M8, M9 — duplication and bare literals — **fixable, not yet done**
+
+The refcount-width preamble three times; `8` as the table-entry size at 13 sites;
+header offsets open-coded six ways; the two fixture builders 95% identical;
+`OFFSET_MASK`'s value written longhand 11 times; and the
 `(host & MASK) | COPIED` construction four times.
-
-Deferred as one deduplication change with the synthetic and qemu-validation
-suites as the contract. Folding them into a pass that is otherwise comments and
-one bug fix would make the diff hard to review for the thing that matters.
 
 ### M3, M4 — `write_at` and `allocate_cluster` are god functions (129 and 104 lines) — **needs your decision**
 
@@ -111,5 +136,5 @@ The fix is to encode it in a type, which changes the cache's shape.
 
 ## Verification
 
-56 tests pass across all binaries, up from 55 — the new one being the header
+56 tests pass across all binaries — the new one being the header
 cluster regression. `chore lint` clean.

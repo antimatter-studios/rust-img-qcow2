@@ -36,6 +36,25 @@ use std::sync::{Arc, Mutex};
 /// Bits 9..55 inclusive — host cluster offset for L1 and uncompressed L2.
 const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
 
+/// Where a cluster's refcount entry is, or why there is not one.
+///
+/// The absent cases are separate variants rather than a single `None`
+/// because the two callers answer them differently and the error text
+/// differs: "past table coverage" and "block not allocated" are
+/// distinguishable corruptions.
+enum RefcountEntryLocation {
+    /// The entry exists, in the refcount block at `block_off`.
+    At {
+        block_off: u64,
+        /// Byte offset of the entry within that block.
+        byte_in_block: usize,
+    },
+    /// The refcount table does not reach this cluster.
+    PastTableCoverage,
+    /// The table reaches it, but the block it points at is a hole.
+    BlockNotAllocated,
+}
+
 /// L2 entry flags.
 const L2_FLAG_COMPRESSED: u64 = 1 << 62;
 /// v3 only: when bit 62 is clear, bit 0 means "this cluster reads as zeros".
@@ -787,7 +806,25 @@ impl Qcow2Reader {
     /// in-use, becoming a "clean leak" recoverable by `qemu-img check`.
     /// Real compressed payloads almost always fit in one host cluster,
     /// so the leak window is rare in practice.
-    fn decrement_refcount(&self, host_off: u64) -> Result<()> {
+    /// Where the refcount entry for the cluster containing `host_off`
+    /// lives, or why it does not.
+    ///
+    /// The two callers disagree about what absence means, and that
+    /// disagreement is correct rather than accidental — which is why
+    /// this returns it rather than deciding:
+    ///
+    /// - [`Qcow2Reader::read_refcount`] treats an uncovered or
+    ///   unallocated range as **zero references**. The cluster is not
+    ///   live, so there is no share to copy away from.
+    /// - [`Qcow2Reader::decrement_refcount`] treats it as **corruption**.
+    ///   A caller releasing a cluster the table does not cover is
+    ///   releasing something that was never recorded as taken.
+    ///
+    /// Sharing the arithmetic while keeping that split is the point.
+    /// The two functions were thirty near-identical lines apart, and a
+    /// reader had to diff them to discover that the divergence was
+    /// deliberate.
+    fn locate_refcount_entry(&self, host_off: u64) -> Result<RefcountEntryLocation> {
         let cluster_size = self.header.cluster_size;
         let refcount_bits = if self.header.version >= 3 {
             1u32 << self.header.refcount_order
@@ -799,6 +836,7 @@ impl Qcow2Reader {
                 "non-16-bit refcount entries (refcount_order != 4)",
             ));
         }
+        // Two bytes per entry, because the width above is 16 bits.
         let entries_per_block = cluster_size / 2;
 
         let host_cluster_idx = host_off / cluster_size;
@@ -808,30 +846,50 @@ impl Qcow2Reader {
         let rt_off = self.header.refcount_table_offset;
         let rt_clusters = self.header.refcount_table_clusters as u64;
         if rt_off == 0 || rt_clusters == 0 {
-            return Err(Error::Unsupported(
-                "no refcount table (cannot decrement refcount)",
-            ));
+            return Err(Error::Unsupported("no refcount table"));
         }
-        let rt_size = rt_clusters * cluster_size;
-        if block_idx * 8 >= rt_size {
-            return Err(Error::Corrupt(
-                "decrement: host cluster past refcount table coverage",
-            ));
+        if block_idx * 8 >= rt_clusters * cluster_size {
+            return Ok(RefcountEntryLocation::PastTableCoverage);
         }
 
         let mut rt_entry_bytes = [0u8; 8];
         self.dev_read(rt_off + block_idx * 8, &mut rt_entry_bytes)?;
         let block_off = u64::from_be_bytes(rt_entry_bytes);
         if block_off == 0 {
-            return Err(Error::Corrupt(
-                "decrement: refcount block not allocated for this range",
-            ));
+            return Ok(RefcountEntryLocation::BlockNotAllocated);
         }
+
+        Ok(RefcountEntryLocation::At {
+            block_off,
+            byte_in_block: (entry_idx as usize) * 2,
+        })
+    }
+
+    fn decrement_refcount(&self, host_off: u64) -> Result<()> {
+        let cluster_size = self.header.cluster_size;
+        let (block_off, off) = match self.locate_refcount_entry(host_off)? {
+            RefcountEntryLocation::At {
+                block_off,
+                byte_in_block,
+            } => (block_off, byte_in_block),
+            // Releasing a cluster the table does not cover means the
+            // caller believes it took something that was never recorded
+            // as taken.
+            RefcountEntryLocation::PastTableCoverage => {
+                return Err(Error::Corrupt(
+                    "decrement: host cluster past refcount table coverage",
+                ))
+            }
+            RefcountEntryLocation::BlockNotAllocated => {
+                return Err(Error::Corrupt(
+                    "decrement: refcount block not allocated for this range",
+                ))
+            }
+        };
 
         let mut block_bytes = vec![0u8; cluster_size as usize];
         self.dev_read(block_off, &mut block_bytes)?;
 
-        let off = (entry_idx as usize) * 2;
         let cur = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
         if cur == 0 {
             return Err(Error::Corrupt(
@@ -855,45 +913,20 @@ impl Qcow2Reader {
     /// (treats absence as "no share to worry about" — the cluster also
     /// isn't really live, and the caller will alloc fresh either way).
     fn read_refcount(&self, host_off: u64) -> Result<u16> {
-        let cluster_size = self.header.cluster_size;
-        let refcount_bits = if self.header.version >= 3 {
-            1u32 << self.header.refcount_order
-        } else {
-            16
+        let (block_off, off) = match self.locate_refcount_entry(host_off)? {
+            RefcountEntryLocation::At {
+                block_off,
+                byte_in_block,
+            } => (block_off, byte_in_block),
+            // No entry means no references — the cluster is not live, so
+            // there is no share to copy away from.
+            RefcountEntryLocation::PastTableCoverage | RefcountEntryLocation::BlockNotAllocated => {
+                return Ok(0)
+            }
         };
-        if refcount_bits != 16 {
-            return Err(Error::Unsupported(
-                "non-16-bit refcount entries (refcount_order != 4)",
-            ));
-        }
-        let entries_per_block = cluster_size / 2;
 
-        let host_cluster_idx = host_off / cluster_size;
-        let block_idx = host_cluster_idx / entries_per_block;
-        let entry_idx = host_cluster_idx % entries_per_block;
-
-        let rt_off = self.header.refcount_table_offset;
-        let rt_clusters = self.header.refcount_table_clusters as u64;
-        if rt_off == 0 || rt_clusters == 0 {
-            return Err(Error::Unsupported(
-                "no refcount table (cannot read refcount)",
-            ));
-        }
-        let rt_size = rt_clusters * cluster_size;
-        if block_idx * 8 >= rt_size {
-            return Ok(0);
-        }
-
-        let mut rt_entry_bytes = [0u8; 8];
-        self.dev_read(rt_off + block_idx * 8, &mut rt_entry_bytes)?;
-        let block_off = u64::from_be_bytes(rt_entry_bytes);
-        if block_off == 0 {
-            return Ok(0);
-        }
-
-        let off_in_block = (entry_idx as usize) * 2;
         let mut entry_bytes = [0u8; 2];
-        self.dev_read(block_off + off_in_block as u64, &mut entry_bytes)?;
+        self.dev_read(block_off + off as u64, &mut entry_bytes)?;
         Ok(u16::from_be_bytes(entry_bytes))
     }
 
