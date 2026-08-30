@@ -39,6 +39,16 @@ pub const L2_ZERO: u64 = 1u64 << 0;
 pub const L2_FLAG_ZERO: u64 = L2_ZERO;
 pub const L2_FLAG_COMPRESSED: u64 = 1u64 << 62;
 
+/// Bits 9..55 — the host-offset field of an L1 or uncompressed L2
+/// entry.
+///
+/// Written out longhand at eleven sites before this. It is defined here
+/// rather than imported from the crate on purpose: the fixtures are
+/// meant to be an independent statement of the format, so a wrong mask
+/// in `reader.rs` shows up as a failure instead of being agreed with.
+/// One copy per side, not eleven on one.
+pub const HOST_OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
+
 /// Bit 3 of `incompatible_features` — the spec mandates it when
 /// `compression_type != 0`.
 pub const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -141,14 +151,14 @@ pub fn build_image(path: &Path) {
 
     // ---- cluster 1: L1 table ----
     let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let l1_entry = (L2_OFFSET & HOST_OFFSET_MASK) | COPIED;
     l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
     f.write_all_at(&l1, L1_OFFSET).unwrap();
 
     // ---- cluster 2: L2 table ----
     let mut l2 = [0u8; 4096];
-    let e0 = (DATA0_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    let e2 = (DATA2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let e0 = (DATA0_OFFSET & HOST_OFFSET_MASK) | COPIED;
+    let e2 = (DATA2_OFFSET & HOST_OFFSET_MASK) | COPIED;
     let e3 = COPIED | L2_ZERO;
     l2[0..8].copy_from_slice(&e0.to_be_bytes());
     // l2[8..16] left zero (unallocated)
@@ -181,15 +191,52 @@ pub fn build_image(path: &Path) {
     f.write_all_at(&rb, REFCOUNT_BLOCK_OFFSET).unwrap();
 }
 
+/// Which compressor a compressed-cluster fixture uses.
+///
+/// The zlib and zstd builders were ~70 lines each and differed in the
+/// compressor call and three header bytes. Everything else — the
+/// descriptor encoding, the layout arithmetic, the L1/L2 writes, the
+/// refcount table and block — was byte-for-byte the same, which meant a
+/// fix to the shared 90% had to be made twice and could be made once.
+#[derive(Clone, Copy)]
+pub enum Compressor {
+    /// qcow2 `compression_type = 0`: raw deflate.
+    Zlib,
+    /// qcow2 `compression_type = 1`, plus the matching
+    /// incompatible-features bit.
+    Zstd,
+}
+
 /// Build a qcow2 v3 image whose virt cluster 0 holds a *compressed*
 /// cluster of `pattern`-filled bytes; other virt clusters are
-/// unallocated. Compression: raw deflate (qcow2 `compression_type = 0`).
+/// unallocated.
 pub fn build_compressed_image(path: &Path, pattern: u8) {
-    // Compress 4096 bytes of `pattern` with raw deflate.
+    build_compressed_image_with(path, pattern, Compressor::Zlib);
+}
+
+/// As [`build_compressed_image`], with zstd. The header sets
+/// `compression_type = 1` at byte 104 and the matching
+/// incompatible-features bit.
+pub fn build_zstd_compressed_image(path: &Path, pattern: u8) {
+    build_compressed_image_with(path, pattern, Compressor::Zstd);
+}
+
+/// The one compressed-cluster builder.
+///
+/// Offsets are still written as literals rather than through
+/// `qcow2::header::offsets` — deliberately, so this fixture is an
+/// independent statement of the layout and can disagree with the
+/// parser. See that module's docs.
+pub fn build_compressed_image_with(path: &Path, pattern: u8, compressor: Compressor) {
     let plain = vec![pattern; CLUSTER_SIZE as usize];
-    let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(&plain).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = match compressor {
+        Compressor::Zlib => {
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap()
+        }
+        Compressor::Zstd => zstd::stream::encode_all(&plain[..], 0).unwrap(),
+    };
     assert!(
         compressed.len() < CLUSTER_SIZE as usize,
         "compressed payload should be smaller than a cluster"
@@ -217,7 +264,6 @@ pub fn build_compressed_image(path: &Path, pattern: u8) {
     let mut f = File::create(path).unwrap();
     f.set_len(total).unwrap();
 
-    // Header.
     let mut hdr = [0u8; 4096];
     hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
     hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
@@ -229,12 +275,22 @@ pub fn build_compressed_image(path: &Path, pattern: u8) {
     hdr[48..56].copy_from_slice(&rt_off.to_be_bytes());
     hdr[56..60].copy_from_slice(&1u32.to_be_bytes());
     hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
-    hdr[100..104].copy_from_slice(&104u32.to_be_bytes());
+    // The three bytes that are the whole difference on disk.
+    match compressor {
+        Compressor::Zlib => {
+            hdr[100..104].copy_from_slice(&104u32.to_be_bytes());
+        }
+        Compressor::Zstd => {
+            hdr[72..80].copy_from_slice(&INCOMPAT_COMPRESSION_TYPE.to_be_bytes());
+            hdr[100..104].copy_from_slice(&112u32.to_be_bytes());
+            hdr[104] = 1; // compression_type = zstd
+        }
+    }
     f.write_all_at(&hdr, 0).unwrap();
 
     // L1 → L2.
     let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let l1_entry = (L2_OFFSET & HOST_OFFSET_MASK) | COPIED;
     l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
     f.write_all_at(&l1, L1_OFFSET).unwrap();
 
@@ -314,7 +370,7 @@ pub fn build_child_with_backing(
 
     // L1.
     let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let l1_entry = (L2_OFFSET & HOST_OFFSET_MASK) | COPIED;
     l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
     f.write_all_at(&l1, L1_OFFSET).unwrap();
 
@@ -341,78 +397,82 @@ pub fn build_child_with_backing(
     f.write_all_at(&rb, rb_off).unwrap();
 }
 
-/// Build a qcow2 v3 image whose virt cluster 0 holds a *zstd-compressed*
-/// cluster of `pattern`-filled bytes. The header sets compression_type=1
-/// at byte 104 and the matching incompatible-features bit. Layout mirrors
-/// `build_compressed_image`.
-pub fn build_zstd_compressed_image(path: &Path, pattern: u8) {
-    let plain = vec![pattern; CLUSTER_SIZE as usize];
-    let compressed = zstd::stream::encode_all(&plain[..], 0).unwrap();
-    assert!(
-        compressed.len() < CLUSTER_SIZE as usize,
-        "compressed payload should be smaller than a cluster"
-    );
+/// Build an image whose virtual disk needs **more than one L1 entry**.
+///
+/// One L1 entry covers `cluster_size / 8` clusters — 512 of them at a
+/// 4 KiB cluster, so 2 MiB of virtual disk. Every other fixture here is
+/// 16 KiB, which means `l1_index` is 0 in every test, and forcing it to
+/// 0 in the reader failed **no** tests at all: the second level of the
+/// two-level addressing was never exercised.
+///
+/// This one is 3 MiB, so virtual offsets past 2 MiB land in the second
+/// L1 entry and a wrong `l1_index` reads the wrong L2 table.
+///
+/// Layout:
+///
+/// ```text
+///   cluster 0     header
+///   cluster 1     L1 table (2 entries)
+///   cluster 2     L2 table for L1 entry 0
+///   cluster 3     L2 table for L1 entry 1
+///   cluster 4     data for virt cluster 0        (0xA1)
+///   cluster 5     data for virt cluster 512      (0xB2, first of L1 #1)
+///   cluster 6     refcount table
+///   cluster 7     refcount block
+/// ```
+pub fn build_two_l1_entry_image(path: &Path) {
+    const VIRT: u64 = 3 * 1024 * 1024;
+    const L1: u64 = CLUSTER_SIZE;
+    const L2_A: u64 = CLUSTER_SIZE * 2;
+    const L2_B: u64 = CLUSTER_SIZE * 3;
+    const DATA_A: u64 = CLUSTER_SIZE * 4;
+    const DATA_B: u64 = CLUSTER_SIZE * 5;
+    const RT: u64 = CLUSTER_SIZE * 6;
+    const RB: u64 = CLUSTER_SIZE * 7;
+    const CLUSTERS: u64 = 32;
 
-    let comp_host_off: u64 = CLUSTER_SIZE * 3;
-    let span_bytes = compressed.len().div_ceil(512) * 512;
-    let n_sectors_minus1 = ((span_bytes / 512) - 1) as u64;
-
-    let x: u64 = 62 - (12 - 8);
-    let descriptor = comp_host_off | (n_sectors_minus1 << x);
-    // Per spec: COPIED (bit 63) MUST NOT be set on compressed L2
-    // entries; the COMPRESSED flag itself is the indicator. qemu-img
-    // check rejects an image that sets both.
-    let l2_entry_compressed = L2_FLAG_COMPRESSED | descriptor;
-
-    let span_clusters = (span_bytes.div_ceil(CLUSTER_SIZE as usize) as u64).max(1);
-    let comp_end_cluster = 3 + span_clusters;
-    let rt_cluster = comp_end_cluster;
-    let rb_cluster = comp_end_cluster + 1;
-    let total_clusters = (rb_cluster + 8).max(16);
-    let total = CLUSTER_SIZE * total_clusters;
     let mut f = File::create(path).unwrap();
-    f.set_len(total).unwrap();
+    f.set_len(CLUSTER_SIZE * CLUSTERS).unwrap();
 
-    // Header — compression_type=1 at byte 104, header_length=112, and
-    // the incompatible-features bit set.
     let mut hdr = [0u8; 4096];
     hdr[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
     hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
     hdr[20..24].copy_from_slice(&12u32.to_be_bytes());
-    hdr[24..32].copy_from_slice(&VIRT_SIZE.to_be_bytes());
-    hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
-    hdr[40..48].copy_from_slice(&L1_OFFSET.to_be_bytes());
-    let rt_off = rt_cluster * CLUSTER_SIZE;
-    hdr[48..56].copy_from_slice(&rt_off.to_be_bytes());
+    hdr[24..32].copy_from_slice(&VIRT.to_be_bytes());
+    hdr[36..40].copy_from_slice(&2u32.to_be_bytes()); // l1_size = 2
+    hdr[40..48].copy_from_slice(&L1.to_be_bytes());
+    hdr[48..56].copy_from_slice(&RT.to_be_bytes());
     hdr[56..60].copy_from_slice(&1u32.to_be_bytes());
-    hdr[72..80].copy_from_slice(&INCOMPAT_COMPRESSION_TYPE.to_be_bytes());
     hdr[96..100].copy_from_slice(&4u32.to_be_bytes());
-    hdr[100..104].copy_from_slice(&112u32.to_be_bytes());
-    hdr[104] = 1; // compression_type = zstd
+    hdr[100..104].copy_from_slice(&104u32.to_be_bytes());
     f.write_all_at(&hdr, 0).unwrap();
 
     let mut l1 = [0u8; 4096];
-    let l1_entry = (L2_OFFSET & 0x00ff_ffff_ffff_fe00) | COPIED;
-    l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
-    f.write_all_at(&l1, L1_OFFSET).unwrap();
+    l1[0..8].copy_from_slice(&((L2_A & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
+    l1[8..16].copy_from_slice(&((L2_B & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
+    f.write_all_at(&l1, L1).unwrap();
 
-    let mut l2 = [0u8; 4096];
-    l2[0..8].copy_from_slice(&l2_entry_compressed.to_be_bytes());
-    f.write_all_at(&l2, L2_OFFSET).unwrap();
+    // L2 for L1 entry 0: virt cluster 0 → DATA_A.
+    let mut l2a = [0u8; 4096];
+    l2a[0..8].copy_from_slice(&((DATA_A & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
+    f.write_all_at(&l2a, L2_A).unwrap();
 
-    let mut sector_buf = vec![0u8; span_bytes];
-    sector_buf[..compressed.len()].copy_from_slice(&compressed);
-    f.write_all_at(&sector_buf, comp_host_off).unwrap();
+    // L2 for L1 entry 1: virt cluster 512 (its entry 0) → DATA_B.
+    let mut l2b = [0u8; 4096];
+    l2b[0..8].copy_from_slice(&((DATA_B & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
+    f.write_all_at(&l2b, L2_B).unwrap();
+
+    f.write_all_at(&[0xA1u8; 4096], DATA_A).unwrap();
+    f.write_all_at(&[0xB2u8; 4096], DATA_B).unwrap();
 
     let mut rt = [0u8; 4096];
-    let rb_off = rb_cluster * CLUSTER_SIZE;
-    rt[0..8].copy_from_slice(&rb_off.to_be_bytes());
-    f.write_all_at(&rt, rt_off).unwrap();
+    rt[0..8].copy_from_slice(&RB.to_be_bytes());
+    f.write_all_at(&rt, RT).unwrap();
 
     let mut rb = [0u8; 4096];
-    for cluster_idx in 0..=rb_cluster {
+    for cluster_idx in 0..8u16 {
         let off = (cluster_idx as usize) * 2;
         rb[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
     }
-    f.write_all_at(&rb, rb_off).unwrap();
+    f.write_all_at(&rb, RB).unwrap();
 }

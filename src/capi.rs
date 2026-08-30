@@ -156,6 +156,10 @@ mod tests {
     /// self-contained.
     fn build_image(path: &PathBuf) {
         const COPIED: u64 = 1u64 << 63;
+        // Bits 9..55, the host-offset field. Spelled out here rather
+        // than imported from `reader`: this fixture is meant to be an
+        // independent statement of the format.
+        const HOST_OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
         const CLUSTER: u64 = 4096;
         const VIRT: u64 = CLUSTER * 4;
         const L1_OFF: u64 = CLUSTER;
@@ -178,12 +182,12 @@ mod tests {
         f.write_all(&hdr).unwrap();
 
         let mut l1 = [0u8; 4096];
-        l1[0..8].copy_from_slice(&((L2_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes());
+        l1[0..8].copy_from_slice(&((L2_OFF & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
         f.seek(SeekFrom::Start(L1_OFF)).unwrap();
         f.write_all(&l1).unwrap();
 
         let mut l2 = [0u8; 4096];
-        l2[0..8].copy_from_slice(&((D0_OFF & 0x00ff_ffff_ffff_fe00) | COPIED).to_be_bytes());
+        l2[0..8].copy_from_slice(&((D0_OFF & HOST_OFFSET_MASK) | COPIED).to_be_bytes());
         f.seek(SeekFrom::Start(L2_OFF)).unwrap();
         f.write_all(&l2).unwrap();
 
