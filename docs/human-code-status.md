@@ -42,10 +42,13 @@ the `Ok` it used to return.
 `Zero | Unallocated` arm was discarding a parent image's data on write. Copy-up
 now happens.
 
-### H2 — `allocate_cluster`'s doc describes three paths, the code has two — **fixable, not yet done**
+### H2 — `allocate_cluster`'s doc describes three paths, the code has two — **fixed**
 
-The prose for the third path is incoherent, and rewriting it needs the intended
-behaviour established rather than guessed. Grouped with H4/H5.
+The doc now describes two passes and a refusal, which is what the code does. The
+"third path" was a garbled account of the failure case: if pass 1 finds nothing
+free *and* there is no empty refcount-table slot either, the table itself is
+full, growing it is out of scope, and the call returns `Unsupported`. It never
+"recycled cluster 0's spare scan", which is what the old prose seemed to claim.
 
 ### H3 — the public `write_at` contract contradicted the implementation and itself — **fixed**
 
@@ -59,13 +62,46 @@ and copies up from the backing chain.
 document said: a write to a **compressed** cluster allocates an uncompressed one
 in its place rather than re-compressing.
 
-### H4 — the compressed-cluster descriptor decode is unnamed, and encode re-derives it — **fixable, not yet done**
+### H4 — the compressed-cluster descriptor decode is unnamed, and encode re-derives it — **fixed, and it was hiding three dead branches**
 
-Real, and the fix is a shared descriptor type. Worth its own change.
+Every quantity now has a name: `offset_bits` (the field width, which *moves with
+the cluster size* — a bigger cluster needs more bits for the sector count, so it
+leaves fewer for the offset), `additional_sectors`, `first_sector_start`, and
+`COMPRESSED_SECTOR_SIZE` — which the doc says is deliberately neither the cluster
+size nor the device's block size.
 
-### H5 — the two-level address translation is recomputed inline in four places — **fixable, not yet done**
+The naming pass was the cheap half. Measuring first showed the decode was
+**effectively untested**:
 
-Same batch as H4.
+| mutation | before | after |
+|---|---|---|
+| offset-field width `- 8` → `- 9` | 0 tests fail | 3 |
+| `COMPRESSED_SECTOR_SIZE` 512 → 1024 | 0 | 3 |
+| `(additional + 1)` → `additional` | 0 | 7 |
+
+Every compressed fixture is a cluster of one repeated byte, which deflates to
+well under one sector — so the sector count was always zero, and the whole
+"additional sectors" half of the descriptor was dead as far as the tests were
+concerned. Four unit tests now cover multi-sector payloads, unaligned host
+offsets (the `- (host_off % 512)` term the report flagged), and cluster sizes
+other than 4 KiB. Their encode side is written from the specification rather
+than derived from the decoder, so the round trip is a check and not a tautology.
+
+### H5 — the two-level address translation is recomputed inline in four places — **fixed, and half of it was untested**
+
+`ClusterAddress { virt_cluster, l1_index, l2_index, offset_in_cluster }` and
+`split_virtual`. The rule "one L1 entry covers `l2_entries` clusters" is now
+stated once instead of asserted at every site that needed an address — in two
+different spellings, which is what made the write path's branches read as three
+unrelated paragraphs.
+
+**`l1_index` was dead code as far as the tests were concerned.** Forcing it to
+zero failed *no* tests: one L1 entry covers 2 MiB at a 4 KiB cluster, and every
+fixture in the suite was 16 KiB, so the second level of the crate's two-level
+addressing had never been exercised. `build_two_l1_entry_image` builds a 3 MiB
+image with two L1 entries and two L2 tables; two tests read and write past the
+2 MiB boundary and check the *other* table stayed untouched. The mutation now
+fails 2.
 
 ---
 
@@ -111,12 +147,36 @@ one needs a fixture over 2048 clusters. The consolidation at least means the two
 functions can no longer disagree about it — mutating the shared arithmetic now
 fails 3 tests where the duplicated copy failed 0.
 
-### M1, M5, M6, M7, M8, M9 — duplication and bare literals — **fixable, not yet done**
+### M1, M5, M6, M7, M8, M9 — duplication and bare literals — **fixed**
 
-The refcount-width preamble three times; `8` as the table-entry size at 13 sites;
-header offsets open-coded six ways; the two fixture builders 95% identical;
-`OFFSET_MASK`'s value written longhand 11 times; and the
-`(host & MASK) | COPIED` construction four times.
+- **M1 — the refcount-width guard, and it was completely uncovered.** Deleting
+  the whole `refcount_order != 4` check failed **no** tests. It is not a
+  politeness: every refcount walk treats blocks as arrays of big-endian `u16`,
+  and at any other order that stride reads two neighbouring entries as one,
+  hands out a cluster that is in use, and overwrites live data with it. One
+  `refcount_entries_per_block()` now owns it, and
+  `a_non_u16_refcount_width_is_refused_rather_than_mis_walked` covers it.
+- **M5** — `TABLE_ENTRY_BYTES` and `REFCOUNT_ENTRY_BYTES` replace `8` and `2`
+  across thirteen sites where either could have been a byte count, a bit width
+  or an alignment.
+- **M6** — `header::offsets`, with the same call as vhd's H7: the parser reads
+  through the constants, **the fixtures deliberately keep their literals**.
+  Moving `CLUSTER_BITS` by a byte fails 52 tests and `L1_TABLE_OFFSET` 35,
+  precisely because the fixtures were written from the specification and do not
+  import the table. `offsets_match_the_published_specification` and
+  `no_header_field_overlaps_its_neighbour` write that intent down.
+- **M7** — one `build_compressed_image_with(path, pattern, Compressor)`. The two
+  builders differed in the compressor call and three header bytes; the other
+  ~65 lines were identical.
+- **M8** — one `HOST_OFFSET_MASK` per *side* rather than eleven copies on one:
+  the crate has `OFFSET_MASK`, the fixtures have their own, and they are meant
+  to be able to disagree. A new derived test pins the crate's to bits 9..55 —
+  widening it to strip bit 9 failed no tests before, since every fixture offset
+  is cluster-aligned.
+- **M9** — `l2_entry_for(host_off)`. Dropping its mask also failed **no** tests
+  for the same reason, so a test now covers the case the allocator never
+  produces: an offset with low bits set would put those bits on top of the flags
+  field, and on a v3 image bit 0 is the "reads as zeros" flag.
 
 ### M3, M4 — `write_at` and `allocate_cluster` are god functions (129 and 104 lines) — **needs your decision**
 
@@ -131,6 +191,14 @@ naming them means deciding what the names assert.
 ### M13 — the two caches encode their key invariant only in a comment — **needs your decision**
 
 The fix is to encode it in a type, which changes the cache's shape.
+
+---
+
+## Verification (updated)
+
+**67 tests pass, up from 58.** `cargo clippy --all-targets -- -D warnings` clean.
+Nine of the new tests exist because a mutation showed the code they cover was
+unreachable from the suite; the details are under each finding above.
 
 ---
 

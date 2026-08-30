@@ -36,6 +36,28 @@ use std::sync::{Arc, Mutex};
 /// Bits 9..55 inclusive — host cluster offset for L1 and uncompressed L2.
 const OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
 
+/// Bytes per entry in the refcount table and in an L1 or L2 table.
+///
+/// All three are arrays of big-endian `u64`, and the `8` was written
+/// out at thirteen sites where it could equally have been a byte count,
+/// a bit width or an alignment.
+pub(crate) const TABLE_ENTRY_BYTES: u64 = 8;
+
+/// Bytes per refcount-*block* entry — the only width this crate walks.
+///
+/// The format allows `1 << refcount_order` bits per entry; this crate
+/// implements `refcount_order == 4` alone, and every caller goes
+/// through [`Qcow2Reader::refcount_entries_per_block`], which refuses
+/// anything else rather than walking it at the wrong stride.
+const REFCOUNT_ENTRY_BYTES: u64 = 2;
+
+/// The unit the compressed-cluster descriptor counts in.
+///
+/// Fixed by the specification at 512 bytes. It is **not** the cluster
+/// size and **not** the backing device's block size — a compressed
+/// cluster's span is measured in these regardless of either.
+const COMPRESSED_SECTOR_SIZE: u64 = 512;
+
 /// Where a cluster's refcount entry is, or why there is not one.
 ///
 /// The absent cases are separate variants rather than a single `None`
@@ -53,6 +75,29 @@ enum RefcountEntryLocation {
     PastTableCoverage,
     /// The table reaches it, but the block it points at is a hole.
     BlockNotAllocated,
+}
+
+/// Where a virtual byte offset lives, in the format's own terms.
+///
+/// qcow2 addresses a cluster through two levels: an L1 entry selects an
+/// L2 table, and an L2 entry inside it selects the host cluster. The
+/// rule tying them together is that **one L1 entry covers
+/// `l2_entries` clusters** — and that rule was asserted at every site
+/// that needed an address, and owned by none of them.
+///
+/// Naming the address also names the read: `addr.l1_index` says what
+/// `(virt / cluster_size) / l2_entries` means, which is otherwise three
+/// divisions the reader has to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClusterAddress {
+    /// Index of the virtual cluster, counting from the start of the disk.
+    virt_cluster: u64,
+    /// Which L1 entry — i.e. which L2 table — covers that cluster.
+    l1_index: u32,
+    /// Which entry within that L2 table.
+    l2_index: u32,
+    /// How far into the cluster the original byte offset falls.
+    offset_in_cluster: u64,
 }
 
 /// L2 entry flags.
@@ -527,13 +572,12 @@ impl Qcow2Reader {
         // what actually keeps snapshots intact.
 
         let cluster_size = self.header.cluster_size;
-        let cluster_mask = cluster_size - 1;
 
         let mut cursor = offset;
         let mut written = 0usize;
 
         while cursor < end {
-            let in_cluster = (cursor & cluster_mask) as usize;
+            let in_cluster = self.split_virtual(cursor).offset_in_cluster as usize;
             let chunk = std::cmp::min(cluster_size - in_cluster as u64, end - cursor) as usize;
             let src = &buf[written..written + chunk];
 
@@ -640,54 +684,102 @@ impl Qcow2Reader {
         Ok(full)
     }
 
-    /// Point the L2 entry covering virtual offset `virt` at a host
-    /// cluster we have just allocated. Such a cluster has refcount 1 by
-    /// construction, which is exactly what COPIED asserts.
-    fn repoint_l2(&self, virt: u64, new_host: u64) -> Result<()> {
-        let virt_cluster = virt / self.header.cluster_size;
-        let l2_entries = self.header.l2_entries();
-        let l1_idx = (virt_cluster / l2_entries) as u32;
-        let l2_idx = (virt_cluster % l2_entries) as u32;
-        self.update_l2_entry(l1_idx, l2_idx, (new_host & OFFSET_MASK) | L2_FLAG_COPIED)
-    }
-
-    /// Find a host cluster with refcount = 0, increment it to 1, and
-    /// return the cluster's host byte offset.
+    /// How many refcount entries one refcount block holds — and the
+    /// single place that refuses a refcount width this crate cannot
+    /// walk.
     ///
-    /// Three fast paths in order:
-    /// 1. Free entry inside an already-present refcount block — claim it.
-    /// 2. A refcount-table slot points to no block (`block_off == 0`) —
-    ///    allocate a fresh host cluster for that block, point the table
-    ///    entry at it, then claim a free entry inside it.
-    /// 3. Every populated block is full and there is no empty slot — we
-    ///    grow at the tail by recycling cluster `host_cluster_idx == 0`'s
-    ///    spare scan: in practice every refcount table sized for the
-    ///    underlying device has spare entries, and the case that lands
-    ///    here is "refcount table itself is too small". That requires
-    ///    refcount-table reallocation, which is intentionally out of
-    ///    scope; surfaces as `Unsupported`.
+    /// Everything that touches a refcount block treats it as an array
+    /// of big-endian `u16`. That is right only when
+    /// `refcount_order == 4`; at any other order the entries are a
+    /// different width, and walking them at this stride would read two
+    /// neighbouring entries as one — handing out a cluster that is
+    /// actually in use, and overwriting live data with it. So the guard
+    /// is not a politeness, and it is not optional at any call site.
     ///
-    /// Crash-safety order for the new-block path:
-    ///   data (zeroed block) → block-with-self-ref=1 → refcount-table-entry
-    /// with `dev_flush` between each step. A crash mid-sequence may leak
-    /// one host cluster but never corrupts the image.
+    /// v2 images have no `refcount_order` field at all; the format
+    /// fixes them at 16 bits, which is why the version check comes
+    /// first rather than reading a field that is not there.
     ///
-    /// Errors with `Unsupported` when the image has no refcount table or
-    /// uses a non-u16 refcount width.
-    fn allocate_cluster(&self) -> Result<u64> {
-        let cluster_size = self.header.cluster_size;
+    /// It was written out twice before, thirty lines apart, and neither
+    /// copy was covered — deleting either failed no tests. See
+    /// `a_non_u16_refcount_width_is_refused_rather_than_mis_walked`.
+    fn refcount_entries_per_block(&self) -> Result<u64> {
         let refcount_bits = if self.header.version >= 3 {
             1u32 << self.header.refcount_order
         } else {
             16
         };
-        if refcount_bits != 16 {
+        if refcount_bits != REFCOUNT_ENTRY_BYTES as u32 * 8 {
             return Err(Error::Unsupported(
                 "non-16-bit refcount entries (refcount_order != 4)",
             ));
         }
-        let refcount_bytes: u64 = 2;
-        let entries_per_block = cluster_size / refcount_bytes;
+        Ok(self.header.cluster_size / REFCOUNT_ENTRY_BYTES)
+    }
+
+    /// Split a virtual byte offset into the address the format uses.
+    ///
+    /// The one place the two-level addressing rule is written down. It
+    /// was previously re-derived at each site that needed it, in two
+    /// different spellings (`l1_idx` and `l1_index`), which made the
+    /// write path's three branches read as three unrelated paragraphs
+    /// rather than one operation with one differing step.
+    fn split_virtual(&self, virt: u64) -> ClusterAddress {
+        let cluster_size = self.header.cluster_size;
+        let l2_entries = self.header.l2_entries();
+        let virt_cluster = virt / cluster_size;
+        ClusterAddress {
+            virt_cluster,
+            l1_index: (virt_cluster / l2_entries) as u32,
+            l2_index: (virt_cluster % l2_entries) as u32,
+            offset_in_cluster: virt % cluster_size,
+        }
+    }
+
+    /// Point the L2 entry covering virtual offset `virt` at a host
+    /// cluster we have just allocated. Such a cluster has refcount 1 by
+    /// construction, which is exactly what COPIED asserts.
+    fn repoint_l2(&self, virt: u64, new_host: u64) -> Result<()> {
+        let addr = self.split_virtual(virt);
+        self.update_l2_entry(addr.l1_index, addr.l2_index, l2_entry_for(new_host))
+    }
+
+    /// Find a host cluster with refcount = 0, increment it to 1, and
+    /// return the cluster's host byte offset.
+    ///
+    /// **Two** passes, then a refusal — the doc here previously
+    /// described three paths, and the third was a garbled account of
+    /// what is really the failure case.
+    ///
+    /// 1. Walk every refcount block the table already points at, and
+    ///    claim the first entry whose count is zero. Note the first
+    ///    empty table *slot* on the way past, in case pass 1 finds
+    ///    nothing.
+    /// 2. Every present block was full. Take that first empty slot and
+    ///    allocate a fresh refcount block for it, placed at the host
+    ///    cluster the slot's own range begins at. The new block can then
+    ///    record itself (entry 0) and the caller's cluster (entry 1),
+    ///    which is why it needs no allocation of its own.
+    ///
+    /// If pass 1 found nothing free **and** there was no empty slot
+    /// either, the refcount table itself is full. Growing it is
+    /// deliberately out of scope, so this surfaces as `Unsupported`
+    /// rather than being worked around. In practice a table sized for
+    /// its device always has spare slots; an image that lands here has
+    /// a table too small for the disk it describes.
+    ///
+    /// Crash-safety order for pass 2:
+    ///   data (zeroed block) → block-with-self-ref=1 → refcount-table-entry
+    /// with `dev_flush` between each step. A crash mid-sequence may leak
+    /// one host cluster but never corrupts the image.
+    ///
+    /// Errors with `Unsupported` when the image has no refcount table or
+    /// uses a non-u16 refcount width — see
+    /// [`Qcow2Reader::refcount_entries_per_block`] for why the second
+    /// one is not negotiable.
+    fn allocate_cluster(&self) -> Result<u64> {
+        let cluster_size = self.header.cluster_size;
+        let entries_per_block = self.refcount_entries_per_block()?;
 
         let rt_off = self.header.refcount_table_offset;
         let rt_clusters = self.header.refcount_table_clusters as u64;
@@ -700,16 +792,19 @@ impl Qcow2Reader {
         let mut rt_bytes = vec![0u8; rt_size as usize];
         self.dev_read(rt_off, &mut rt_bytes)?;
 
-        let rt_entries_total = (rt_size / 8) as usize;
+        let rt_entries_total = (rt_size / TABLE_ENTRY_BYTES) as usize;
 
         // Pass 1: walk the table. For each present block try to claim a
         // free slot. Remember the first absent slot in case pass 1 yields
         // nothing.
         let mut first_empty_block_slot: Option<usize> = None;
         for block_idx in 0..rt_entries_total {
-            let entry_off = block_idx * 8;
-            let block_off =
-                u64::from_be_bytes(rt_bytes[entry_off..entry_off + 8].try_into().unwrap());
+            let entry_off = block_idx * TABLE_ENTRY_BYTES as usize;
+            let block_off = u64::from_be_bytes(
+                rt_bytes[entry_off..entry_off + TABLE_ENTRY_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
             if block_off == 0 {
                 if first_empty_block_slot.is_none() {
                     first_empty_block_slot = Some(block_idx);
@@ -788,7 +883,7 @@ impl Qcow2Reader {
         // Step 2: publish the new block's address into the refcount-table
         // entry. After this flush the block is reachable; if we crash
         // before it the only loss is two host clusters at a known offset.
-        let entry_off_in_rt = (block_idx as u64) * 8;
+        let entry_off_in_rt = (block_idx as u64) * TABLE_ENTRY_BYTES;
         self.dev_write(rt_off + entry_off_in_rt, &new_block_off.to_be_bytes())?;
         self.dev_flush()?;
 
@@ -826,18 +921,7 @@ impl Qcow2Reader {
     /// deliberate.
     fn locate_refcount_entry(&self, host_off: u64) -> Result<RefcountEntryLocation> {
         let cluster_size = self.header.cluster_size;
-        let refcount_bits = if self.header.version >= 3 {
-            1u32 << self.header.refcount_order
-        } else {
-            16
-        };
-        if refcount_bits != 16 {
-            return Err(Error::Unsupported(
-                "non-16-bit refcount entries (refcount_order != 4)",
-            ));
-        }
-        // Two bytes per entry, because the width above is 16 bits.
-        let entries_per_block = cluster_size / 2;
+        let entries_per_block = self.refcount_entries_per_block()?;
 
         let host_cluster_idx = host_off / cluster_size;
         let block_idx = host_cluster_idx / entries_per_block;
@@ -848,12 +932,12 @@ impl Qcow2Reader {
         if rt_off == 0 || rt_clusters == 0 {
             return Err(Error::Unsupported("no refcount table"));
         }
-        if block_idx * 8 >= rt_clusters * cluster_size {
+        if block_idx * TABLE_ENTRY_BYTES >= rt_clusters * cluster_size {
             return Ok(RefcountEntryLocation::PastTableCoverage);
         }
 
         let mut rt_entry_bytes = [0u8; 8];
-        self.dev_read(rt_off + block_idx * 8, &mut rt_entry_bytes)?;
+        self.dev_read(rt_off + block_idx * TABLE_ENTRY_BYTES, &mut rt_entry_bytes)?;
         let block_off = u64::from_be_bytes(rt_entry_bytes);
         if block_off == 0 {
             return Ok(RefcountEntryLocation::BlockNotAllocated);
@@ -962,8 +1046,8 @@ impl Qcow2Reader {
         let mut l2_bytes = vec![0u8; cluster_size];
         self.dev_read(l2_table_off, &mut l2_bytes)?;
 
-        let off = (l2_idx as usize) * 8;
-        l2_bytes[off..off + 8].copy_from_slice(&new_entry.to_be_bytes());
+        let off = l2_idx as usize * TABLE_ENTRY_BYTES as usize;
+        l2_bytes[off..off + TABLE_ENTRY_BYTES as usize].copy_from_slice(&new_entry.to_be_bytes());
 
         self.dev_write(l2_table_off, &l2_bytes)?;
         self.dev_flush()?;
@@ -987,7 +1071,7 @@ impl Qcow2Reader {
     fn allocate_l2_table(&self, l1_idx: u32) -> Result<u64> {
         let l2_host = self.allocate_cluster()?;
         self.zero_cluster(l2_host)?;
-        let new_l1_entry = (l2_host & OFFSET_MASK) | L2_FLAG_COPIED;
+        let new_l1_entry = l2_entry_for(l2_host);
         self.update_l1_entry(l1_idx, new_l1_entry)?;
         Ok(l2_host)
     }
@@ -1000,7 +1084,7 @@ impl Qcow2Reader {
         if (l1_idx as usize) >= l1.len() {
             return Err(Error::Corrupt("l1_idx out of range"));
         }
-        let l1_offset_on_disk = self.header.l1_table_offset + (l1_idx as u64) * 8;
+        let l1_offset_on_disk = self.header.l1_table_offset + (l1_idx as u64) * TABLE_ENTRY_BYTES;
         self.dev_write(l1_offset_on_disk, &new_entry.to_be_bytes())?;
         self.dev_flush()?;
         l1[l1_idx as usize] = new_entry;
@@ -1025,13 +1109,13 @@ impl Qcow2Reader {
         }
 
         let cluster_size = self.header.cluster_size;
-        let cluster_mask = cluster_size - 1;
 
         let mut cursor = offset;
         let mut written = 0usize;
 
         while cursor < end {
-            let in_cluster = cursor & cluster_mask;
+            let addr = self.split_virtual(cursor);
+            let in_cluster = addr.offset_in_cluster;
             let chunk = std::cmp::min(cluster_size - in_cluster, end - cursor) as usize;
 
             let map = self.lookup_cluster(cursor)?;
@@ -1042,9 +1126,8 @@ impl Qcow2Reader {
                     self.dev_read(host_off + in_cluster, dst)?;
                 }
                 ClusterMap::Compressed { host_off, byte_len } => {
-                    let virt_cluster = cursor / cluster_size;
                     self.read_decompressed_slice(
-                        virt_cluster,
+                        addr.virt_cluster,
                         host_off,
                         byte_len,
                         in_cluster as usize,
@@ -1093,11 +1176,9 @@ impl Qcow2Reader {
     }
 
     fn lookup_cluster(&self, virt: u64) -> Result<ClusterMap> {
-        let cluster_size = self.header.cluster_size;
-        let virt_cluster = virt / cluster_size;
-        let l2_entries = self.header.l2_entries();
-        let l1_index = (virt_cluster / l2_entries) as u32;
-        let l2_index = (virt_cluster % l2_entries) as u32;
+        let ClusterAddress {
+            l1_index, l2_index, ..
+        } = self.split_virtual(virt);
 
         let l1_entry = {
             let l1 = self.l1.lock().unwrap();
@@ -1148,8 +1229,12 @@ impl Qcow2Reader {
         }
 
         let bytes = &cache.as_ref().unwrap().1;
-        let off = (l2_index as usize) * 8;
-        let entry = u64::from_be_bytes(bytes[off..off + 8].try_into().unwrap());
+        let off = l2_index as usize * TABLE_ENTRY_BYTES as usize;
+        let entry = u64::from_be_bytes(
+            bytes[off..off + TABLE_ENTRY_BYTES as usize]
+                .try_into()
+                .unwrap(),
+        );
         Ok(entry)
     }
 
@@ -1226,18 +1311,63 @@ impl Qcow2Reader {
     }
 }
 
-/// Decode the compressed-cluster descriptor in an L2 entry. Returns the
-/// byte-granular host offset and the on-disk span (sector-rounded).
+/// The L1 or L2 entry that points at a host cluster we have just
+/// allocated.
+///
+/// COPIED (bit 63) is the format's promise that the cluster's refcount
+/// is exactly 1, so a writer may go through it in place without
+/// copy-on-write. A freshly allocated cluster has refcount 1 by
+/// construction, which is why setting the flag here is not an
+/// assumption — it is the thing that just became true.
+///
+/// The mask is not defensive tidying either: an offset with low bits
+/// set would silently shift the pointer once it reaches an L2 entry,
+/// because those bits belong to the flags rather than to the address.
+fn l2_entry_for(host_off: u64) -> u64 {
+    (host_off & OFFSET_MASK) | L2_FLAG_COPIED
+}
+
+/// Decode the compressed-cluster descriptor in an L2 entry.
+///
+/// Returns `(host offset, span)`: where the compressed payload starts,
+/// byte-granular, and how many bytes to read from there.
+///
+/// The descriptor packs two fields whose boundary **moves with the
+/// cluster size**, which is the part worth reading slowly. The low
+/// `62 - (cluster_bits - 8)` bits are a byte offset; everything above
+/// them is a count of *additional* 512-byte sectors. A bigger cluster
+/// needs more bits for the sector count (a compressed cluster can be
+/// longer), so it leaves fewer for the offset — the two fields trade
+/// against each other inside one 62-bit word.
+///
+/// Three things are easy to get wrong here, and each has a name below:
+///
+/// * the sector count is of sectors **beyond the first**, so the span
+///   is at least one sector even when the count is zero;
+/// * it is measured from the start of the sector containing
+///   `host_off`, not from `host_off` — so an unaligned offset yields a
+///   span that is *not* a whole number of sectors;
+/// * 512 is the compressed-sector size from the specification. It is
+///   deliberately neither the cluster size nor the device's block size,
+///   and does not follow either of them.
+///
+/// The encode side lives in this crate's test fixtures rather than
+/// here, since nothing in the reader writes compressed clusters. What
+/// keeps the two honest is `tests/qemu_validation.rs`, which hands our
+/// compressed images to an external tool and compares its decode with
+/// ours.
 fn decode_compressed_descriptor(entry: u64, cluster_bits: u32) -> (u64, usize) {
-    // Strip COPIED (bit 63) and the COMPRESSED flag (bit 62).
+    // Bits 62 and 63 are the COMPRESSED and COPIED flags; the
+    // descriptor is everything below them.
     let descriptor = entry & ((1u64 << 62) - 1);
-    let x = (62 - (cluster_bits - 8)) as u64;
-    let host_off = descriptor & ((1u64 << x) - 1);
-    let n = descriptor >> x; // additional 512-byte sectors beyond the one
-                             // containing host_off.
-    let start_sector = host_off / 512;
-    let end_byte = (start_sector + n + 1) * 512;
-    let span = (end_byte - host_off) as usize;
+
+    let offset_bits = (62 - (cluster_bits - 8)) as u64;
+    let host_off = descriptor & ((1u64 << offset_bits) - 1);
+    let additional_sectors = descriptor >> offset_bits;
+
+    let first_sector_start = (host_off / COMPRESSED_SECTOR_SIZE) * COMPRESSED_SECTOR_SIZE;
+    let end = first_sector_start + (additional_sectors + 1) * COMPRESSED_SECTOR_SIZE;
+    let span = (end - host_off) as usize;
     (host_off, span)
 }
 
@@ -1321,5 +1451,144 @@ fn fs_core_to_qcow2_error(e: fs_core::Error) -> Error {
             Error::OutOfBounds { offset, len, size }
         }
         fs_core::Error::Custom(s) => Error::Decompress(s),
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    /// The compressed descriptor, encoded the way the format specifies.
+    ///
+    /// Only the tests need this direction, so it lives here rather than
+    /// in the crate proper. It is written from the specification rather
+    /// than derived from `decode_compressed_descriptor`, so a
+    /// round-trip through the two is a real check and not a tautology.
+    fn encode_compressed_descriptor(host_off: u64, compressed_len: u64, cluster_bits: u32) -> u64 {
+        let offset_bits = 62 - (cluster_bits - 8);
+        // The count is of *additional* sectors beyond the one containing
+        // host_off — so it is measured from the start of that sector,
+        // not from host_off itself.
+        let first_sector_start = (host_off / COMPRESSED_SECTOR_SIZE) * COMPRESSED_SECTOR_SIZE;
+        let end = host_off + compressed_len;
+        let sectors = (end - first_sector_start).div_ceil(COMPRESSED_SECTOR_SIZE);
+        let additional = sectors - 1;
+        (additional << offset_bits) | host_off | L2_FLAG_COMPRESSED
+    }
+
+    /// A payload wholly inside one sector spans exactly that sector's
+    /// remainder.
+    #[test]
+    fn a_single_sector_payload_decodes_to_one_sector() {
+        let entry = encode_compressed_descriptor(4096 * 3, 400, 12);
+        assert_eq!(decode_compressed_descriptor(entry, 12), (4096 * 3, 512));
+    }
+
+    /// A payload crossing sector boundaries.
+    ///
+    /// **This is the case no test reached before.** Every compressed
+    /// fixture in the suite is a cluster of one repeated byte, which
+    /// deflates to well under one sector, so the sector count was always
+    /// zero and the whole `additional sectors` half of the descriptor
+    /// was dead as far as the tests were concerned: widening the offset
+    /// field by a bit — which moves where that count is read from —
+    /// failed **no** tests at all.
+    #[test]
+    fn a_multi_sector_payload_decodes_to_every_sector_it_covers() {
+        for (len, expected_span) in [(512u64, 512usize), (513, 1024), (1024, 1024), (1025, 1536)] {
+            let entry = encode_compressed_descriptor(4096 * 3, len, 12);
+            let (host, span) = decode_compressed_descriptor(entry, 12);
+            assert_eq!(host, 4096 * 3, "host offset for len {len}");
+            assert_eq!(span, expected_span, "span for len {len}");
+        }
+    }
+
+    /// A host offset that is not sector-aligned.
+    ///
+    /// The span runs from `host_off` to the end of the last sector the
+    /// payload touches, so it is *not* a whole number of sectors when
+    /// the offset is unaligned. The report flagged this term as never
+    /// exercised, and it was right — every fixture is cluster-aligned.
+    #[test]
+    fn an_unaligned_host_offset_shortens_the_span_by_its_remainder() {
+        // 100 bytes into a sector, 300 bytes long: still one sector, but
+        // only 412 bytes of it lie at or after host_off.
+        let entry = encode_compressed_descriptor(4096 * 3 + 100, 300, 12);
+        assert_eq!(
+            decode_compressed_descriptor(entry, 12),
+            (4096 * 3 + 100, 412)
+        );
+
+        // Same start, long enough to cross into the next sector.
+        let entry = encode_compressed_descriptor(4096 * 3 + 100, 500, 12);
+        assert_eq!(
+            decode_compressed_descriptor(entry, 12),
+            (4096 * 3 + 100, 924)
+        );
+    }
+
+    /// The offset field's width depends on the cluster size, so the same
+    /// host offset encodes differently at different `cluster_bits`.
+    ///
+    /// Every existing test runs at `cluster_bits = 12`, which left the
+    /// `- (cluster_bits - 8)` term unexercised.
+    #[test]
+    fn the_offset_field_width_tracks_the_cluster_size() {
+        for cluster_bits in [9u32, 12, 16, 21] {
+            let host = 1u64 << 20;
+            let entry = encode_compressed_descriptor(host, 1000, cluster_bits);
+            let (decoded_host, span) = decode_compressed_descriptor(entry, cluster_bits);
+            assert_eq!(decoded_host, host, "host at cluster_bits {cluster_bits}");
+            assert_eq!(span, 1024, "span at cluster_bits {cluster_bits}");
+        }
+    }
+
+    /// The host-offset mask covers bits 9..55 inclusive, and nothing else.
+    ///
+    /// Derived here from the bit range the specification names, rather
+    /// than copied from the constant — the constant written out as a hex
+    /// literal is exactly the kind of thing that can be one nibble wrong
+    /// and still look plausible. Nothing else in the suite would notice:
+    /// widening the mask to strip bit 9 as well failed **no** tests,
+    /// because every fixture offset is cluster-aligned and so has zeroes
+    /// there anyway.
+    /// The mask in `l2_entry_for` is load-bearing, not tidying.
+    ///
+    /// Every host offset the allocator hands out is cluster-aligned, so
+    /// the mask is a no-op in practice and dropping it failed **no**
+    /// tests. It matters for the case the allocator does not produce: an
+    /// offset with low bits set would land those bits on top of the
+    /// flags field, and the entry would then read back as a *different*
+    /// host offset — or, with bit 0 set on a v3 image, as the "reads as
+    /// zeros" flag.
+    #[test]
+    fn an_unaligned_host_offset_cannot_bleed_into_the_flag_bits() {
+        let aligned = 4096u64 * 7;
+        assert_eq!(l2_entry_for(aligned), aligned | L2_FLAG_COPIED);
+
+        // Low bits set: they must be dropped, not carried into flags.
+        let entry = l2_entry_for(aligned | 0x1FF);
+        assert_eq!(entry & OFFSET_MASK, aligned, "offset is unchanged");
+        assert_eq!(
+            entry & L2_FLAG_ZERO,
+            0,
+            "bit 0 did not become the zero flag"
+        );
+        assert_eq!(entry & L2_FLAG_COMPRESSED, 0, "bit 62 is clear");
+        assert_ne!(entry & L2_FLAG_COPIED, 0, "COPIED is set");
+    }
+
+    #[test]
+    fn the_offset_mask_is_exactly_bits_9_through_55() {
+        let all_bits_below_56 = (1u64 << 56) - 1;
+        let bits_below_9 = (1u64 << 9) - 1;
+        assert_eq!(OFFSET_MASK, all_bits_below_56 & !bits_below_9);
+
+        // Stated the other way round, so a single edit cannot satisfy
+        // both: the mask keeps bit 9 and bit 55, and drops bit 8 and 56.
+        assert_ne!(OFFSET_MASK & (1 << 9), 0, "bit 9 is part of the offset");
+        assert_ne!(OFFSET_MASK & (1 << 55), 0, "bit 55 is part of the offset");
+        assert_eq!(OFFSET_MASK & (1 << 8), 0, "bit 8 is not");
+        assert_eq!(OFFSET_MASK & (1 << 56), 0, "bit 56 is not");
     }
 }

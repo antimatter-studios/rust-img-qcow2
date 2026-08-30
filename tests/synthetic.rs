@@ -445,13 +445,13 @@ fn write_into_unallocated_l1_entry_allocates_l2_table() {
 
     // L1 table: entry 0 -> L2 at l2_off (COPIED), entry 1 = 0.
     let mut l1 = [0u8; 4096];
-    let l1_entry = (l2_off & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let l1_entry = (l2_off & HOST_OFFSET_MASK) | COPIED;
     l1[0..8].copy_from_slice(&l1_entry.to_be_bytes());
     f.write_all_at(&l1, l1_off).unwrap();
 
     // L2 (for L1[0]): entry 0 -> data cluster (COPIED).
     let mut l2 = [0u8; 4096];
-    let e0 = (data0_off & 0x00ff_ffff_ffff_fe00) | COPIED;
+    let e0 = (data0_off & HOST_OFFSET_MASK) | COPIED;
     l2[0..8].copy_from_slice(&e0.to_be_bytes());
     f.write_all_at(&l2, l2_off).unwrap();
 
@@ -764,8 +764,8 @@ fn write_to_shared_cluster_clones_via_cow() {
     // L2 entry must now point at a NEW host cluster, not cluster 3.
     let new_l2 = read_l2_entry_0(&path);
     assert_ne!(
-        new_l2 & 0x00ff_ffff_ffff_fe00,
-        original_l2 & 0x00ff_ffff_ffff_fe00,
+        new_l2 & HOST_OFFSET_MASK,
+        original_l2 & HOST_OFFSET_MASK,
         "L2 entry must be repointed at a fresh cluster after CoW"
     );
 
@@ -777,7 +777,7 @@ fn write_to_shared_cluster_clones_via_cow() {
     );
 
     // The new cluster's refcount should be 1.
-    let new_host_cluster_idx = (new_l2 & 0x00ff_ffff_ffff_fe00) / CLUSTER_SIZE;
+    let new_host_cluster_idx = (new_l2 & HOST_OFFSET_MASK) / CLUSTER_SIZE;
     assert_eq!(
         read_refcount_entry(&path, REFCOUNT_BLOCK_OFFSET, new_host_cluster_idx),
         1,
@@ -1061,4 +1061,98 @@ fn allocator_refuses_the_header_cluster() {
     assert_eq!(&magic, b"QFI\xfb", "the header was overwritten");
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// An image with 8-bit refcounts is refused at the point of allocating,
+/// not silently mis-read.
+///
+/// `allocate_cluster` walks refcount blocks as arrays of big-endian
+/// `u16`. That is only right when `refcount_order == 4`; at any other
+/// order the entries are a different width and the walk would read
+/// neighbouring entries as one, hand out a cluster that is actually in
+/// use, and overwrite live data. The guard against that has been there
+/// since the writer landed — and **no test touched it**: deleting the
+/// whole check failed nothing at all.
+///
+/// `refcount_order = 3` (8-bit entries) is the realistic case; qemu
+/// writes it for images created with `refcount_bits=8`.
+#[test]
+fn a_non_u16_refcount_width_is_refused_rather_than_mis_walked() {
+    let path = tmp_path("refcount_order_3");
+    build_image(&path);
+
+    // Patch refcount_order 4 → 3. Everything else about the image stays
+    // valid, so the refusal can only come from the width check.
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&3u32.to_be_bytes(), 96).unwrap();
+    }
+
+    let r = Qcow2Reader::open_rw(&path).unwrap();
+    // Virt cluster 1 is unallocated, so writing to it must allocate.
+    let err = r.write_at(4096, &[0x77; 16]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refcount_order") || msg.contains("refcount entries"),
+        "expected a refusal naming the refcount width, got: {msg}"
+    );
+}
+
+/// A virtual offset past the first L1 entry's reach resolves through
+/// the *second* L2 table.
+///
+/// One L1 entry covers 2 MiB at a 4 KiB cluster, and every other
+/// fixture in this suite is 16 KiB — so `l1_index` was 0 in every test
+/// ever run, and hard-coding it to 0 in the reader failed nothing. Half
+/// the crate's central abstraction was untested.
+#[test]
+fn a_virtual_offset_past_the_first_l1_entry_reads_the_second_l2_table() {
+    let path = tmp_path("two_l1");
+    build_two_l1_entry_image(&path);
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = [0u8; 8];
+
+    // Virt cluster 0 — L1 entry 0.
+    r.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf, [0xA1; 8], "first L1 entry's cluster");
+
+    // Virt cluster 512 = 2 MiB — the first cluster of L1 entry 1.
+    r.read_at(2 * 1024 * 1024, &mut buf).unwrap();
+    assert_eq!(buf, [0xB2; 8], "second L1 entry's cluster");
+
+    // A cluster inside L1 entry 1 that has no L2 entry reads as zeros
+    // rather than borrowing from the first table.
+    r.read_at(2 * 1024 * 1024 + 4096, &mut buf).unwrap();
+    assert_eq!(buf, [0; 8], "unallocated cluster in the second L2 table");
+}
+
+/// Writing past the first L1 entry updates the second L2 table.
+///
+/// The write path derives `l1_index` the same way the read path does,
+/// so it was equally untested past 2 MiB.
+#[test]
+fn a_write_past_the_first_l1_entry_lands_in_the_second_l2_table() {
+    let path = tmp_path("two_l1_write");
+    build_two_l1_entry_image(&path);
+
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        r.write_at(2 * 1024 * 1024 + 16, &[0x5A; 8]).unwrap();
+        r.flush().unwrap();
+    }
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = [0u8; 8];
+    r.read_at(2 * 1024 * 1024 + 16, &mut buf).unwrap();
+    assert_eq!(buf, [0x5A; 8]);
+
+    // The first L1 entry's data is untouched — a wrong l1_index on the
+    // write path would have landed there.
+    let mut first = [0u8; 8];
+    r.read_at(16, &mut first).unwrap();
+    assert_eq!(
+        first, [0xA1; 8],
+        "the first L2 table's cluster is unchanged"
+    );
 }

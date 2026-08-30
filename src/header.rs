@@ -31,6 +31,52 @@ use crate::error::{Error, Result};
 
 pub const QCOW2_MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
 
+/// Byte offsets of the header's fields, per the layout above.
+///
+/// The parser reads through these; the *fixtures* deliberately do not,
+/// and write literal offsets instead. That is what lets a wrong
+/// constant here be caught rather than agreed with: moving
+/// `CLUSTER_BITS` by one byte fails 52 tests, `L1_TABLE_OFFSET` 35.
+/// Rewriting the fixtures against this table would take both to zero.
+/// [`tests::offsets_match_the_published_specification`] is the same
+/// intent written down once, so it survives a later tidy-up.
+pub mod offsets {
+    pub const MAGIC: usize = 0;
+    pub const VERSION: usize = 4;
+    pub const BACKING_FILE_OFFSET: usize = 8;
+    pub const BACKING_FILE_SIZE: usize = 16;
+    pub const CLUSTER_BITS: usize = 20;
+    pub const SIZE: usize = 24;
+    pub const CRYPT_METHOD: usize = 32;
+    pub const L1_SIZE: usize = 36;
+    pub const L1_TABLE_OFFSET: usize = 40;
+    pub const REFCOUNT_TABLE_OFFSET: usize = 48;
+    pub const REFCOUNT_TABLE_CLUSTERS: usize = 56;
+    pub const NB_SNAPSHOTS: usize = 60;
+    pub const SNAPSHOTS_OFFSET: usize = 64;
+
+    // v3 only.
+    pub const INCOMPATIBLE_FEATURES: usize = 72;
+    pub const COMPATIBLE_FEATURES: usize = 80;
+    pub const AUTOCLEAR_FEATURES: usize = 88;
+    pub const REFCOUNT_ORDER: usize = 96;
+    pub const HEADER_LENGTH: usize = 100;
+
+    /// Where the v3 header ends if it carries no additional fields.
+    /// A `header_length` above this means `COMPRESSION_TYPE` is present.
+    pub const V3_BASE_HEADER_LENGTH: u32 = 104;
+    /// First byte of the v3 additional-fields region.
+    pub const COMPRESSION_TYPE: usize = 104;
+
+    /// v2 has no feature words, no `refcount_order` and no
+    /// `header_length` on disk. The specification fixes their values,
+    /// and these are them — not defaults this crate chose.
+    pub mod v2_implicit {
+        pub const REFCOUNT_ORDER: u32 = 4;
+        pub const HEADER_LENGTH: u32 = 72;
+    }
+}
+
 /// Bits set in `incompatible_features` we know how to refuse cleanly.
 pub mod incompat {
     pub const DIRTY: u64 = 1 << 0;
@@ -81,32 +127,32 @@ impl Header {
             return Err(Error::Corrupt("header shorter than 72 bytes"));
         }
 
-        let magic = read_u32(bytes, 0);
+        let magic = read_u32(bytes, offsets::MAGIC);
         if magic != QCOW2_MAGIC {
             return Err(Error::NotQcow2);
         }
 
-        let version = read_u32(bytes, 4);
+        let version = read_u32(bytes, offsets::VERSION);
         if version != 2 && version != 3 {
             return Err(Error::UnsupportedVersion(version));
         }
 
-        let backing_file_offset = read_u64(bytes, 8);
-        let backing_file_size = read_u32(bytes, 16);
-        let cluster_bits = read_u32(bytes, 20);
+        let backing_file_offset = read_u64(bytes, offsets::BACKING_FILE_OFFSET);
+        let backing_file_size = read_u32(bytes, offsets::BACKING_FILE_SIZE);
+        let cluster_bits = read_u32(bytes, offsets::CLUSTER_BITS);
         if !(9..=21).contains(&cluster_bits) {
             return Err(Error::InvalidClusterBits(cluster_bits));
         }
         let cluster_size = 1u64 << cluster_bits;
 
-        let virtual_size = read_u64(bytes, 24);
-        let crypt_method = read_u32(bytes, 32);
-        let l1_size = read_u32(bytes, 36);
-        let l1_table_offset = read_u64(bytes, 40);
-        let refcount_table_offset = read_u64(bytes, 48);
-        let refcount_table_clusters = read_u32(bytes, 56);
-        let nb_snapshots = read_u32(bytes, 60);
-        let snapshots_offset = read_u64(bytes, 64);
+        let virtual_size = read_u64(bytes, offsets::SIZE);
+        let crypt_method = read_u32(bytes, offsets::CRYPT_METHOD);
+        let l1_size = read_u32(bytes, offsets::L1_SIZE);
+        let l1_table_offset = read_u64(bytes, offsets::L1_TABLE_OFFSET);
+        let refcount_table_offset = read_u64(bytes, offsets::REFCOUNT_TABLE_OFFSET);
+        let refcount_table_clusters = read_u32(bytes, offsets::REFCOUNT_TABLE_CLUSTERS);
+        let nb_snapshots = read_u32(bytes, offsets::NB_SNAPSHOTS);
+        let snapshots_offset = read_u64(bytes, offsets::SNAPSHOTS_OFFSET);
 
         let (
             incompatible_features,
@@ -115,32 +161,41 @@ impl Header {
             refcount_order,
             header_length,
         ) = if version >= 3 {
-            if bytes.len() < 104 {
+            if bytes.len() < offsets::V3_BASE_HEADER_LENGTH as usize {
                 return Err(Error::Corrupt("v3 header shorter than 104 bytes"));
             }
             (
-                read_u64(bytes, 72),
-                read_u64(bytes, 80),
-                read_u64(bytes, 88),
-                read_u32(bytes, 96),
-                read_u32(bytes, 100),
+                read_u64(bytes, offsets::INCOMPATIBLE_FEATURES),
+                read_u64(bytes, offsets::COMPATIBLE_FEATURES),
+                read_u64(bytes, offsets::AUTOCLEAR_FEATURES),
+                read_u32(bytes, offsets::REFCOUNT_ORDER),
+                read_u32(bytes, offsets::HEADER_LENGTH),
             )
         } else {
             // v2 implicit defaults per spec.
-            (0, 0, 0, 4, 72)
+            (
+                0,
+                0,
+                0,
+                offsets::v2_implicit::REFCOUNT_ORDER,
+                offsets::v2_implicit::HEADER_LENGTH,
+            )
         };
 
         // v3 additional-fields region starts at byte 104. The first byte is
         // `compression_type` (0 = zlib, 1 = zstd). Older v3 images set
         // header_length to 104 and omit this byte; treat as zlib.
-        let compression_type = if version >= 3 && header_length > 104 && bytes.len() > 104 {
-            bytes[104]
+        let compression_type = if version >= 3
+            && header_length > offsets::V3_BASE_HEADER_LENGTH
+            && bytes.len() > offsets::COMPRESSION_TYPE
+        {
+            bytes[offsets::COMPRESSION_TYPE]
         } else {
             0
         };
 
         // Sanity: l1 must be large enough to address the whole virtual disk.
-        let l2_entries_per_cluster = cluster_size / 8;
+        let l2_entries_per_cluster = cluster_size / crate::reader::TABLE_ENTRY_BYTES;
         let bytes_per_l1_entry = cluster_size * l2_entries_per_cluster;
         let needed_l1 = virtual_size.div_ceil(bytes_per_l1_entry);
         if (l1_size as u64) < needed_l1 {
@@ -227,6 +282,84 @@ fn read_u64(b: &[u8], off: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// The offset table, checked against the specification's own table.
+    ///
+    /// A deliberate second copy: the literals here come from the QCOW2
+    /// specification, reproduced in this module's doc comment. Every
+    /// other reader in the crate now goes through the constants, so
+    /// this is the only place that can disagree with them.
+    ///
+    /// If this test and the constants diverge, re-read the spec before
+    /// touching either — this is the half with independent provenance.
+    #[test]
+    fn offsets_match_the_published_specification() {
+        use super::offsets as at;
+        assert_eq!(at::MAGIC, 0);
+        assert_eq!(at::VERSION, 4);
+        assert_eq!(at::BACKING_FILE_OFFSET, 8);
+        assert_eq!(at::BACKING_FILE_SIZE, 16);
+        assert_eq!(at::CLUSTER_BITS, 20);
+        assert_eq!(at::SIZE, 24);
+        assert_eq!(at::CRYPT_METHOD, 32);
+        assert_eq!(at::L1_SIZE, 36);
+        assert_eq!(at::L1_TABLE_OFFSET, 40);
+        assert_eq!(at::REFCOUNT_TABLE_OFFSET, 48);
+        assert_eq!(at::REFCOUNT_TABLE_CLUSTERS, 56);
+        assert_eq!(at::NB_SNAPSHOTS, 60);
+        assert_eq!(at::SNAPSHOTS_OFFSET, 64);
+        assert_eq!(at::INCOMPATIBLE_FEATURES, 72);
+        assert_eq!(at::COMPATIBLE_FEATURES, 80);
+        assert_eq!(at::AUTOCLEAR_FEATURES, 88);
+        assert_eq!(at::REFCOUNT_ORDER, 96);
+        assert_eq!(at::HEADER_LENGTH, 100);
+        assert_eq!(at::V3_BASE_HEADER_LENGTH, 104);
+        assert_eq!(at::COMPRESSION_TYPE, 104);
+        assert_eq!(at::v2_implicit::REFCOUNT_ORDER, 4);
+        assert_eq!(at::v2_implicit::HEADER_LENGTH, 72);
+    }
+
+    /// No header field overlaps the next.
+    ///
+    /// The table above pins each offset on its own; this checks they
+    /// still describe one layout. A field widened without its
+    /// neighbour moving satisfies every assertion above and fails here.
+    #[test]
+    fn no_header_field_overlaps_its_neighbour() {
+        use super::offsets as at;
+        let fields = [
+            (at::MAGIC, 4),
+            (at::VERSION, 4),
+            (at::BACKING_FILE_OFFSET, 8),
+            (at::BACKING_FILE_SIZE, 4),
+            (at::CLUSTER_BITS, 4),
+            (at::SIZE, 8),
+            (at::CRYPT_METHOD, 4),
+            (at::L1_SIZE, 4),
+            (at::L1_TABLE_OFFSET, 8),
+            (at::REFCOUNT_TABLE_OFFSET, 8),
+            (at::REFCOUNT_TABLE_CLUSTERS, 4),
+            (at::NB_SNAPSHOTS, 4),
+            (at::SNAPSHOTS_OFFSET, 8),
+            (at::INCOMPATIBLE_FEATURES, 8),
+            (at::COMPATIBLE_FEATURES, 8),
+            (at::AUTOCLEAR_FEATURES, 8),
+            (at::REFCOUNT_ORDER, 4),
+            (at::HEADER_LENGTH, 4),
+            (at::COMPRESSION_TYPE, 1),
+        ];
+        let mut reached = 0usize;
+        for (start, width) in fields {
+            assert!(
+                start >= reached,
+                "field at {start} overlaps the one ending at {reached}"
+            );
+            reached = start + width;
+        }
+        // The v3 base header ends exactly where the additional-fields
+        // region begins.
+        assert_eq!(at::V3_BASE_HEADER_LENGTH as usize, at::COMPRESSION_TYPE);
+    }
+
     use super::*;
 
     #[test]
