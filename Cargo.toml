@@ -1,6 +1,6 @@
 [package]
 name = "am-img-qcow2"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust QCOW2 reader. Exposes a Rust API and a C ABI suitable for FFI from C/C++/Go/Swift."

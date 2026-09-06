@@ -7,6 +7,16 @@ never does.
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-09-06
+
+### Fixed
+
+- A compressed cluster's decode is bounded, and so are the tables read
+  at open. A qcow2 header states the size of its refcount and L1 tables
+  and each compressed cluster states how much it decodes to; all three
+  came off the image and none was checked against what the file can
+  hold, so a crafted image could make the reader allocate on its say-so.
+
 ## [0.4.4] — 2026-09-04
 
 ### Fixed
