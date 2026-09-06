@@ -1156,3 +1156,102 @@ fn a_write_past_the_first_l1_entry_lands_in_the_second_l2_table() {
         "the first L2 table's cluster is unchanged"
     );
 }
+
+/// A compressed cluster's descriptor says how many 512-byte sectors the
+/// payload occupies. It says nothing about how much that payload
+/// decodes to, and the two branches that decode one did not agree about
+/// whose job it was to bound it: the zlib branch reads into a buffer
+/// already sized to one cluster, so it cannot produce more; the zstd
+/// branch read the whole frame and compared the length afterwards.
+///
+/// A frame of repeated zeros compresses to almost nothing, so a
+/// payload that fits in one 512-byte sector decodes to as much as the
+/// image cares to claim.
+#[test]
+fn a_zstd_cluster_stops_decoding_at_one_cluster() {
+    let path = tmp_path("zstd_bomb");
+    // Sixteen thousand times what a 4 KiB cluster holds.
+    let bomb = vec![0u8; 64 * 1024 * 1024];
+    common::build_compressed_image_of(&path, &bomb, common::Compressor::Zstd);
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 4096];
+    let why = format!("{:?}", r.read_at(0, &mut buf).err());
+
+    // The refusal itself is not in doubt -- 64 MiB is not 4 KiB either
+    // way. What is asserted is how much was decoded before saying so.
+    let produced: usize = why
+        .split("produced ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("expected a decode-size refusal, got {why}"));
+    assert!(
+        produced <= CLUSTER_SIZE as usize + 1,
+        "the reader decoded {produced} bytes of a cluster that holds {CLUSTER_SIZE} \
+         before deciding it was too much"
+    );
+
+    drop(r);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The L1 table and the refcount table are each read whole into a
+/// buffer sized from a header field. `l1_size` is a `u32` with only a
+/// lower bound; `refcount_table_clusters` is a `u32` multiplied by the
+/// cluster size, which at the largest cluster this reader accepts is
+/// nine petabytes. That allocation does not fail politely --
+/// `handle_alloc_error` aborts, and an abort is not something the FFI
+/// boundary's `catch_unwind` can turn into an error code.
+///
+/// Both refusals are asserted by name: the open or the write fails
+/// either way once the read comes up short, and what matters is that it
+/// is refused before the buffer is allocated.
+#[test]
+fn a_table_claiming_more_than_the_image_is_refused_by_name() {
+    // L1 table: 512 M entries of eight bytes.
+    {
+        let path = tmp_path("oversized_l1");
+        build_image(&path);
+        patch_header_u32(&path, 36, 0x2000_0000);
+        let why = format!("{:?}", Qcow2Reader::open(&path).err());
+        assert!(
+            why.contains("L1 table reaches past the end"),
+            "an L1 table of 4 GiB was refused as {why}, which means the \
+             buffer was allocated and read first"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Refcount table: reached from the allocator, so the image has to
+    // be opened read-write and written into an unallocated cluster.
+    {
+        let path = tmp_path("oversized_refcount_table");
+        build_image(&path);
+        patch_header_u32(&path, 56, 0x0010_0000);
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        // Virtual cluster 1 has no L2 entry in this fixture, so writing
+        // to it has to allocate.
+        let why = format!("{:?}", r.write_at(CLUSTER_SIZE, &[0xEE; 512]).err());
+        assert!(
+            why.contains("refcount table reaches past the end"),
+            "a refcount table of 4 GiB was refused as {why}, which means the \
+             buffer was allocated and read first"
+        );
+        drop(r);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Overwrite one big-endian `u32` in the header of an image.
+fn patch_header_u32(path: &PathBuf, at: u64, value: u32) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&value.to_be_bytes()).unwrap();
+    f.flush().unwrap();
+}

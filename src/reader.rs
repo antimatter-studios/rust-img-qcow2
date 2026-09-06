@@ -295,6 +295,36 @@ pub struct Qcow2Reader {
     writable: bool,
 }
 
+/// The length of a table, once it is known to be inside the image.
+///
+/// The L1 table and the refcount table are each read whole into a
+/// buffer sized from header fields. `l1_size` is a `u32` with only a
+/// lower bound (it must cover the virtual size); `refcount_table_clusters`
+/// is a `u32` multiplied by the cluster size, which at the largest
+/// cluster this reader accepts is nine petabytes. That allocation does
+/// not fail politely: `handle_alloc_error` aborts, and an abort is not
+/// something the FFI boundary's `catch_unwind` can turn into an error
+/// code -- the host process dies.
+///
+/// A table that does not fit inside the image is not a table.
+///
+/// `outside` is the message for one that does not fit. It is static
+/// because `Error::Corrupt` carries a `&'static str`, and formatting
+/// one per failure would mean leaking a string for every hostile
+/// image.
+fn span_inside_the_image(
+    dev_size: u64,
+    offset: u64,
+    length: u64,
+    outside: &'static str,
+) -> Result<usize> {
+    let end = offset.checked_add(length).ok_or(Error::Corrupt(outside))?;
+    if end > dev_size {
+        return Err(Error::Corrupt(outside));
+    }
+    Ok(length as usize)
+}
+
 impl Qcow2Reader {
     /// Open `path` read-only and parse the header + L1 table. If the image
     /// references a backing file, the parent is opened recursively (capped at
@@ -386,7 +416,15 @@ impl Qcow2Reader {
         let header = Header::parse(&head_bytes[..])?;
         header.check_supported()?;
 
-        let mut l1_bytes = vec![0u8; (header.l1_size as usize) * 8];
+        let mut l1_bytes = vec![
+            0u8;
+            span_inside_the_image(
+                dev.size_bytes(),
+                header.l1_table_offset,
+                u64::from(header.l1_size) * 8,
+                "L1 table reaches past the end of the image",
+            )?
+        ];
         dev.read_at(header.l1_table_offset, &mut l1_bytes)
             .map_err(fs_core_to_qcow2_error)?;
         let mut l1 = Vec::with_capacity(header.l1_size as usize);
@@ -788,8 +826,18 @@ impl Qcow2Reader {
                 "no refcount table (cannot allocate clusters)",
             ));
         }
-        let rt_size = rt_clusters * cluster_size;
-        let mut rt_bytes = vec![0u8; rt_size as usize];
+        let rt_size = rt_clusters
+            .checked_mul(cluster_size)
+            .ok_or(Error::Corrupt("refcount table size overflows"))?;
+        let mut rt_bytes = vec![
+            0u8;
+            span_inside_the_image(
+                self.dev.size_bytes(),
+                rt_off,
+                rt_size,
+                "refcount table reaches past the end of the image",
+            )?
+        ];
         self.dev_read(rt_off, &mut rt_bytes)?;
 
         let rt_entries_total = (rt_size / TABLE_ENTRY_BYTES) as usize;
@@ -1282,10 +1330,22 @@ impl Qcow2Reader {
                 // used (not read_exact) because zstd frames know their
                 // own decompressed length; we then check it matches the
                 // cluster size we expected.
-                let mut decoder = ruzstd::decoding::StreamingDecoder::new(&compressed[..])
+                //
+                // ONE BYTE MORE THAN A CLUSTER, and no further. The
+                // descriptor bounds how much compressed payload there
+                // is -- at most about 4 MiB -- and says nothing about
+                // how much it decodes to. Zeros compress to almost
+                // nothing, so a payload inside a single 512-byte sector
+                // decoded to 64 MiB and reached 2.35 GB resident before
+                // the length was compared to the cluster size, which
+                // happened after the whole frame was in memory. The
+                // extra byte is what makes "too long" still detectable
+                // once the read stops early.
+                let decoder = ruzstd::decoding::StreamingDecoder::new(&compressed[..])
                     .map_err(|e| Error::Decompress(e.to_string()))?;
                 let mut out = Vec::with_capacity(cluster_size);
                 decoder
+                    .take(cluster_size as u64 + 1)
                     .read_to_end(&mut out)
                     .map_err(|e| Error::Decompress(e.to_string()))?;
                 if out.len() != cluster_size {

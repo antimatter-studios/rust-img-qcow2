@@ -229,13 +229,24 @@ pub fn build_zstd_compressed_image(path: &Path, pattern: u8) {
 /// parser. See that module's docs.
 pub fn build_compressed_image_with(path: &Path, pattern: u8, compressor: Compressor) {
     let plain = vec![pattern; CLUSTER_SIZE as usize];
+    build_compressed_image_of(path, &plain, compressor);
+}
+
+/// As [`build_compressed_image_with`], with the plaintext given rather
+/// than a cluster of one repeated byte.
+///
+/// A cluster's descriptor says how many 512-byte sectors the compressed
+/// payload occupies; it says nothing about how much it decodes to. So a
+/// payload that decodes to far more than a cluster is a legal thing to
+/// write down, and this is how a test writes one.
+pub fn build_compressed_image_of(path: &Path, plain: &[u8], compressor: Compressor) {
     let compressed = match compressor {
         Compressor::Zlib => {
             let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(&plain).unwrap();
+            enc.write_all(plain).unwrap();
             enc.finish().unwrap()
         }
-        Compressor::Zstd => zstd::stream::encode_all(&plain[..], 0).unwrap(),
+        Compressor::Zstd => zstd::stream::encode_all(plain, 0).unwrap(),
     };
     assert!(
         compressed.len() < CLUSTER_SIZE as usize,
