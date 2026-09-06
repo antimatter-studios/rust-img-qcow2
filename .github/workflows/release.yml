@@ -22,7 +22,7 @@ jobs:
       - name: clone sibling crates
         shell: bash
         run: |
-          git clone --depth 1 --branch v0.2.5 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+          git clone --depth 1 --branch v0.2.6 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
           git clone --depth 1 --branch v0.4.1 https://github.com/antimatter-studios/rust-partitions.git ../rust-partitions
 
       - uses: dtolnay/rust-toolchain@stable
@@ -57,7 +57,7 @@ jobs:
       - name: clone sibling crates
         shell: bash
         run: |
-          git clone --depth 1 --branch v0.2.5 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+          git clone --depth 1 --branch v0.2.6 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
           git clone --depth 1 --branch v0.4.1 https://github.com/antimatter-studios/rust-partitions.git ../rust-partitions
 
       - name: install qemu-utils
@@ -81,7 +81,7 @@ jobs:
       - name: clone sibling crates (path deps)
         shell: bash
         run: |
-          git clone --depth 1 --branch v0.2.5 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+          git clone --depth 1 --branch v0.2.6 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
           git clone --depth 1 --branch v0.4.1 https://github.com/antimatter-studios/rust-partitions.git ../rust-partitions
       - uses: dtolnay/rust-toolchain@stable
         with:

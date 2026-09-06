@@ -34,7 +34,7 @@ flate2 = "1"
 ruzstd = "0.8"
 # Block-device trait surface. Local path dep until both crates are
 # published; flip to a published version on the first crates.io release.
-am-fs-core = { path = "../rust-fs-core", version = "0.2" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.6" }
 
 [dev-dependencies]
 # Partition probe + FS sniff, used by the `inspect` example to demonstrate
