@@ -443,6 +443,12 @@ impl Qcow2Reader {
 
         let header = Header::parse(&head_bytes[..])?;
         header.check_supported()?;
+        // The advisory bits are advisory to a reader and not to a
+        // writer, so the gate is asked which one this is. `open_inner`
+        // is the only place that knows.
+        if writable {
+            header.check_writable()?;
+        }
 
         let mut l1_bytes = vec![
             0u8;

@@ -310,6 +310,67 @@ impl Header {
         }
         Ok(())
     }
+
+    /// The image was flagged corrupt: somebody has already established
+    /// that its metadata is inconsistent.
+    ///
+    /// Tolerated on the read path deliberately — the flag is how a
+    /// damaged image gets looked at — and refused on the write path by
+    /// [`Header::check_writable`].
+    pub fn is_corrupt(&self) -> bool {
+        self.version >= 3 && self.incompatible_features & incompat::CORRUPT != 0
+    }
+
+    /// The refcounts were not written back before the last shutdown, so
+    /// the refcount blocks on disk are not to be trusted.
+    pub fn has_dirty_refcounts(&self) -> bool {
+        self.version >= 3 && self.incompatible_features & incompat::DIRTY != 0
+    }
+
+    /// Reject an image that may be read but must not be written.
+    ///
+    /// `check_supported` puts DIRTY and CORRUPT in the tolerated set,
+    /// and for reading that is right: both are advisory, and refusing
+    /// them would take away the one thing somebody with a damaged image
+    /// wants. Neither is advisory for a writer, and the reference tool
+    /// treats them as hard gates on the read/write open — measured:
+    ///
+    /// ```text
+    /// CORRUPT set:  qemu-img info      -> reports the image, "corrupt: true"
+    ///               qemu-img snapshot  -> "Image is corrupt; cannot be
+    ///                                      opened read/write"
+    ///
+    /// DIRTY set:    qemu-img snapshot  -> succeeds, and the bit is 0x0
+    ///                                      afterwards: it repaired the
+    ///                                      refcounts first
+    /// ```
+    ///
+    /// CORRUPT says the metadata is already inconsistent, and writing
+    /// turns a recoverable inconsistency into a different one. DIRTY is
+    /// the sharper of the two here, because this crate does not repair:
+    /// `allocate_cluster` finds a free cluster by trusting exactly the
+    /// blocks the bit says are stale, so a cluster that is really in use
+    /// can read as refcount 0, and the write path then hands it out,
+    /// fills it and points an L2 entry at it. The data destroyed
+    /// belongs to some other part of the guest's disk and nothing
+    /// reports an error.
+    ///
+    /// Repairing the refcounts, which is what the reference tool does,
+    /// would be the better answer and is a larger piece of work.
+    /// Refusing is what this crate can honestly do today.
+    pub fn check_writable(&self) -> Result<()> {
+        if self.is_corrupt() {
+            return Err(Error::Unsupported(
+                "image is flagged corrupt; it can be read but not written",
+            ));
+        }
+        if self.has_dirty_refcounts() {
+            return Err(Error::Unsupported(
+                "image is flagged dirty; its refcounts need repair before it can be written",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn read_u32(b: &[u8], off: usize) -> u32 {
@@ -686,10 +747,54 @@ mod tests {
     #[test]
     fn check_supported_tolerates_dirty_and_corrupt_advisory_bits() {
         // DIRTY and CORRUPT are recognised (and tolerated) incompatible
-        // bits — they must not trip the unknown-bit rejection.
+        // bits — they must not trip the unknown-bit rejection. This is
+        // the READ gate; the write gate is `check_writable`, below, and
+        // the pair of tests is the whole statement of the decision.
         let mut b = valid_v3_header();
         set_u64(&mut b, 72, incompat::DIRTY | incompat::CORRUPT);
         let h = Header::parse(&b).unwrap();
-        h.check_supported().expect("dirty/corrupt are tolerated");
+        h.check_supported()
+            .expect("dirty/corrupt are tolerated for reading");
+    }
+
+    /// The same two bits are not advisory to a writer.
+    ///
+    /// Each is set on its own, so a check that only looked at one of
+    /// them fails here rather than passing on the other's account.
+    #[test]
+    fn check_writable_refuses_the_dirty_and_corrupt_bits_separately() {
+        for (bit, name, expect) in [
+            (incompat::CORRUPT, "CORRUPT", "flagged corrupt"),
+            (incompat::DIRTY, "DIRTY", "flagged dirty"),
+        ] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, 72, bit);
+            let h = Header::parse(&b).unwrap();
+            h.check_supported()
+                .unwrap_or_else(|e| panic!("{name} must still be readable: {e:?}"));
+            match h.check_writable() {
+                Err(Error::Unsupported(m)) => assert!(
+                    m.contains(expect),
+                    "{name}: refusal must name the flag, got {m:?}"
+                ),
+                other => panic!("{name}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// An image with neither bit is writable, and a v2 image — which has
+    /// no `incompatible_features` field at all — is not caught by the
+    /// bits happening to be set in bytes it does not use.
+    #[test]
+    fn check_writable_accepts_an_image_with_neither_bit() {
+        let h = Header::parse(&valid_v3_header()).unwrap();
+        h.check_writable().expect("an unflagged image is writable");
+
+        let mut b = valid_v3_header();
+        set_u32(&mut b, 4, 2); // version 2
+        set_u64(&mut b, 72, incompat::DIRTY | incompat::CORRUPT);
+        let h = Header::parse(&b).unwrap();
+        h.check_writable()
+            .expect("v2 has no incompatible_features; those bytes mean nothing");
     }
 }

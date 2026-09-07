@@ -543,3 +543,65 @@ fn an_unaligned_table_offset_is_refused_by_the_validator_and_by_us() {
         let _ = std::fs::remove_file(&qcow);
     }
 }
+
+const INCOMPAT_FEATURES_OFFSET: u64 = 72;
+const INCOMPAT_DIRTY: u64 = 1 << 0;
+const INCOMPAT_CORRUPT: u64 = 1 << 1;
+
+/// The two advisory bits are advisory to a reader and not to a writer,
+/// and the reference tool draws the line in the same place.
+///
+/// Measured, on an image that is otherwise sound:
+///
+/// ```text
+/// CORRUPT: qemu-img info      -> reports the image, "corrupt: true"
+///          qemu-img snapshot  -> "Image is corrupt; cannot be opened read/write"
+/// DIRTY:   qemu-img snapshot  -> succeeds, and the bit reads 0x0 afterwards,
+///                                because it repaired the refcounts first
+/// ```
+///
+/// We cannot repair, so refusing is what this crate can honestly do.
+/// The read half is asserted too, because refusing to read a flagged
+/// image would take away the one thing somebody with a damaged one
+/// wants.
+#[test]
+fn a_flagged_image_still_reads_and_no_longer_takes_writes() {
+    for (label, bit) in [("corrupt", INCOMPAT_CORRUPT), ("dirty", INCOMPAT_DIRTY)] {
+        let (qcow, data) = populated_qcow2(&format!("flagged-{label}"));
+
+        // Positive control: unflagged, it reads and writes.
+        {
+            let r = Qcow2Reader::open_rw(&qcow).expect("the unflagged image is writable");
+            r.write_at(0, &[0xABu8; 512]).expect("and takes a write");
+            r.flush().unwrap();
+        }
+        qemu_check(&qcow);
+
+        patch(&qcow, INCOMPAT_FEATURES_OFFSET, &bit.to_be_bytes());
+
+        // Reading is still allowed — and still correct past the bytes we
+        // just overwrote, so this is not passing on an empty image.
+        {
+            let r = Qcow2Reader::open(&qcow).expect("a flagged image must still be readable");
+            let mut buf = vec![0u8; 4096];
+            r.read_at(65536, &mut buf).unwrap();
+            assert_eq!(
+                buf,
+                data[65536..65536 + 4096],
+                "{label}: the read must be right"
+            );
+        }
+
+        // Writing is not.
+        match Qcow2Reader::open_rw(&qcow) {
+            Err(qcow2::Error::Unsupported(m)) => assert!(
+                m.contains(label),
+                "{label}: the refusal must name the flag, got {m:?}"
+            ),
+            Err(other) => panic!("{label}: expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("{label}: opened read-write an image the validator refuses"),
+        }
+
+        let _ = std::fs::remove_file(&qcow);
+    }
+}
