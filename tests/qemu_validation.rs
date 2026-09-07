@@ -461,3 +461,85 @@ fn a_write_leaves_an_internal_snapshot_holding_what_it_held() {
     r.read_at(0, &mut live).unwrap();
     assert!(live.iter().all(|&b| b == 0xEE), "the write did not land");
 }
+
+/// A 3 MiB pattern converted to qcow2 by the reference tool, so the
+/// tables are where a real producer puts them.
+fn populated_qcow2(name: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let raw = tmp_path(&format!("{name}-raw"));
+    let qcow = tmp_path(name);
+    let data = (0..(3 * 1024 * 1024))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<u8>>();
+    std::fs::write(&raw, &data).unwrap();
+    qemu_convert_raw_to_qcow2(&raw, &qcow);
+    let _ = std::fs::remove_file(&raw);
+    (qcow, data)
+}
+
+/// A table offset that is not cluster-aligned is refused by the
+/// validator and by us.
+///
+/// Each offset is moved half a cluster past its real value, so the
+/// table is still inside the image and only its alignment is wrong —
+/// which is what separates this from the "past the end" check that
+/// already existed and was catching these by accident of image size.
+///
+/// Both directions are asserted, so the test cannot pass by the patch
+/// failing to take effect.
+#[test]
+fn an_unaligned_table_offset_is_refused_by_the_validator_and_by_us() {
+    for (field, header_offset, qemu_says) in [
+        ("l1_table_offset", 40u64, "Active L1 table offset invalid"),
+        (
+            "refcount_table_offset",
+            48u64,
+            "Reference count table offset invalid",
+        ),
+    ] {
+        let (qcow, data) = populated_qcow2(field);
+
+        // Positive control: untouched, both of us read it.
+        qemu_check(&qcow);
+        {
+            let r = Qcow2Reader::open(&qcow).unwrap();
+            let mut buf = vec![0u8; 4096];
+            r.read_at(0, &mut buf).unwrap();
+            assert_eq!(buf, data[..4096], "{field}: the untouched image must read");
+        }
+
+        let real = read_be64(&qcow, header_offset);
+        assert_ne!(real, 0, "{field}: qemu should have written a real offset");
+        patch(&qcow, header_offset, &(real + 0x200).to_be_bytes());
+
+        let refusal = run_qemu(&["info", qcow.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&refusal.stderr).into_owned();
+        assert!(
+            !refusal.status.success() && stderr.contains(qemu_says),
+            "precondition: the validator must refuse {field}, got {stderr:?}"
+        );
+
+        match Qcow2Reader::open(&qcow) {
+            Err(qcow2::Error::Corrupt(msg)) => assert!(
+                msg.contains("cluster-aligned"),
+                "{field}: the refusal must name the alignment, got {msg:?}"
+            ),
+            Err(other) => panic!("{field}: expected Corrupt, got {other:?}"),
+            Ok(r) => {
+                let mut buf = vec![0u8; 16];
+                let read = r.read_at(0, &mut buf);
+                panic!(
+                    "{field}: opened an image the validator refuses; read {read:?} gave {:02x?} \
+                     where the guest holds {:02x?}",
+                    buf,
+                    &data[..16]
+                );
+            }
+        }
+        // And read-write, which is where it costs more than a bad read.
+        assert!(
+            Qcow2Reader::open_rw(&qcow).is_err(),
+            "{field}: must not open read-write either"
+        );
+        let _ = std::fs::remove_file(&qcow);
+    }
+}
