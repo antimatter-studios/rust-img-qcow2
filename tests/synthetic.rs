@@ -1368,3 +1368,92 @@ fn an_l1_entry_with_reserved_bits_set_is_refused() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Read `len` bytes out of an image on disk.
+fn raw_bytes(path: &std::path::Path, off: u64, len: usize) -> Vec<u8> {
+    let mut f = File::open(path).unwrap();
+    let mut b = vec![0u8; len];
+    f.read_exact_at(&mut b, off).unwrap();
+    b
+}
+
+/// Set one refcount-block entry.
+fn set_refcount(path: &std::path::Path, host_cluster_idx: u64, count: u16) {
+    patch(
+        path,
+        REFCOUNT_BLOCK_OFFSET + host_cluster_idx * 2,
+        &count.to_be_bytes(),
+    );
+}
+
+/// A shared L2 table is copied before it is written into.
+///
+/// This is the layout an internal snapshot produces: the active L1 and
+/// the snapshot's L1 point at the *same* L2 table, the table's refcount
+/// is 2, COPIED is cleared on the L1 entry to say so, and every data
+/// cluster the table names is reachable twice and so has refcount 2 as
+/// well. Writing into that table changes what the snapshot sees.
+///
+/// The assertion is on the old table's bytes rather than on the write,
+/// because the write lands either way: what used to happen is that it
+/// landed *and* took the snapshot's view with it.
+#[test]
+fn a_shared_l2_table_is_copied_before_it_is_written_into() {
+    let path = tmp_path("shared_l2");
+    build_image(&path);
+
+    // Clear COPIED on the L1 entry and raise the refcounts of the L2
+    // table (cluster 2) and of virt cluster 0's data (cluster 3).
+    patch(
+        &path,
+        L1_OFFSET,
+        &(L2_OFFSET & HOST_OFFSET_MASK).to_be_bytes(),
+    );
+    patch(
+        &path,
+        L2_OFFSET,
+        &(DATA0_OFFSET & HOST_OFFSET_MASK).to_be_bytes(),
+    );
+    set_refcount(&path, L2_OFFSET / CLUSTER_SIZE, 2);
+    set_refcount(&path, DATA0_OFFSET / CLUSTER_SIZE, 2);
+
+    let l2_before = raw_bytes(&path, L2_OFFSET, CLUSTER_SIZE as usize);
+    let data_before = raw_bytes(&path, DATA0_OFFSET, CLUSTER_SIZE as usize);
+
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        r.write_at(0, &[0xEEu8; 64]).unwrap();
+        r.flush().unwrap();
+    }
+
+    let l1_after = u64::from_be_bytes(raw_bytes(&path, L1_OFFSET, 8).try_into().unwrap());
+    assert_ne!(
+        l1_after & HOST_OFFSET_MASK,
+        L2_OFFSET,
+        "L1 still points at the shared L2 table"
+    );
+    assert_ne!(
+        l1_after & COPIED,
+        0,
+        "the private copy must be marked COPIED"
+    );
+
+    assert_eq!(
+        raw_bytes(&path, L2_OFFSET, CLUSTER_SIZE as usize),
+        l2_before,
+        "the shared L2 table was written into"
+    );
+    assert_eq!(
+        raw_bytes(&path, DATA0_OFFSET, CLUSTER_SIZE as usize),
+        data_before,
+        "the shared data cluster was written into"
+    );
+
+    // And the write itself did land.
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = [0u8; 64];
+    r.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf, [0xEE; 64]);
+
+    let _ = std::fs::remove_file(&path);
+}

@@ -1104,6 +1104,21 @@ impl Qcow2Reader {
         Ok(u16::from_be_bytes(entry_bytes))
     }
 
+    /// Whether the L2 table at `l2_table_off` is reached from more than
+    /// one L1 table, so that writing into it would change somebody
+    /// else's view of the disk.
+    ///
+    /// The same shape as the data-cluster test in
+    /// [`Qcow2Reader::plan_write`], and for the same reason: COPIED is
+    /// the format's promise that the refcount is exactly 1, so it is
+    /// only when the bit is clear that the refcount has to be read.
+    fn l2_table_is_shared(&self, l1_entry: u64, l2_table_off: u64) -> Result<bool> {
+        if l1_entry & L2_FLAG_COPIED != 0 {
+            return Ok(false);
+        }
+        Ok(self.read_refcount(l2_table_off)? > 1)
+    }
+
     /// Write `cluster_size` zero bytes to `host_off` and flush.
     /// Used to initialise a freshly-allocated cluster before the user's
     /// payload lands inside it.
@@ -1138,6 +1153,35 @@ impl Qcow2Reader {
         let cluster_size = self.header.cluster_size as usize;
         let mut l2_bytes = vec![0u8; cluster_size];
         self.dev_read(l2_table_off, &mut l2_bytes)?;
+
+        // An L2 table can be shared, and when an internal snapshot
+        // exists it is exactly what is shared: the active L1 and the
+        // snapshot's L1 point at the same table, and the format says so
+        // by clearing COPIED on the L1 entry. Writing into it changes
+        // the snapshot's view of the disk, which is the one thing a
+        // snapshot is for. So copy it first — allocate, copy verbatim,
+        // repoint L1 with COPIED set, and only then release the old
+        // table's share of it.
+        //
+        // The copy leaves the entries alone. Every data cluster the
+        // table names was already reachable from two L1 tables and is
+        // still reachable from two afterwards, so no refcount changes:
+        // the number of paths to each cluster is what the refcount
+        // counts, and copying the table does not add or remove one.
+        //
+        // Crash-safety order: data, then L1, then the release. A crash
+        // between the first two leaks a cluster and changes nothing a
+        // reader can see.
+        let l2_table_off = if self.l2_table_is_shared(l1_entry, l2_table_off)? {
+            let copy_off = self.allocate_cluster()?;
+            self.dev_write(copy_off, &l2_bytes)?;
+            self.dev_flush()?;
+            self.update_l1_entry(l1_idx, l2_entry_for(copy_off))?;
+            let _ = self.decrement_refcount(l2_table_off);
+            copy_off
+        } else {
+            l2_table_off
+        };
 
         let off = l2_idx as usize * TABLE_ENTRY_BYTES as usize;
         l2_bytes[off..off + TABLE_ENTRY_BYTES as usize].copy_from_slice(&new_entry.to_be_bytes());
@@ -1341,6 +1385,12 @@ impl Qcow2Reader {
         let Some(l2_table_off) = self.l2_table_offset(l1_entry)? else {
             return Ok(ClusterMap::Unallocated);
         };
+        // COPIED on the L1 entry says the L2 table's refcount is 1. When
+        // it is clear the table may be reached from a snapshot's L1 as
+        // well, and then every cluster the table names is reached twice
+        // too — so a COPIED bit on an entry inside it cannot be taken at
+        // face value, whatever it says.
+        let l1_copied = l1_entry & L2_FLAG_COPIED != 0;
 
         let l2_entry = self.read_l2_entry(l1_index, l2_table_off, l2_index)?;
 
@@ -1368,7 +1418,7 @@ impl Qcow2Reader {
             "L2 entry names a data cluster that is not cluster-aligned",
             "L2 entry names a data cluster outside the image",
         )?;
-        let copied = l2_entry & L2_FLAG_COPIED != 0;
+        let copied = l1_copied && (l2_entry & L2_FLAG_COPIED != 0);
         Ok(ClusterMap::Plain {
             host_off: host,
             copied,

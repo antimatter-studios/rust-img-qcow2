@@ -386,3 +386,78 @@ fn an_unaligned_l2_entry_is_refused_by_the_validator_and_by_us() {
         &buf[..8]
     );
 }
+
+/// Take an internal snapshot with the reference tool.
+fn qemu_snapshot_create(path: &Path, name: &str) {
+    assert_qemu(&["snapshot", "-c", name, path.to_str().unwrap()]);
+}
+
+/// Convert one internal snapshot's view of the disk out to raw.
+fn qemu_convert_snapshot_to_raw(qcow: &Path, name: &str, raw: &Path) {
+    assert_qemu(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-l",
+        &format!("snapshot.name={name}"),
+        "-O",
+        "raw",
+        qcow.to_str().unwrap(),
+        raw.to_str().unwrap(),
+    ]);
+}
+
+/// Direction 5: a write into an image that has an internal snapshot
+/// must leave the snapshot holding what it was taken to hold.
+///
+/// This is the case the format's copy-on-write exists for, and it
+/// cannot be checked without a real snapshot: when one is taken, the
+/// active L1 and the snapshot's L1 point at the *same* L2 table and
+/// COPIED is cleared on the L1 entry to say so. Writing into that
+/// shared table changes the snapshot's view. A synthetic fixture that
+/// only bumps a data cluster's refcount never reaches it.
+///
+/// The two assertions are independent and both used to fail. The
+/// validator reported `ERROR cluster 11 refcount=1 reference=2` and a
+/// leaked cluster; the snapshot's own view came back as the bytes we
+/// had just written.
+#[test]
+fn a_write_leaves_an_internal_snapshot_holding_what_it_held() {
+    let raw = tmp_path("snap-src");
+    let img = tmp_path("snap-img");
+    let snap_out = tmp_path("snap-view");
+
+    let mut data = vec![0u8; 65_536 * 4];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    std::fs::write(&raw, &data).unwrap();
+    qemu_convert_raw_to_qcow2(&raw, &img);
+    qemu_snapshot_create(&img, "s1");
+    qemu_check(&img);
+
+    {
+        let r = Qcow2Reader::open_rw(&img).unwrap();
+        r.write_at(0, &[0xEEu8; 4096]).unwrap();
+        r.flush().unwrap();
+    }
+
+    // Structurally sound: no refcount mismatch, no leak.
+    qemu_check(&img);
+
+    // And the snapshot still holds the pre-write bytes.
+    qemu_convert_snapshot_to_raw(&img, "s1", &snap_out);
+    let seen = std::fs::read(&snap_out).unwrap();
+    assert_eq!(
+        &seen[..data.len()],
+        &data[..],
+        "the snapshot's view changed; first bytes are {:02x?}",
+        &seen[..8]
+    );
+
+    // The live view is the one that changed.
+    let r = Qcow2Reader::open(&img).unwrap();
+    let mut live = vec![0u8; 4096];
+    r.read_at(0, &mut live).unwrap();
+    assert!(live.iter().all(|&b| b == 0xEE), "the write did not land");
+}
