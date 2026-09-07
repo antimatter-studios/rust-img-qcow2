@@ -487,3 +487,18 @@ pub fn build_two_l1_entry_image(path: &Path) {
     }
     f.write_all_at(&rb, RB).unwrap();
 }
+
+/// Overwrite `bytes` at `off` in an image that already exists.
+///
+/// Corruption fixtures are all "a valid image with one field changed",
+/// and every one of them was opening the file, seeking and writing by
+/// hand. One helper, so a test says which field it moved rather than
+/// how a file is opened.
+pub fn patch(path: &Path, off: u64, bytes: &[u8]) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.write_all_at(bytes, off).unwrap();
+}

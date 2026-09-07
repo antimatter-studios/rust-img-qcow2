@@ -317,3 +317,72 @@ fn qemu_info_reports_backing_path_on_our_child() {
         .unwrap_or_else(|| panic!("child must report a backing filename"));
     assert_eq!(backing, &Value::String(rel));
 }
+
+/// Read a big-endian `u64` out of an image on disk.
+fn read_be64(path: &Path, off: u64) -> u64 {
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut b = [0u8; 8];
+    f.read_exact_at(&mut b, off).unwrap();
+    u64::from_be_bytes(b)
+}
+
+/// Where the first L2 table of a real qemu-produced image lives.
+///
+/// Header byte 40 is `l1_table_offset`; the first L1 entry is a host
+/// offset in bits 9..55 with COPIED in bit 63.
+fn first_l2_table_offset(path: &Path) -> u64 {
+    let l1_off = read_be64(path, 40);
+    read_be64(path, l1_off) & HOST_OFFSET_MASK
+}
+
+/// Direction 4: the images the reference tool refuses are the ones we
+/// refuse.
+///
+/// Every other test here asks whether we agree with the validator about
+/// a *good* image. This asks whether we agree about a bad one, which is
+/// the half that decides what happens to a corrupt disk in front of a
+/// user. `OFFSET_MASK` covers bits 9..55, so a host offset of 0x200
+/// passes through the mask unchanged and names byte 512 — inside the
+/// image's own header. The validator says so by name; before this
+/// change we opened the image and returned those bytes as the guest's
+/// first data cluster with `Ok(())`.
+#[test]
+fn an_unaligned_l2_entry_is_refused_by_the_validator_and_by_us() {
+    let raw = tmp_path("unaligned-src");
+    let qcow = tmp_path("unaligned-dst");
+
+    let data = vec![0x5Au8; 4096 * 8];
+    std::fs::write(&raw, &data).unwrap();
+    qemu_convert_raw_to_qcow2(&raw, &qcow);
+    // The image is well-formed until we move one entry.
+    qemu_check(&qcow);
+
+    let l2 = first_l2_table_offset(&qcow);
+    assert_ne!(l2, 0, "qemu-produced image should have an L2 table");
+    patch(&qcow, l2, &(0x200u64 | COPIED).to_be_bytes());
+
+    // The reference tool refuses to convert it.
+    let out = run_qemu(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        qcow.to_str().unwrap(),
+        tmp_path("unaligned-out").to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "the validator was expected to refuse an unaligned L2 entry, but it converted the image"
+    );
+
+    // And so do we, rather than serving the header's bytes.
+    let r = Qcow2Reader::open(&qcow).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?} with buf starting {:02x?}",
+        &buf[..8]
+    );
+}
