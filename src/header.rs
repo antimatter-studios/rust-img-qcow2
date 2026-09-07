@@ -202,6 +202,55 @@ impl Header {
             return Err(Error::Corrupt("l1_size too small for virtual_size"));
         }
 
+        // WHERE THE TABLES ARE, checked before anything follows them.
+        //
+        // Every table in a qcow2 image occupies whole clusters, so its
+        // offset is cluster-aligned by construction. These three were
+        // read out of the header and used raw: the L1 table was read
+        // from wherever `l1_table_offset` pointed and its bytes taken
+        // as L1 entries, and `allocate_cluster` did the same with the
+        // refcount table — and then *wrote* a refcount block back to an
+        // address decoded from those bytes.
+        //
+        // The reference validator refuses both by name, and the two
+        // failures we had are different from each other and both bad.
+        // Measured on a 3 MiB pattern converted to qcow2, with each
+        // offset moved half a cluster (0x200) past its real value, so
+        // the table is still inside the image and only its alignment is
+        // wrong:
+        //
+        //   l1_table_offset  0x30000 -> 0x30200
+        //     qemu-img info: "Active L1 table offset invalid"
+        //     ours: open OK; read_at(0, 16) = 00 x16, where the guest
+        //           really holds 00 01 02 03 ... — a populated image
+        //           reading as sparse, with no error
+        //     ours: open_rw + write_at succeeded, grew the file by
+        //           131072 bytes and published an L2 pointer into bytes
+        //           that are not the L1 table
+        //
+        //   refcount_table_offset  0x10000 -> 0x10200
+        //     qemu-img info: "Reference count table offset invalid"
+        //     ours: open OK, and a write allocated a cluster from
+        //           refcount entries decoded out of the wrong bytes
+        //
+        // `span_inside_the_image` already keeps both tables inside the
+        // file; alignment is the half nothing checked, and it needs no
+        // device, so it belongs here beside the other header rules.
+        for (offset, unaligned) in [
+            (l1_table_offset, "l1_table_offset is not cluster-aligned"),
+            (
+                refcount_table_offset,
+                "refcount_table_offset is not cluster-aligned",
+            ),
+            // Zero means "no snapshot table", which is ordinary; a
+            // non-zero one is a table like any other.
+            (snapshots_offset, "snapshots_offset is not cluster-aligned"),
+        ] {
+            if !offset.is_multiple_of(cluster_size) {
+                return Err(Error::Corrupt(unaligned));
+            }
+        }
+
         Ok(Header {
             version,
             cluster_bits,
@@ -302,11 +351,11 @@ mod tests {
         assert_eq!(at::SIZE, 24);
         assert_eq!(at::CRYPT_METHOD, 32);
         assert_eq!(at::L1_SIZE, 36);
-        assert_eq!(at::L1_TABLE_OFFSET, 40);
-        assert_eq!(at::REFCOUNT_TABLE_OFFSET, 48);
+        assert_eq!(offsets::L1_TABLE_OFFSET, 40);
+        assert_eq!(offsets::REFCOUNT_TABLE_OFFSET, 48);
         assert_eq!(at::REFCOUNT_TABLE_CLUSTERS, 56);
         assert_eq!(at::NB_SNAPSHOTS, 60);
-        assert_eq!(at::SNAPSHOTS_OFFSET, 64);
+        assert_eq!(offsets::SNAPSHOTS_OFFSET, 64);
         assert_eq!(at::INCOMPATIBLE_FEATURES, 72);
         assert_eq!(at::COMPATIBLE_FEATURES, 80);
         assert_eq!(at::AUTOCLEAR_FEATURES, 88);
@@ -335,11 +384,11 @@ mod tests {
             (at::SIZE, 8),
             (at::CRYPT_METHOD, 4),
             (at::L1_SIZE, 4),
-            (at::L1_TABLE_OFFSET, 8),
-            (at::REFCOUNT_TABLE_OFFSET, 8),
+            (offsets::L1_TABLE_OFFSET, 8),
+            (offsets::REFCOUNT_TABLE_OFFSET, 8),
             (at::REFCOUNT_TABLE_CLUSTERS, 4),
             (at::NB_SNAPSHOTS, 4),
-            (at::SNAPSHOTS_OFFSET, 8),
+            (offsets::SNAPSHOTS_OFFSET, 8),
             (at::INCOMPATIBLE_FEATURES, 8),
             (at::COMPATIBLE_FEATURES, 8),
             (at::AUTOCLEAR_FEATURES, 8),
@@ -382,6 +431,12 @@ mod tests {
     /// Build a parseable v3 header (112 bytes so the compression_type
     /// byte at offset 104 is read). cluster_bits = 16 (64 KiB clusters),
     /// virtual_size = 1 MiB, l1_size = 1 (the minimum that addresses it).
+    ///
+    /// The table offsets are left at zero, which is what the reference
+    /// validator accepts: patching either to 0 in a real image and
+    /// asking `qemu-img info` reports the image normally, so zero is
+    /// not a value this parser gets to refuse. The tests that care
+    /// about those fields set them.
     fn valid_v3_header() -> Vec<u8> {
         let mut b = vec![0u8; 112];
         b[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
@@ -392,6 +447,66 @@ mod tests {
         b[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order
         b[100..104].copy_from_slice(&112u32.to_be_bytes()); // header_length
         b
+    }
+
+    /// A table's offset names whole clusters, or the header is refused.
+    ///
+    /// Each of the three is moved half a cluster past a legal value, so
+    /// only its alignment is wrong — the offset is otherwise a place a
+    /// table could be. The reference validator refuses the first two by
+    /// name ("Active L1 table offset invalid", "Reference count table
+    /// offset invalid"), and before this we opened both.
+    #[test]
+    fn a_table_offset_that_is_not_cluster_aligned_is_refused() {
+        for (field, off, expect) in [
+            (
+                "l1",
+                offsets::L1_TABLE_OFFSET,
+                "l1_table_offset is not cluster-aligned",
+            ),
+            (
+                "refcount",
+                offsets::REFCOUNT_TABLE_OFFSET,
+                "refcount_table_offset is not cluster-aligned",
+            ),
+            (
+                "snapshots",
+                offsets::SNAPSHOTS_OFFSET,
+                "snapshots_offset is not cluster-aligned",
+            ),
+        ] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, off, 0x0003_0200);
+            match Header::parse(&b) {
+                Err(Error::Corrupt(msg)) => assert_eq!(msg, expect, "{field}"),
+                other => panic!("{field}: expected Corrupt({expect:?}), got {other:?}"),
+            }
+        }
+    }
+
+    /// The last aligned value each field must still accept.
+    ///
+    /// Without this, a check written as "must be a multiple of the
+    /// cluster size and greater than one cluster", or any other stricter
+    /// reading, would pass the test above while refusing ordinary
+    /// images.
+    #[test]
+    fn cluster_aligned_table_offsets_are_accepted() {
+        for off in [
+            offsets::L1_TABLE_OFFSET,
+            offsets::REFCOUNT_TABLE_OFFSET,
+            offsets::SNAPSHOTS_OFFSET,
+        ] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, off, 1 << 16); // exactly one cluster in
+            Header::parse(&b).expect("a cluster-aligned offset is legal");
+        }
+        // Zero is aligned, and the reference validator accepts it in
+        // all three fields — measured by patching each to 0 in a real
+        // image and asking `qemu-img info`, which reports the image
+        // normally. So this parser does not get to refuse it either;
+        // the fields it names are checked where they are used.
+        Header::parse(&valid_v3_header()).expect("zero offsets are what the validator accepts");
     }
 
     fn set_u32(b: &mut [u8], off: usize, v: u32) {
