@@ -109,6 +109,24 @@ const L2_FLAG_ZERO: u64 = 1 << 0;
 /// Always set when the writer allocates a fresh cluster.
 const L2_FLAG_COPIED: u64 = 1 << 63;
 
+/// Bits an L1 entry must leave clear: 0..=8 below the offset field and
+/// 56..=62 above it. Bit 63 is COPIED and bits 9..=55 are the offset.
+///
+/// An L1 entry has no compressed flag and no zero flag — bit 62 means
+/// "compressed" one level down and nothing here — so the reserved span
+/// above the offset is one bit wider than an L2 entry's.
+const L1_RESERVED_MASK: u64 = 0x7f00_0000_0000_01ff;
+
+/// Bits a standard (uncompressed) L2 entry must leave clear: 1..=8 and
+/// 56..=61. Bit 0 is the v3 zero flag, 9..=55 the host offset, 62 the
+/// compressed flag and 63 COPIED.
+///
+/// The disk-image validator reports a violation as "found l2 entry with
+/// reserved bits set" and refuses to convert the image; the bits are
+/// how a producer says something this reader would not understand, so
+/// following the entry anyway is guessing.
+const L2_RESERVED_MASK: u64 = 0x3f00_0000_0000_01fe;
+
 /// Maximum backing-file recursion depth. A pathological chain (or a cycle)
 /// is rejected rather than blowing the stack or hanging.
 const MAX_BACKING_DEPTH: u32 = 16;
@@ -293,6 +311,16 @@ pub struct Qcow2Reader {
     /// True when the image was opened read-write. Read-only images reject
     /// every `write_at` call up front.
     writable: bool,
+    /// How far the image reaches, in bytes.
+    ///
+    /// Seeded from `dev.size_bytes()` and raised by [`Qcow2Reader::dev_write`]
+    /// whenever a write lands past it. `fs_core::FileDevice` records its
+    /// length when the file is opened and never re-stats, so the device's
+    /// own answer goes stale the moment the allocator hands out a cluster
+    /// beyond the current tail — and every bound checked against it would
+    /// then reject a cluster this reader had just written. This is the
+    /// same number, kept honest.
+    image_len: Mutex<u64>,
 }
 
 /// The length of a table, once it is known to be inside the image.
@@ -458,6 +486,7 @@ impl Qcow2Reader {
             None
         };
 
+        let image_len = dev.size_bytes();
         Ok(Self {
             dev,
             header,
@@ -466,6 +495,7 @@ impl Qcow2Reader {
             decompress_cache: Mutex::new(None),
             backing,
             writable,
+            image_len: Mutex::new(image_len),
         })
     }
 
@@ -547,7 +577,19 @@ impl Qcow2Reader {
     }
 
     fn dev_write(&self, off: u64, buf: &[u8]) -> Result<()> {
-        self.dev.write_at(off, buf).map_err(fs_core_to_qcow2_error)
+        self.dev
+            .write_at(off, buf)
+            .map_err(fs_core_to_qcow2_error)?;
+        // A write past the tail extends the file, so the image is now
+        // longer than the device reported at open. Record it here rather
+        // than at the allocator, because every path that grows the image
+        // goes through this one function.
+        let end = off.saturating_add(buf.len() as u64);
+        let mut len = self.image_len.lock().unwrap();
+        if end > *len {
+            *len = end;
+        }
+        Ok(())
     }
 
     fn dev_flush(&self) -> Result<()> {
@@ -1077,17 +1119,20 @@ impl Qcow2Reader {
     /// L2 cache so subsequent lookups re-read. Allocates a fresh L2 table
     /// (and updates L1) on demand if `l1[l1_idx]` is unallocated.
     fn update_l2_entry(&self, l1_idx: u32, l2_idx: u32, new_entry: u64) -> Result<()> {
-        let l2_table_off = {
+        let l1_entry = {
             let l1 = self.l1.lock().unwrap();
             if (l1_idx as usize) >= l1.len() {
                 return Err(Error::Corrupt("l1_idx out of range"));
             }
-            l1[l1_idx as usize] & OFFSET_MASK
+            l1[l1_idx as usize]
         };
-        let l2_table_off = if l2_table_off == 0 {
-            self.allocate_l2_table(l1_idx)?
-        } else {
-            l2_table_off
+        // The same check the read path makes, and it matters more here:
+        // this writes a whole cluster to the offset the entry names, so
+        // an unchecked one turns a corrupt table into writes at an
+        // address the image chose.
+        let l2_table_off = match self.l2_table_offset(l1_entry)? {
+            Some(off) => off,
+            None => self.allocate_l2_table(l1_idx)?,
         };
 
         let cluster_size = self.header.cluster_size as usize;
@@ -1223,6 +1268,64 @@ impl Qcow2Reader {
         }
     }
 
+    /// How far the image reaches. See [`Qcow2Reader::image_len`].
+    fn image_len(&self) -> u64 {
+        *self.image_len.lock().unwrap()
+    }
+
+    /// A host cluster offset taken out of a table entry, checked before
+    /// it is used as an address.
+    ///
+    /// The format says such an offset is cluster-aligned and inside the
+    /// image, and every other producer enforces both: the disk-image
+    /// validator refuses to open an image whose L1 entry is unaligned
+    /// ("Table is not cluster aligned; L1 entry corrupted") and refuses
+    /// to convert one whose L2 entry is ("Cluster allocation offset
+    /// 0x200 unaligned"). This reader used to follow either — and the
+    /// masks are the problem, not the arithmetic: `OFFSET_MASK` covers
+    /// bits 9..55, so an offset of 0x200 survives it intact and names
+    /// byte 512, which is inside the header. The read succeeded and
+    /// handed the header's own bytes back as the guest's data, which is
+    /// the one failure a caller cannot detect.
+    fn checked_host_offset(
+        &self,
+        off: u64,
+        unaligned: &'static str,
+        outside: &'static str,
+    ) -> Result<u64> {
+        let cluster_size = self.header.cluster_size;
+        if !off.is_multiple_of(cluster_size) {
+            return Err(Error::Corrupt(unaligned));
+        }
+        let end = off
+            .checked_add(cluster_size)
+            .ok_or(Error::Corrupt(outside))?;
+        if end > self.image_len() {
+            return Err(Error::Corrupt(outside));
+        }
+        Ok(off)
+    }
+
+    /// The L2 table an L1 entry names, checked.
+    ///
+    /// Returns `None` for an entry of zero, which is the format's way of
+    /// saying the whole range that entry covers is unallocated.
+    fn l2_table_offset(&self, l1_entry: u64) -> Result<Option<u64>> {
+        if l1_entry & L1_RESERVED_MASK != 0 {
+            return Err(Error::Corrupt("L1 entry has reserved bits set"));
+        }
+        let off = l1_entry & OFFSET_MASK;
+        if off == 0 {
+            return Ok(None);
+        }
+        self.checked_host_offset(
+            off,
+            "L1 entry names an L2 table that is not cluster-aligned",
+            "L1 entry names an L2 table outside the image",
+        )
+        .map(Some)
+    }
+
     fn lookup_cluster(&self, virt: u64) -> Result<ClusterMap> {
         let ClusterAddress {
             l1_index, l2_index, ..
@@ -1235,10 +1338,9 @@ impl Qcow2Reader {
             }
             l1[l1_index as usize]
         };
-        let l2_table_off = l1_entry & OFFSET_MASK;
-        if l2_table_off == 0 {
+        let Some(l2_table_off) = self.l2_table_offset(l1_entry)? else {
             return Ok(ClusterMap::Unallocated);
-        }
+        };
 
         let l2_entry = self.read_l2_entry(l1_index, l2_table_off, l2_index)?;
 
@@ -1247,6 +1349,13 @@ impl Qcow2Reader {
                 decode_compressed_descriptor(l2_entry, self.header.cluster_bits);
             return Ok(ClusterMap::Compressed { host_off, byte_len });
         }
+        // From here the entry describes a standard cluster, so the
+        // reserved spans either side of the offset field must be clear
+        // before anything in it is believed — including the zero flag,
+        // which is bit 0 of the same word.
+        if l2_entry & L2_RESERVED_MASK != 0 {
+            return Err(Error::Corrupt("L2 entry has reserved bits set"));
+        }
         if self.header.version >= 3 && (l2_entry & L2_FLAG_ZERO) != 0 {
             return Ok(ClusterMap::Zero);
         }
@@ -1254,6 +1363,11 @@ impl Qcow2Reader {
         if host == 0 {
             return Ok(ClusterMap::Unallocated);
         }
+        let host = self.checked_host_offset(
+            host,
+            "L2 entry names a data cluster that is not cluster-aligned",
+            "L2 entry names a data cluster outside the image",
+        )?;
         let copied = l2_entry & L2_FLAG_COPIED != 0;
         Ok(ClusterMap::Plain {
             host_off: host,

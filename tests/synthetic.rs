@@ -1255,3 +1255,116 @@ fn patch_header_u32(path: &PathBuf, at: u64, value: u32) {
     f.write_all(&value.to_be_bytes()).unwrap();
     f.flush().unwrap();
 }
+
+// ---------------------------------------------------------------------
+// Table entries are followed only where the format says they may point.
+//
+// `OFFSET_MASK` covers bits 9..55, so bit 9 — 0x200 — survives it: an
+// entry whose low bits are `0x200` names host offset 512, which is
+// inside the image's own header cluster. The disk-image validator
+// refuses every image below by name; this reader used to open them and
+// return whatever bytes were at the computed offset, with no error.
+// ---------------------------------------------------------------------
+
+/// Fill the second half of the header cluster with a marker, so a read
+/// that follows a bad entry into it is visibly reading metadata rather
+/// than the guest's data.
+fn mark_header_tail(path: &std::path::Path) {
+    patch(path, 0x200, &[0xCDu8; (4096 - 0x200) as usize]);
+}
+
+#[test]
+fn an_unaligned_l2_entry_is_refused_rather_than_followed() {
+    let path = tmp_path("l2_unaligned");
+    build_image(&path);
+    mark_header_tail(&path);
+    // virt cluster 0's L2 entry now names host offset 0x200.
+    patch(&path, L2_OFFSET, &(0x200u64 | COPIED).to_be_bytes());
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?} with buf starting {:02x?}",
+        &buf[..8]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_l2_entry_with_reserved_bits_set_is_refused() {
+    let path = tmp_path("l2_reserved");
+    build_image(&path);
+    // Bit 56 is reserved on a standard cluster descriptor. The host
+    // offset is left correct, so only the reserved bit is wrong.
+    let entry = (DATA0_OFFSET & HOST_OFFSET_MASK) | COPIED | (1u64 << 56);
+    patch(&path, L2_OFFSET, &entry.to_be_bytes());
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_l2_entry_past_the_end_of_the_image_is_refused() {
+    let path = tmp_path("l2_past_end");
+    build_image(&path);
+    // A host offset one cluster past the file, which is a legal-looking
+    // number and an unreachable one.
+    let entry = (TOTAL_SIZE & HOST_OFFSET_MASK) | COPIED;
+    patch(&path, L2_OFFSET, &entry.to_be_bytes());
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_unaligned_l1_entry_is_refused_rather_than_followed() {
+    let path = tmp_path("l1_unaligned");
+    build_image(&path);
+    mark_header_tail(&path);
+    // The L2 table is now claimed to start half a sector into the
+    // header cluster, so every "L2 entry" read from it is header bytes.
+    patch(&path, L1_OFFSET, &(0x200u64 | COPIED).to_be_bytes());
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?} with buf starting {:02x?}",
+        &buf[..8]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_l1_entry_with_reserved_bits_set_is_refused() {
+    let path = tmp_path("l1_reserved");
+    build_image(&path);
+    // Bit 62 is reserved on an L1 entry — it is the COMPRESSED flag on
+    // an L2 entry and means nothing one level up.
+    let entry = (L2_OFFSET & HOST_OFFSET_MASK) | COPIED | (1u64 << 62);
+    patch(&path, L1_OFFSET, &entry.to_be_bytes());
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
