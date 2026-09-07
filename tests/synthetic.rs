@@ -112,14 +112,33 @@ fn cross_cluster_read() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A read running off the end is refused as `OutOfBounds`, and the
+/// error says how far past the end it went.
+///
+/// The `matches!` that used to stand here was a statement, so its
+/// `bool` was discarded and nothing was asserted: the test passed on
+/// the `unwrap_err()` above it, which only says the read failed
+/// somehow. `Corrupt`, `Io`, or a panic re-wrapped as an error would
+/// all have left it green under the name of the one variant it does
+/// not check.
+///
+/// The three fields are asserted rather than just the variant, because
+/// `size` is the reader's answer to "how big is this image" and a
+/// caller sizing a buffer from a short read acts on it.
 #[test]
 fn read_past_end_errors() {
     let path = tmp_path("eof");
     build_image(&path);
     let r = Qcow2Reader::open(&path).unwrap();
     let mut buf = vec![0u8; 16];
-    let err = r.read_at(VIRT_SIZE - 8, &mut buf).unwrap_err();
-    matches!(err, qcow2::Error::OutOfBounds { .. });
+    match r.read_at(VIRT_SIZE - 8, &mut buf) {
+        Err(qcow2::Error::OutOfBounds { offset, len, size }) => {
+            assert_eq!(offset, VIRT_SIZE - 8, "the refusal names the wrong offset");
+            assert_eq!(len, 16, "the refusal names the wrong length");
+            assert_eq!(size, VIRT_SIZE, "the refusal names the wrong image size");
+        }
+        other => panic!("a read eight bytes short of the end gave {other:?}"),
+    }
     let _ = std::fs::remove_file(&path);
 }
 
