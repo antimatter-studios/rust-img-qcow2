@@ -605,3 +605,149 @@ fn a_flagged_image_still_reads_and_no_longer_takes_writes() {
         let _ = std::fs::remove_file(&qcow);
     }
 }
+
+const BACKING_FILE_OFFSET: u64 = 8;
+const BACKING_FILE_SIZE: u64 = 16;
+
+/// The backing chain is keyed off the offset, and the offset is bounded
+/// — and we agree with the reference tool about both.
+///
+/// Three shapes, each asserted against `qemu-img info` as well as
+/// against us, so the test cannot pass by a patch failing to take.
+#[test]
+fn the_backing_chain_is_keyed_and_bounded_like_the_validator_does_it() {
+    // 1. A size with no offset is not a backing file.
+    //
+    //    The validator reports such an image with no backing file. We
+    //    read `backing_file_size` bytes from offset 0 — the header's own
+    //    magic — and refused the image with BadBackingPath.
+    {
+        let p = tmp_path("backing-size-no-offset");
+        qemu_create(&p, "4M");
+        patch(&p, BACKING_FILE_SIZE, &12u32.to_be_bytes());
+
+        let info = run_qemu(&["info", p.to_str().unwrap()]);
+        assert!(info.status.success(), "the validator opens this image");
+        assert!(
+            !String::from_utf8_lossy(&info.stdout).contains("backing file"),
+            "and reports no backing file"
+        );
+        Qcow2Reader::open(&p).expect("so must we");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // 1b. An offset with no length is not a backing file either.
+    //
+    //     The reference tool opens such an image and reports no backing
+    //     file. Refusing it — which an offset-only gate does — rejects a
+    //     legal image, which is the same mistake as case 1 made while
+    //     fixing case 1.
+    {
+        let p = tmp_path("backing-offset-no-size");
+        qemu_create(&p, "4M");
+        patch(&p, BACKING_FILE_OFFSET, &0x50u64.to_be_bytes());
+        patch(&p, BACKING_FILE_SIZE, &0u32.to_be_bytes());
+
+        let info = run_qemu(&["info", p.to_str().unwrap()]);
+        assert!(
+            info.status.success(),
+            "the validator opens an image whose backing length is zero"
+        );
+        assert!(
+            !String::from_utf8_lossy(&info.stdout).contains("backing file"),
+            "and reports no backing file"
+        );
+        Qcow2Reader::open(&p).expect("so must we");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // 2. An offset past the first cluster is refused.
+    {
+        let p = tmp_path("backing-offset-far");
+        qemu_create(&p, "4M");
+        patch(&p, BACKING_FILE_OFFSET, &0x50000u64.to_be_bytes());
+        patch(&p, BACKING_FILE_SIZE, &8u32.to_be_bytes());
+
+        let refusal = run_qemu(&["info", p.to_str().unwrap()]);
+        assert!(
+            !refusal.status.success()
+                && String::from_utf8_lossy(&refusal.stderr).contains("backing file offset"),
+            "precondition: the validator must refuse it"
+        );
+        match Qcow2Reader::open(&p) {
+            Err(qcow2::Error::Corrupt(m)) => {
+                assert!(m.contains("first cluster"), "got {m:?}")
+            }
+            Err(other) => panic!("expected Corrupt, got {other:?}"),
+            Ok(_) => panic!("opened an image the validator refuses"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // 3. The one that costs something: a real parent named from bytes
+    //    inside a data cluster, which is to say bytes the guest wrote.
+    //    Before this we opened the image AND opened the parent, so a
+    //    guest that can write its own disk chose which host file this
+    //    reader opened.
+    {
+        let parent = tmp_path("backing-guest-parent");
+        let child = tmp_path("backing-guest-child");
+        qemu_create(&parent, "4M");
+        qemu_create(&child, "4M");
+        let name = parent.file_name().unwrap().to_string_lossy().into_owned();
+        patch(&child, 0x50000, name.as_bytes());
+        patch(&child, BACKING_FILE_OFFSET, &0x50000u64.to_be_bytes());
+        patch(
+            &child,
+            BACKING_FILE_SIZE,
+            &(name.len() as u32).to_be_bytes(),
+        );
+
+        let refusal = run_qemu(&["info", child.to_str().unwrap()]);
+        assert!(
+            !refusal.status.success(),
+            "precondition: the validator must refuse a parent named from a data cluster"
+        );
+        assert!(
+            Qcow2Reader::open(&child).is_err(),
+            "we must not open a parent the guest chose"
+        );
+        let _ = std::fs::remove_file(&child);
+        let _ = std::fs::remove_file(&parent);
+    }
+}
+
+/// The positive control: a real backing chain still opens and still
+/// reads through to its parent.
+///
+/// Without this, refusing every backing file would pass every assertion
+/// above.
+#[test]
+fn a_real_backing_chain_still_opens_and_reads_through() {
+    let raw = tmp_path("chain-src");
+    let parent = tmp_path("chain-parent");
+    let child = tmp_path("chain-child");
+
+    let data: Vec<u8> = (0..(4096 * 4)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&raw, &data).unwrap();
+    qemu_convert_raw_to_qcow2(&raw, &parent);
+    assert_qemu(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-b",
+        parent.to_str().unwrap(),
+        "-F",
+        "qcow2",
+        child.to_str().unwrap(),
+    ]);
+
+    let r = Qcow2Reader::open(&child).expect("a real chain must open");
+    let mut buf = vec![0u8; data.len()];
+    r.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf, data, "the child must read through to its parent");
+
+    let _ = std::fs::remove_file(&child);
+    let _ = std::fs::remove_file(&parent);
+    let _ = std::fs::remove_file(&raw);
+}

@@ -466,7 +466,28 @@ impl Qcow2Reader {
             l1.push(u64::from_be_bytes(chunk.try_into().unwrap()));
         }
 
-        let backing = if header.backing_file_size != 0 {
+        // A CHAIN NEEDS BOTH FIELDS, and this keyed on the size alone.
+        //
+        // The reference tool wants an offset to know where the name is
+        // and a length to know how much of it there is, and treats
+        // either being zero as "no backing file". Both halves were
+        // measured, and we disagreed with it in both directions:
+        //
+        //   offset = 0, size = 12
+        //     qemu-img info: opens the image, reports no backing file
+        //     ours:          read 12 bytes from offset 0 — the header's
+        //                    own magic — and refused with BadBackingPath
+        //
+        //   offset = 0x50, size = 0
+        //     qemu-img info: opens the image, reports no backing file
+        //     ours:          refused, once the offset gate was added on
+        //                    its own
+        //
+        // The second is why this tests both rather than only the offset:
+        // an offset with no length is not a path, and refusing it would
+        // reject an image the reference opens — which is the same
+        // mistake, made while fixing the first.
+        let backing = if header.backing_file_offset != 0 && header.backing_file_size != 0 {
             // Backing-chain resolution needs a real path so the parent can
             // be opened by name. Reject when caller went through the
             // on-device entry point.
@@ -1612,9 +1633,21 @@ fn read_backing_path(
     if len > 1024 {
         return Err(Error::Corrupt("backing_file_size > 1024 bytes"));
     }
+    // A zero length never reaches here: `open_inner` treats it as "no
+    // backing file", the way the reference tool does. The assertion
+    // records that this function's contract starts after that decision,
+    // so a caller cannot reintroduce the empty-path join by calling it
+    // directly.
+    debug_assert_ne!(len, 0, "a chain with no path length is not a chain");
     let mut bytes = vec![0u8; len];
     dev.read_at(header.backing_file_offset, &mut bytes)
         .map_err(fs_core_to_qcow2_error)?;
+    if bytes.contains(&0) {
+        // A NUL cannot be in a path, and a string carrying one is how a
+        // caller that measures with `strlen` and a caller that uses the
+        // declared length come to disagree about which file was opened.
+        return Err(Error::Corrupt("backing-file path contains a NUL byte"));
+    }
     let s = std::str::from_utf8(&bytes).map_err(|_| Error::BadBackingPath)?;
     let p = Path::new(s);
     if p.is_absolute() {

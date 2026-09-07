@@ -251,6 +251,33 @@ impl Header {
             }
         }
 
+        // The backing-file name lives in the header area, ahead of the
+        // L1 table, so its offset is inside the first cluster. The
+        // reference tool caps it there and refuses anything past it.
+        //
+        // Nothing bounded it, and the chain was keyed off
+        // `backing_file_size` rather than the offset. Measured:
+        //
+        //   size = 12, offset = 0
+        //     qemu-img info: reports the image, no backing file
+        //     ours: read 12 bytes from offset 0 — the header's own
+        //           magic — and refused with BadBackingPath, on an
+        //           image the validator opens without complaint
+        //
+        //   offset = 0x50000, a real parent's name written there
+        //     qemu-img info: "Invalid backing file offset"
+        //     ours: opened it, and opened the parent
+        //
+        // The second is the one that matters. 0x50000 is inside a data
+        // cluster — bytes the guest itself wrote — so a guest that can
+        // write its own disk could choose which host file this reader
+        // opens as its parent.
+        if backing_file_offset > cluster_size {
+            return Err(Error::Corrupt(
+                "backing_file_offset is past the first cluster, where the name cannot be",
+            ));
+        }
+
         Ok(Header {
             version,
             cluster_bits,
@@ -741,6 +768,41 @@ mod tests {
         match h.check_supported() {
             Err(Error::Unsupported(m)) => assert_eq!(m, "unknown compression_type"),
             other => panic!("expected Unsupported(unknown compression_type), got {other:?}"),
+        }
+    }
+
+    /// The backing-file name lives in the header area, so its offset is
+    /// inside the first cluster.
+    ///
+    /// The reference tool caps it there and refuses anything past it,
+    /// because the region ahead of the L1 table is the only place the
+    /// name can be. Past it is a data cluster — bytes the guest wrote.
+    #[test]
+    fn a_backing_file_offset_past_the_first_cluster_is_refused() {
+        let mut b = valid_v3_header();
+        // cluster_bits is 16 in the fixture, so one cluster is 65536.
+        set_u64(&mut b, offsets::BACKING_FILE_OFFSET, 65537);
+        match Header::parse(&b) {
+            Err(Error::Corrupt(m)) => assert!(
+                m.contains("first cluster"),
+                "the refusal must name the bound, got {m:?}"
+            ),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// The last offset that must still be accepted, and zero.
+    ///
+    /// An offset of exactly one cluster is the boundary; without this a
+    /// bound written as `>=` would refuse it, and zero is how an image
+    /// says it has no backing file at all.
+    #[test]
+    fn backing_file_offsets_inside_the_first_cluster_are_accepted() {
+        for off in [0u64, 1, 512, 65536] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, offsets::BACKING_FILE_OFFSET, off);
+            Header::parse(&b)
+                .unwrap_or_else(|e| panic!("offset {off} is inside the first cluster: {e:?}"));
         }
     }
 
