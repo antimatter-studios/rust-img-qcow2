@@ -1354,6 +1354,45 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
         }
     }
 
+    /// THE QUOTE TRACKING IN `comment_start`, WHICH NOTHING ELSE PINS.
+    ///
+    /// `a_hash_that_does_not_begin_a_word_is_not_a_comment` looks like
+    /// it covers this and does not: its quoted `#` sits AFTER the
+    /// `cargo test`, so cutting the line there still leaves the
+    /// invocation behind and the guard still counts it. The mechanism
+    /// survived deletion with every other test green.
+    ///
+    /// The witnessing input has to put the quoted `#` FIRST, so that
+    /// treating it as a comment removes the run:
+    ///
+    ///     echo "step # 1"; cargo test --locked --all-targets
+    ///
+    /// Without quote tracking the line is cut to `echo "step`, no
+    /// `cargo test` remains, and the guard REFUSES A CORRECT WORKFLOW.
+    /// That is the direction this one guards -- a false rejection, not
+    /// a false pass.
+    ///
+    /// It is asserted here rather than as a workflow because YAML ends
+    /// a plain scalar at ` #` itself, so the same line written as
+    /// `run: echo "step # 1"; ...` is refused before this function ever
+    /// sees it -- a different defect, and an easy way to measure the
+    /// wrong thing. Only a block scalar reaches here intact, and at
+    /// that point the shell text is what is under test.
+    #[test]
+    fn a_quoted_hash_before_the_run_does_not_cut_the_line_short() {
+        for line in [
+            "echo \"step # 1\"; cargo test --locked --all-targets",
+            "echo 'step # 1' && cargo test --locked --all-targets",
+            "printf '%s\\n' \"# not a comment\"; cargo test --locked --lib",
+        ] {
+            assert_eq!(
+                runs_with_overflow_checks(line).len(),
+                1,
+                "{line:?} runs the suite: the `#` is inside quotes and ends nothing"
+            );
+        }
+    }
+
     /// The inline-comment strip, which nothing else here pins. A real
     /// debug run whose trailing comment happens to contain `--release`
     /// must still be counted. Without the strip that word disqualifies
