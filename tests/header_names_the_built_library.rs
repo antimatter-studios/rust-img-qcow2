@@ -144,6 +144,83 @@ fn the_lib_name_comes_from_the_lib_section_and_not_the_package() {
     assert_eq!(lib_name("[package]\nname = \"am-img-qcow2\"\n"), None);
 }
 
+/// `vars.LIBNAME` out of `chores.yml`, parsed.
+///
+/// YAML, so it is parsed rather than scanned -- `saphyr` is the adopted
+/// parser for it, the way `toml` is for the manifest, and it is already
+/// a dev-dependency here for `tests/ci_profile.rs`.
+fn chores_libname(chores_yml: &str) -> Option<String> {
+    use saphyr::{LoadableYamlNode, Yaml};
+    let docs = Yaml::load_from_str(chores_yml).ok()?;
+    let doc = docs.first()?;
+    // as_mapping_get, not indexing: saphyr's Index PANICS on a missing
+    // key, so a chores file without the variable would abort the test
+    // rather than report its absence -- and reporting absence is half
+    // of what this function is for.
+    doc.as_mapping_get("vars")?
+        .as_mapping_get("LIBNAME")?
+        .as_str()
+        .map(|s| s.to_owned())
+}
+
+/// THE PACKAGING VARIABLE AGREES WITH THE MANIFEST.
+///
+/// Deleting the shell guard closed the check that could not fail. It
+/// did not give `LIBNAME` a second source: `chores.yml` copies
+/// `target/<triple>/release/lib{{.LIBNAME}}.a`, and what cargo builds is
+/// named by `[lib] name`. Nothing tied the two together, so the header
+/// check compared against the manifest while `LIBNAME` was free to
+/// drift from it independently.
+///
+/// A drift did fail -- but LATE and unrecognisably, after a full release
+/// cross-compile, as `cp: cannot stat .../libNAME.a`. The guard runs
+/// first precisely so a naming mistake costs no build, and this was the
+/// one naming mistake it did not cover.
+#[test]
+fn the_packaging_variable_matches_the_manifest() {
+    let name = lib_name(&read("Cargo.toml")).expect("Cargo.toml declares [lib] name");
+    let libname = chores_libname(&read("chores.yml")).expect("chores.yml declares vars.LIBNAME");
+    assert_eq!(
+        libname, name,
+        "chores.yml sets LIBNAME={libname:?} and Cargo.toml sets [lib] name={name:?}. \
+         cargo builds lib{name}.a, chores copies lib{libname}.a, and the packaging step \
+         fails with `cp: cannot stat` after the release build rather than here."
+    );
+}
+
+/// The chores parse reads YAML rather than matching a line.
+///
+/// The acceptance half, which is the one that gets forgotten: every
+/// spelling below is legal YAML that a maintainer may write, and a
+/// scanner that only handled the plain one would break on an edit to
+/// the file it guards.
+#[test]
+fn the_libname_is_parsed_rather_than_scanned() {
+    for (what, yml) in [
+        ("a plain value", "vars:\n  LIBNAME: qcow2\n"),
+        ("a quoted value", "vars:\n  LIBNAME: \"qcow2\"\n"),
+        (
+            "a trailing comment",
+            "vars:\n  LIBNAME: qcow2 # the linked name\n",
+        ),
+        (
+            "the key named in a comment first",
+            "# LIBNAME: wrong\nvars:\n  LIBNAME: qcow2\n",
+        ),
+    ] {
+        assert_eq!(
+            chores_libname(yml).as_deref(),
+            Some("qcow2"),
+            "{what} is valid YAML, so this guard must read it"
+        );
+    }
+    assert_eq!(
+        chores_libname("tasks:\n  build:\n    cmds: ['cargo build']\n"),
+        None,
+        "a chores file with no LIBNAME has none to report"
+    );
+}
+
 /// The header scan finds a library name wherever it sits in a line.
 #[test]
 fn the_header_scan_finds_library_names_in_prose() {
