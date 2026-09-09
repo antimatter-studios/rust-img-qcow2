@@ -51,13 +51,33 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 saphyr = "0.0.12"
 # Partition probe + FS sniff, used by the `inspect` example to demonstrate
 # the qcow2 -> partitions -> sniff stack.
-am-partitions = { path = "../rust-partitions", version = "0.4" }
+#
+# FROM THE REGISTRY, NOT FROM ../rust-partitions. chores.yml:11 says
+# `staticlib` is the whole interface a consumer needs; as a path
+# dependency this made that sentence false. Cargo builds the resolve
+# graph for EVERY command, dev-dependencies included, so
+# `cargo build --release` needed that directory on disk exactly as
+# `cargo test` does. Measured on aac5d3d in a checkout carrying only
+# ../rust-fs-core: exit 101 at the build step,
+# `failed to read .../rust-partitions/Cargo.toml`.
+#
+# tests/siblings_the_contract_promises.rs refuses any path dependency on
+# a sibling chores.yml does not declare, and CI no longer checks
+# rust-partitions out, so a path here fails the build rather than
+# quietly reinstating the prerequisite.
+am-partitions = "0.4"
 # Zstd encoder used only by the synthetic-image test harness to build
 # fixture clusters; never linked into the runtime crate.
 zstd = "0.13"
 # JSON parsing for `qemu-img info --output=json` in the qemu-validation
 # test harness. Test-only.
 serde_json = "1"
+# TOML parser for tests/siblings_the_contract_promises.rs, which reads this
+# manifest and refuses a path dependency on an undeclared sibling. It PARSES
+# rather than scans: `path` is legal in four dependency tables, in
+# `[target.'cfg(..)'.dependencies]` and in `[patch]`, and it can be spelled
+# with either quote style, inline or as its own table. Dev-only.
+toml = "1.1.5"
 
 [profile.release]
 lto = true
@@ -68,3 +88,23 @@ panic = "unwind"  # required for catch_unwind at the C-ABI boundary
 [profile.dev]
 opt-level = 1
 panic = "unwind"
+
+# WHY A PATCH RATHER THAN A SECOND PATH DEPENDENCY.
+#
+# am-partitions comes from the registry (above), and its own am-fs-core
+# comes from the registry too. A registry am-fs-core and this crate's
+# ../rust-fs-core are DIFFERENT PACKAGES to cargo even at the same
+# version, so without this the graph carries two of them and the
+# `inspect` example stops compiling:
+#
+#     the trait `BlockRead` is not implemented for `Qcow2Reader`
+#     note: there are multiple different versions of crate `fs_core`
+#
+# This unifies them onto the copy this crate already builds against. It
+# needs no directory the contract does not already name, and cargo
+# strips `[patch]` when packaging, so nothing reaches a consumer of the
+# published crate. Adding a path here is adding a sibling prerequisite:
+# ../rust-fs-core is declared in chores.yml, and the guard requires that
+# of anything else put here.
+[patch.crates-io]
+am-fs-core = { path = "../rust-fs-core" }
