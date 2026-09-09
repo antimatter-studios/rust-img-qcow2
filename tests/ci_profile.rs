@@ -108,10 +108,63 @@ fn command_lines(script: &str) -> Vec<&str> {
     script
         .lines()
         .map(str::trim_start)
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| line.split(" #").next().unwrap_or(line).trim())
+        .map(|line| match comment_start(line) {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect()
+}
+
+/// Where a shell comment begins on a line, if it does.
+///
+/// A `#` is the comment character only where a WORD begins: at the
+/// start of the line, or after a character that ends a word. The rule
+/// used to be `line.split(" #")`, which is that rule written for
+/// exactly one such character, so a comment glued to a terminator
+/// survived into the line and was read as part of it:
+///
+///     cargo test --locked --lib;# EXPECT_OVERFLOW_CHECKS=1 is set in CI
+///
+/// The handshake half found the variable in the comment, the command
+/// half found a real debug run before it, and the step counted as
+/// arming a probe the process would never receive.
+///
+/// THE ALPHABET IS [`shell_commands`]' OWN SEPARATOR SET, not a second
+/// one invented here. That is the whole point: two readers of one text
+/// must not have two grammars, which is why `command_lines` exists at
+/// all. `|` and a tab are in the set and were not holes -- other
+/// mechanisms already caught them -- and they are handled here because
+/// the rule is "a word begins", not because either was measured
+/// escaping.
+///
+/// A `#` inside quotes is data, and so is one inside a word:
+/// `--features a#b` is one argument, and cutting at it would truncate
+/// a real command and make the guard refuse a correct workflow.
+fn comment_start(line: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut at_word_start = true;
+    for (index, c) in line.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            at_word_start = false;
+            continue;
+        }
+        match c {
+            '#' if at_word_start => return Some(index),
+            '\'' | '"' => {
+                quote = Some(c);
+                at_word_start = false;
+            }
+            ';' | '&' | '|' | '(' | ')' => at_word_start = true,
+            c if c.is_whitespace() => at_word_start = true,
+            _ => at_word_start = false,
+        }
+    }
+    None
 }
 
 /// Whether a line turns `set -e` off.
@@ -121,8 +174,26 @@ fn command_lines(script: &str) -> Vec<&str> {
 /// makes every command in the block advisory -- including the one this
 /// file exists to require. Recognised in all its spellings (`set +e`,
 /// `set +ex`, `set +o errexit`) rather than as a fixed string.
+///
+/// IT TOKENISES WITH [`shell_commands`] RATHER THAN `split_whitespace`.
+/// Whitespace is not what ends a word in a shell, so the option name
+/// with the next command's punctuation glued to it -- `set +o
+/// errexit;`, `set +o errexit&&` -- read as `errexit;`, which is not
+/// `errexit`, and the withdrawal was invisible. Only the detached
+/// `set +o errexit ;` was caught, which is the spelling nobody writes.
+///
+/// Sharing the tokeniser also settles the quoted case for free:
+/// `echo "set +o errexit"` yields the words `["echo", ""]`, so a
+/// printed withdrawal withdraws nothing.
 fn disables_errexit(line: &str) -> bool {
-    let mut words = line.split_whitespace();
+    shell_commands(line)
+        .iter()
+        .any(|(words, _)| set_disables_errexit(words))
+}
+
+/// Whether one tokenised command is a `set` that turns `errexit` off.
+fn set_disables_errexit(words: &[String]) -> bool {
+    let mut words = words.iter().map(String::as_str);
     if words.next() != Some("set") {
         return false;
     }
@@ -1263,6 +1334,26 @@ EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
         );
     }
 
+    /// A `#` THAT DOES NOT BEGIN A WORD IS NOT A COMMENT.
+    ///
+    /// The acceptance half of widening the comment rule from `" #"` to
+    /// the separator alphabet: a `#` inside a word, or inside quotes,
+    /// is data. Cutting there would truncate a real command and the
+    /// guard would refuse a correct workflow.
+    #[test]
+    fn a_hash_that_does_not_begin_a_word_is_not_a_comment() {
+        for line in [
+            "cargo test --locked --features a#b --all-targets",
+            "cargo test --locked --all-targets && echo \"done #1\"",
+        ] {
+            assert_eq!(
+                runs_with_overflow_checks(line).len(),
+                1,
+                "{line:?} has no comment on it: the `#` is inside a word or a quoted span"
+            );
+        }
+    }
+
     /// The inline-comment strip, which nothing else here pins. A real
     /// debug run whose trailing comment happens to contain `--release`
     /// must still be counted. Without the strip that word disqualifies
@@ -1340,6 +1431,13 @@ cargo build --locked --release
             "set +e\ncargo test --locked --all-targets\n",
             "set +o errexit\ncargo test --locked --all-targets\n",
             "set +ex\ncargo test --locked --all-targets\n",
+            // The option name with the next command's punctuation
+            // glued to it. `split_whitespace` produced `errexit;`,
+            // which is not `errexit`, so the withdrawal was invisible
+            // and everything after it was counted as gating.
+            "set +o errexit; cargo test --locked --all-targets\n",
+            "set +o errexit&& cargo test --locked --all-targets\n",
+            "set +o errexit\ncargo test --locked --all-targets | tee log\n",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line),
@@ -1368,6 +1466,12 @@ cargo build --locked --release
             "cargo test --locked --all-targets; echo done",
             "cargo test --locked --all-targets ; true",
             "set -euo pipefail\ncargo test --locked --all-targets\n",
+            // THE ACCEPTANCE HALF OF THE GLUED-PUNCTUATION RULE.
+            // `-o errexit` turns the option ON, and a `set +o errexit`
+            // that is only PRINTED withdraws nothing -- the tokenizer
+            // drops what is inside quotes, so the word is `echo`.
+            "set -o errexit; cargo test --locked --all-targets\n",
+            "echo \"set +o errexit\"\ncargo test --locked --all-targets\n",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line).len(),
@@ -1727,6 +1831,37 @@ mod gating {
         for block in [
             "      - run: |\n          # EXPECT_OVERFLOW_CHECKS=1 -- see ci_profile.rs\n          cargo test --locked --lib\n",
             "      - run: |\n          cargo test --locked --lib  # EXPECT_OVERFLOW_CHECKS=1 is set in CI\n",
+        ] {
+            let yaml = GATING.replace(
+                "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
+                block,
+            );
+            assert!(
+                gating_runs_that_prove_the_build_traps(&yaml).is_empty(),
+                "the variable is named in a comment, so the process never receives \
+                 it and the runtime probe asserts nothing: {block:?}"
+            );
+        }
+    }
+
+    /// A HANDSHAKE GLUED TO A TERMINATOR DOES NOT ARM THE STEP EITHER.
+    ///
+    /// `command_lines` cut the comment at `" #"`, which is the rule
+    /// "a `#` that begins a word" written for exactly one of the
+    /// characters that end a word. The three it missed are the ones
+    /// `shell_commands` already splits on, so the two readers of one
+    /// text had two grammars again -- the defect this file records
+    /// having fixed once already, at a different character.
+    ///
+    /// `&&#` is not valid bash, and is here anyway: the guard must not
+    /// depend on the evasion being a shape bash would accept, and
+    /// over-strict is the safe direction everywhere in this file.
+    #[test]
+    fn a_handshake_glued_to_a_terminator_does_not_arm_a_step() {
+        for block in [
+            "      - run: |\n          cargo test --locked --lib;# EXPECT_OVERFLOW_CHECKS=1 is set in CI\n",
+            "      - run: |\n          (cargo test --locked --lib)# EXPECT_OVERFLOW_CHECKS=1 is set in CI\n",
+            "      - run: |\n          cargo test --locked --lib && echo ok&&# EXPECT_OVERFLOW_CHECKS=1 is set in CI\n",
         ] {
             let yaml = GATING.replace(
                 "      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib\n",
