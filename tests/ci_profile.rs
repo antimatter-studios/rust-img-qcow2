@@ -1095,10 +1095,21 @@ fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
 /// a step is a misconfiguration and it fails loudly rather than
 /// quietly: the checks are legitimately off in release, so the
 /// assertion the handshake arms would fire there every time.
+/// THE SECOND CALL SITE OF THE SAME QUESTION, and it needs its own
+/// witness. `step_declares_the_handshake` asks it of a step and this
+/// asks it of one command line; fixing only the first left this one a
+/// `contains`, and the suite stayed green because no test drove this
+/// path with a printed mention on the same line as a real run:
+///
+///     echo "EXPECT_OVERFLOW_CHECKS=1" && cargo test --locked --lib
+///
+/// One line, so `runs_with_overflow_checks` hands the whole thing back
+/// as the command, `contains` matched, and the run counted as proving
+/// the build traps while the process received no variable.
 fn debug_runs_that_prove_the_build_traps(script: &str) -> Vec<String> {
     runs_with_overflow_checks(script)
         .into_iter()
-        .filter(|command| command.contains("EXPECT_OVERFLOW_CHECKS=1"))
+        .filter(|command| line_assigns_the_handshake(command))
         .collect()
 }
 
@@ -2008,6 +2019,34 @@ mod handshake {
                 "{line} assigns the handshake and must arm the step"
             );
         }
+    }
+
+    /// THE SECOND CALL SITE. `debug_runs_that_prove_the_build_traps`
+    /// asked the same question with the same `contains`, and fixing
+    /// only `step_declares_the_handshake` left the suite green — no
+    /// test drove this path with a printed mention on the same line as
+    /// a real run.
+    #[test]
+    fn a_printed_handshake_beside_a_real_run_does_not_prove_anything() {
+        for script in [
+            "echo \"EXPECT_OVERFLOW_CHECKS=1\" && cargo test --locked --lib\n",
+            "cargo test --locked --lib -- --skip EXPECT_OVERFLOW_CHECKS=1\n",
+        ] {
+            assert_eq!(
+                debug_runs_that_prove_the_build_traps(script),
+                Vec::<String>::new(),
+                "{script:?}: the handshake is mentioned, not assigned, so the process \
+                 gets no variable and the runtime probe asserts nothing"
+            );
+        }
+    }
+
+    /// The acceptance half of that call site: the same line shape with a
+    /// real assignment still counts.
+    #[test]
+    fn a_real_assignment_beside_a_run_on_one_line_still_counts() {
+        let script = "export EXPECT_OVERFLOW_CHECKS=1 && cargo test --locked --lib\n";
+        assert_eq!(debug_runs_that_prove_the_build_traps(script).len(), 1);
     }
 
     /// The `env:` mapping is untouched by any of this, and it is the
