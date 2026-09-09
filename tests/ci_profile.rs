@@ -313,7 +313,18 @@ fn shell_commands(line: &str) -> Vec<(Vec<String>, Sep)> {
         //
         // A BARE `( … )` SUBSHELL IS NOT THIS. Its status IS read, so it
         // keeps falling through to the separator arm.
-        if c == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+        // `<( … )` AND `>( … )` ARE THE SAME SWALLOWING. A process
+        // substitution hands the command a file name to read, and the
+        // command's own status is all the line reports. Measured:
+        //
+        //   bash -e -c 'cat <(false)'          exit 0
+        //   bash -e -c 'cat <(false); echo R'  exit 0, R printed
+        //
+        // Only `$(` was recognised, so `cat <(cargo test --locked
+        // --all-targets)` split at the `(` into a `cat <` command and a
+        // `cargo test` one that looked status-read -- and the guard
+        // counted a suite whose failure nothing could see.
+        if matches!(c, '$' | '<' | '>') && i + 1 < chars.len() && chars[i + 1] == '(' {
             let mut depth = 0usize;
             let mut j = i + 1;
             while j < chars.len() {
@@ -568,13 +579,30 @@ fn omits_the_library_unit_tests(arguments: &[&str]) -> bool {
 /// `set +e` is the caller's to handle, because it disqualifies the
 /// whole block rather than one line.
 ///
-/// It stays STRICTER than bash in one place: `cargo test … & wait $!`
-/// does propagate the failure (measured: exit 1) and is refused
-/// anyway, because recognising it means tracking which job `$!` names.
+/// It stays STRICTER than bash in two places, and both are stated
+/// rather than accidental:
+///
+/// - `cargo test … & wait $!` does propagate the failure (measured:
+///   exit 1) and is refused anyway, because recognising it means
+///   tracking which job `$!` names;
+/// - `cargo test --locked --all-targets && echo ok | tee log` is
+///   refused because the tail contains a `Pipe`, and bash reads that
+///   status: `|` binds tighter than `&&`, so the pipeline is the last
+///   member of the list rather than something after it. MEASURED:
+///   `bash -e -c 'false && echo ok | tee /dev/null'` exits 1.
+///   `grep -cE 'cargo test.*&&.*\|'` is 0 in all six copies' `ci.yml`,
+///   so nothing hits it today; fixing it means telling a pipeline
+///   INSIDE a list from one that follows it, which is a change to the
+///   tokenizer rather than to this rule.
+///
 /// Refusing a correct workflow loudly is this file's declared
 /// direction; passing a broken one silently is the defect it exists
 /// for.
-fn status_is_read(commands: &[(Vec<String>, Sep)], index: usize) -> bool {
+fn status_is_read(
+    commands: &[(Vec<String>, Sep)],
+    index: usize,
+    is_last_command_line: bool,
+) -> bool {
     let tail = &commands[index..];
     if !tail
         .iter()
@@ -595,10 +623,31 @@ fn status_is_read(commands: &[(Vec<String>, Sep)], index: usize) -> bool {
     // So `cargo test --locked --lib && echo ok; echo done` is a gate
     // that cannot fail, and the rule above -- which asked only that no
     // `||`, `|` or `&` follow -- counted it as read.
+    //
+    // A NEWLINE ENDS A COMMAND THE SAME WAY `;` DOES, and this rule
+    // could not see one. `runs_with_overflow_checks` calls this per
+    // line, so "ends the line" was the whole test -- and a `run: |`
+    // block is the spelling a workflow is actually written in:
+    //
+    //   run: |
+    //     cargo test --locked --all-targets && echo done
+    //     echo "second line"
+    //
+    // The `&&` list ends its own line, the tail is `[And, End]`, and
+    // the step exits 0 with the suite red. Measured:
+    // `bash -e -c $'false && echo x\necho R'` exits 0 and prints R,
+    // exactly as the `;` spelling does.
+    //
+    // `an_and_list_that_does_not_end_the_line_has_its_failure_swallowed`
+    // is named for this defect and reaches only the `;` half: both of
+    // its inputs put the following command on the SAME line. So the
+    // rule needs to know whether anything runs after this LINE too,
+    // which is a fact about the script rather than about the line.
     if tail[0].1 == Sep::And {
-        return tail
-            .iter()
-            .all(|(_, sep)| matches!(sep, Sep::And | Sep::End));
+        return is_last_command_line
+            && tail
+                .iter()
+                .all(|(_, sep)| matches!(sep, Sep::And | Sep::End));
     }
     true
 }
@@ -638,7 +687,8 @@ fn runs_with_overflow_checks(script: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for line in lines {
+    let last_line = lines.len().saturating_sub(1);
+    for (line_index, line) in lines.iter().enumerate() {
         if line.contains("--release") || line.contains("--profile") {
             continue;
         }
@@ -653,7 +703,9 @@ fn runs_with_overflow_checks(script: &str) -> Vec<String> {
             if omits_the_library_unit_tests(&arguments) {
                 continue;
             }
-            if !status_is_read(&commands, index) {
+            // Whether an `&&` chain's failure reaches the step depends
+            // on nothing running after it -- on a later line included.
+            if !status_is_read(&commands, index, line_index == last_line) {
                 continue;
             }
             out.push(line.to_string());
@@ -1782,6 +1834,14 @@ cargo build --locked --release
             "OUT=$(cargo test --locked --lib)",
             "echo `cargo test --locked --lib`",
             "echo \"result: $(cargo test --locked --all-targets)\"",
+            // PROCESS SUBSTITUTION IS THE SAME SWALLOWING. `<( … )`
+            // hands the command a file to read; only the command's own
+            // status reaches the line. Measured, both directions:
+            // `bash -e -c 'cat <(false)'` and
+            // `bash -e -c 'echo x > >(false)'` each exit 0.
+            "cat <(cargo test --locked --all-targets)",
+            "diff <(cargo test --locked --lib) expected.txt",
+            "echo x > >(cargo test --locked --all-targets)",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line),
@@ -1852,6 +1912,13 @@ cargo build --locked --release
         for line in [
             "cargo test --locked --lib && echo ok; echo done",
             "cargo test --locked --all-targets && echo ok; ls",
+            // A NEWLINE IS THE SPELLING A WORKFLOW ACTUALLY USES, and
+            // the two above cannot reach it: both put the following
+            // command on the same line, so "ends the line" was true
+            // and the rule said read. Measured:
+            // `bash -e -c $'false && echo x\necho R'` exits 0.
+            "cargo test --locked --all-targets && echo done\necho \"second line\"\n",
+            "cargo test --locked --lib && echo ok\ncargo build --locked\n",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line),
@@ -1869,6 +1936,12 @@ cargo build --locked --release
             "cargo test --locked --lib && echo ok",
             "cargo test --locked --lib && echo ok && echo done",
             "cd .. && cargo test --locked --lib",
+            // THE ACCEPTANCE HALF OF THE MULTI-LINE RULE. When the
+            // chain IS the last line, its status is the step's, and a
+            // fix that keyed on "is a multi-line block" rather than on
+            // "is the last line" would refuse this.
+            "set -euo pipefail\ncargo test --locked --all-targets && echo ok\n",
+            "cd ..\ncargo test --locked --lib && echo ok\n",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line).len(),
