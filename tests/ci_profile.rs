@@ -293,6 +293,44 @@ fn end_of_substitution(chars: &[char], open: usize) -> Option<usize> {
                     j += 2;
                     continue;
                 }
+                // A NESTED SPAN'S PARENTHESES ARE ITS OWN. Quotes and
+                // escapes were tracked and these two were not, so a `)`
+                // inside a nested backtick span or a `${...}` closed the
+                // OUTER substitution early. Both directions were
+                // measured against `bash -e -c`:
+                //
+                //   echo $(echo `echo x)`) ; cargo test --lib
+                //       bash reads the trailing status; the span closed
+                //       at the `)` inside the backticks, the unmatched
+                //       backtick then ate the rest of the line, and a
+                //       real gate was DROPPED.
+                //
+                //   $(echo ${x:+)} ; cargo test --lib)
+                //       bash swallows it; the span closed at the `)`
+                //       inside `${...}`, so the `cargo test` read as
+                //       top-level and a swallowed suite was COUNTED.
+                //
+                // Skipping the nested span is the same answer as for a
+                // quote: what is inside it is not this scanner's
+                // punctuation.
+                if c == '`' {
+                    match end_of_backticks(chars, j) {
+                        Some(close) => {
+                            j = close + 1;
+                            continue;
+                        }
+                        None => return None,
+                    }
+                }
+                if c == '$' && j + 1 < chars.len() && chars[j + 1] == '{' {
+                    match end_of_braces(chars, j + 1) {
+                        Some(close) => {
+                            j = close + 1;
+                            continue;
+                        }
+                        None => return None,
+                    }
+                }
                 match c {
                     '\'' | '"' => quote = Some(c),
                     '(' => depth += 1,
@@ -309,6 +347,88 @@ fn end_of_substitution(chars: &[char], open: usize) -> Option<usize> {
                     _ => {}
                 }
             }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Index of the `}` closing the `${...}` opened at `open`, which
+/// indexes the `{`, or `None` if it is never closed.
+///
+/// Brace expansions nest — `${x:-${y}}` is legal — so this counts
+/// braces the way [`end_of_substitution`] counts parentheses, and for
+/// the same reason: a `}` belonging to an inner expansion is not the
+/// outer one's close.
+///
+/// Quoting inside `${...}` is NOT tracked, and the limit is stated
+/// rather than implied. The expansion's own grammar allows a quoted
+/// word in the default value, so `${x:-"}"}` would close early here.
+/// No workflow in this constellation writes one, and the effect is to
+/// end the outer span early, which drops a gate rather than inventing
+/// one — the direction this file declares as safe.
+fn end_of_braces(chars: &[char], open: usize) -> Option<usize> {
+    debug_assert_eq!(chars.get(open), Some(&'{'), "open must index the brace");
+    let mut depth = 0usize;
+    let mut j = open;
+    while j < chars.len() {
+        // A NESTED SPAN'S CONTENTS ARE DATA, WHICH IS THE SAME RULE ONE
+        // LAYER DOWN. This counted every `{` and `}`, so a literal
+        // brace inside a command substitution -- where it is an
+        // ordinary argument character -- read as another expansion
+        // level, the closing `}` never brought the depth back to zero,
+        // this answered `None`, `shell_commands` treated the span as
+        // unterminated and dropped the rest of the line, and an `&&`
+        // chain that did NOT end the step looked as though it did:
+        //
+        //   cargo test --locked --lib && echo ${x:-$(echo {)} ; true
+        //
+        // bash exits 0 whether the suite passes or fails -- the
+        // `; true` swallows it -- and the guard counted it as the gate.
+        // Measured both ways with `bash -e -c`; and
+        // `echo "${x:-$(echo {)}"` prints `{`, so the brace really is
+        // data.
+        //
+        // `braces_no_nesting` passing was never evidence this was
+        // right: it shows the depth counter does something, not that it
+        // is correct on a brace that is not an expansion.
+        if chars[j] == '$' && j + 1 < chars.len() && chars[j + 1] == '(' {
+            match end_of_substitution(chars, j + 1) {
+                Some(close) => {
+                    j = close + 1;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        if chars[j] == '`' {
+            match end_of_backticks(chars, j) {
+                Some(close) => {
+                    j = close + 1;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        // ONLY `${` OPENS A LEVEL, apart from the opening brace this
+        // was called on. A bare `{` elsewhere is data.
+        if chars[j] == '$' && j + 1 < chars.len() && chars[j + 1] == '{' {
+            depth += 1;
+            j += 2;
+            continue;
+        }
+        match chars[j] {
+            '\\' if j + 1 < chars.len() => {
+                j += 1;
+            }
+            '{' if j == open => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
         }
         j += 1;
     }
@@ -446,6 +566,28 @@ fn shell_commands(line: &str) -> Vec<(Vec<String>, Sep)> {
         if c == '`' {
             started = true;
             i = match end_of_backticks(&chars, i) {
+                Some(close) => close + 1,
+                None => chars.len(),
+            };
+            continue;
+        }
+        // A `${...}` EXPANSION IS DATA HERE TOO, and this site was
+        // missed when the same rule went into `end_of_substitution`: a
+        // fix applied one function away and not applied here. `$` and
+        // `{` were ordinary word characters, so the `)` in
+        //
+        //   cargo test --locked --lib && echo ${x:+)}
+        //
+        // fell into the separator arm below and split the line. The
+        // `&&` chain then no longer ENDED the step, which is this
+        // file's rule for whether an `&&` list's failure is read, so
+        // the suite's failure read as swallowed and a real gate was
+        // dropped. Measured: `bash -e -c 'x=1; false && echo ${x:+)}'`
+        // exits 1 and the `true` spelling exits 0, so the status is
+        // read.
+        if c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            started = true;
+            i = match end_of_braces(&chars, i + 1) {
                 Some(close) => close + 1,
                 None => chars.len(),
             };
@@ -1175,31 +1317,107 @@ fn step_declares_the_handshake(step: &Step) -> bool {
 /// `export` is accepted with it, because `export VAR=1` on its own line
 /// followed by `cargo test` is a real spelling and refusing it would
 /// refuse a correct workflow. `set` is not: `set` does not assign.
+/// Whether one tokenised command puts the handshake into an
+/// ENVIRONMENT a later process receives.
+///
+/// # AN ASSIGNMENT ON ITS OWN EXPORTS NOTHING
+///
+/// This returned true on seeing the handshake anywhere in a command's
+/// assignment prefix, and a standalone
+///
+/// ```text
+/// EXPECT_OVERFLOW_CHECKS=1
+/// cargo test --locked --lib
+/// ```
+///
+/// is a prefix with no command after it: bash sets a SHELL variable
+/// that the `cargo test` on the next line never sees. So the guard
+/// reported a probe that could not have run — the recurring defect,
+/// inside the guard written to close it. The doc this replaces reasoned
+/// about `export VAR=1` and about `echo VAR=1` and was silent on
+/// assignment-alone, which is how it survived five reviews.
+///
+/// Three conditions, and the defect was the absence of the second:
+///
+/// 1. **Name shape.** [`is_assignment`] requires a name that is a legal
+///    shell identifier, so `1abc=x` is not an assignment and neither is
+///    a bare `=x`.
+/// 2. **Leading position, WITH A COMMAND AFTER IT.** A prefix
+///    assignment is exported to the command it prefixes and to nothing
+///    else, so with no command there is nothing to export to.
+/// 3. **Or an exporting builtin**, which puts it in the shell's own
+///    environment and so reaches every later command.
+///
+/// # THE TEMPTING FIX IS TO REQUIRE `export`, AND IT WOULD BE WRONG
+///
+/// `EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib` is the spelling
+/// this repository's own workflow uses and the one the guard exists to
+/// accept. `a_real_assignment_beside_a_run_on_one_line_still_counts`
+/// and `every_spelling_that_really_assigns_it_still_arms_the_step` are
+/// the acceptance arms, and `require_export` is the mutation that shows
+/// what requiring it costs.
+///
+/// # WHAT IS DELIBERATELY STILL REFUSED
+///
+/// `declare -x` and `typeset -x` do export — measured in
+/// `rust-img-vhdx`'s `assigns_the_handshake`, which is the one copy in
+/// the constellation that built that table:
+///
+/// ```text
+/// export X=1      child sees it: 1     declare -x X=1  child sees it: 1
+/// declare X=1     child sees it: 0     typeset -x X=1  child sees it: 1
+/// typeset X=1     child sees it: 0
+/// readonly X=1    child sees it: 0
+/// ```
+///
+/// This file recognises only `export`, so the `-x` spellings are
+/// REFUSED. That is the over-strict direction and it is left alone
+/// deliberately: recognising them widens what counts as armed, which is
+/// the unsafe direction, and no workflow here writes one. The four
+/// non-exporting spellings are already refused, because none of them is
+/// `export`, `env` or an assignment.
 fn line_assigns_the_handshake(line: &str) -> bool {
-    const HANDSHAKE: &str = "EXPECT_OVERFLOW_CHECKS=1";
-    shell_commands(line).iter().any(|(words, _)| {
-        let mut saw_export = false;
-        for word in words {
-            if word == HANDSHAKE {
-                return true;
-            }
-            if word == "export" && !saw_export {
-                saw_export = true;
-                continue;
-            }
-            // Still in the prefix? `env` and further assignments keep
-            // it open; anything else is the program name, and a match
-            // after it is an argument rather than an assignment.
-            if word == "env" {
-                continue;
-            }
-            if is_assignment(word) {
-                continue;
-            }
-            return false;
+    shell_commands(line)
+        .iter()
+        .any(|(words, _)| command_assigns_the_handshake(words))
+}
+
+const HANDSHAKE: &str = "EXPECT_OVERFLOW_CHECKS=1";
+
+fn command_assigns_the_handshake(words: &[String]) -> bool {
+    // An exporting builtin reaches every later command, so where the
+    // assignment sits among its arguments does not matter. `export`
+    // with no arguments exports nothing, which `words[1..]` gives for
+    // free.
+    if words.first().map(String::as_str) == Some("export") {
+        return words[1..].iter().any(|word| word == HANDSHAKE);
+    }
+
+    // Otherwise it has to be an assignment PREFIX, and a prefix is
+    // exported to the command it prefixes.
+    let mut saw = false;
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at].as_str();
+        if word == "env" {
+            at += 1;
+            continue;
         }
-        false
-    })
+        if is_assignment(word) {
+            if word == HANDSHAKE {
+                saw = true;
+            }
+            at += 1;
+            continue;
+        }
+        // The program name. Anything matching after it is an argument
+        // rather than an assignment.
+        break;
+    }
+    // AND A COMMAND FOLLOWS. `at == words.len()` means the whole
+    // command was assignments, which is the defect this function was
+    // changed for.
+    saw && at < words.len()
 }
 
 /// `NAME=value`, the shape a shell reads as an assignment rather than a
@@ -1945,6 +2163,150 @@ cargo build --locked --release
     /// | `cat <(echo "a)") ; false` | 1 | **count** |
     /// | `cat <(echo 'a)') ; false` | 1 | **count** |
     /// | `cat <(echo a\\) ; false` | 1 | **count** |
+    /// A NESTED SPAN'S PARENTHESES ARE ITS OWN — BACKTICKS.
+    ///
+    /// `end_of_substitution` tracked quotes and escapes and not nested
+    /// spans, so a `)` inside a nested backtick span closed the outer
+    /// `$( )` early; the unmatched backtick then ate the rest of the
+    /// line and a real gate was DROPPED. `bash -e -c` on the exact
+    /// line, `false` versus `true` for the suite: exits 1 and 0, so the
+    /// trailing status is read and this must COUNT.
+    #[test]
+    fn a_nested_backtick_does_not_close_the_outer_substitution() {
+        let line = "echo $(echo `echo x)`) ; cargo test --locked --lib";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            vec![line.to_string()],
+            "{line}: the `)` is inside a nested backtick span, so the substitution runs on \
+             and the cargo test after it is top-level"
+        );
+    }
+
+    /// THE SAME, FOR `${{...}}`, AND IT FAILS THE OTHER WAY.
+    ///
+    /// A `)` inside a brace expansion closed the outer substitution
+    /// early, so a suite that bash keeps INSIDE the substitution read
+    /// as top-level and a swallowed run was COUNTED. Measured:
+    /// `bash -e -c 'x=1; $(echo ${{x:+)}} ; false)'` and the same with
+    /// `true` both exit 0 — the inner status never reaches the line.
+    #[test]
+    fn a_brace_expansion_does_not_close_the_outer_substitution() {
+        assert_eq!(
+            runs_with_overflow_checks("$(echo ${x:+)} ; cargo test --locked --lib)"),
+            Vec::<String>::new(),
+            "the whole thing is inside `$( )`; the `)` belongs to the brace expansion"
+        );
+        // ACCEPTANCE: the same brace expansion with the suite OUTSIDE
+        // the substitution is a real gate and must still count.
+        let line = "echo $(echo ${x:+)}) ; cargo test --locked --lib";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            vec![line.to_string()],
+            "{line}: the substitution closes and the cargo test after it is top-level"
+        );
+        // AND THE MAIN TOKENISER SKIPS IT TOO, which is a second site
+        // for the same rule. `$` and `{` were ordinary word characters
+        // there, so this `)` became a separator, the `&&` chain stopped
+        // ending the step, and the suite's failure read as swallowed.
+        let line = "cargo test --locked --lib && echo ${x:+)}";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            vec![line.to_string()],
+            "{line}: the `)` belongs to the expansion, so the && list still ends the step"
+        );
+
+        // A LITERAL BRACE IS NOT AN EXPANSION LEVEL. `${x:-$(echo {)}`
+        // expands to `{` -- the brace is an ordinary argument
+        // character inside a command substitution. Counting it as a
+        // level left the span unterminated, `shell_commands` dropped
+        // the rest of the line, and the `&&` chain looked as though it
+        // ended the step. `bash -e -c 'x=1; false && echo
+        // ${x:-$(echo {)} ; true'` exits 0, and so does the `true`
+        // spelling: the `; true` swallows the suite's failure, so this
+        // must NOT count.
+        assert_eq!(
+            runs_with_overflow_checks("cargo test --locked --lib && echo ${x:-$(echo {)} ; true"),
+            Vec::<String>::new(),
+            "the `; true` swallows the failure; the brace inside the substitution is data"
+        );
+        // ACCEPTANCE: the same expansion with the chain really ending
+        // the step is a gate. `false && echo ${x:-$(echo {)}` exits 1
+        // and the `true` spelling 0.
+        let line = "cargo test --locked --lib && echo ${x:-$(echo {)}";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            vec![line.to_string()],
+            "{line}: the && chain ends the step, so the suite's failure is read"
+        );
+        // EVERY NESTED SHAPE THAT CARRIES A BRACE, each measured with
+        // `bash -e -c` in both spellings and each SWALLOWED by the
+        // `; true`, so none may count. Three arms of the fix are held
+        // by exactly one of these:
+        //
+        //   ${x:-{}              a literal `{` directly in the
+        //                        expansion; expands to `{`
+        //   ${x:-$(echo })}      a `}` inside a nested substitution;
+        //                        expands to `}`
+        //   ${x:-`echo }`}       a `}` inside nested backticks;
+        //                        expands to `}`
+        //   ${x:-$(echo ${y})}   an expansion inside a substitution
+        //                        inside an expansion; expands to `q`
+        for expansion in [
+            "${x:-{}",
+            "${x:-$(echo })}",
+            "${x:-`echo }`}",
+            "${x:-$(echo ${y})}",
+        ] {
+            let line = format!("cargo test --locked --lib && echo {expansion} ; true");
+            assert_eq!(
+                runs_with_overflow_checks(&line),
+                Vec::<String>::new(),
+                "{line}: the `; true` swallows the failure, so this is not the gate"
+            );
+        }
+
+        // AND THE ACCEPTANCE SIDE OF THE SAME NESTING, which is what
+        // holds the substitution skip specifically. Ending the span
+        // early at the `}` inside `$( )` leaves a stray `)` that reads
+        // as a separator, so the `&&` chain stops ending the step and a
+        // real gate is dropped. `bash -e -c 'x=; false && echo
+        // "${x:-$(echo })}"'` exits 1 and the `true` spelling 0.
+        for expansion in ["${x:-$(echo })}", "${x:-$(echo ${y})}"] {
+            let line = format!("cargo test --locked --lib && echo {expansion}");
+            assert_eq!(
+                runs_with_overflow_checks(&line),
+                vec![line.clone()],
+                "{line}: the && chain ends the step, so the suite's failure is read"
+            );
+        }
+
+        // And a literal brace in a bare substitution, no expansion at
+        // all, which is the same character in the simpler position.
+        assert_eq!(
+            runs_with_overflow_checks("cargo test --locked --lib && echo $(echo {) ; true"),
+            Vec::<String>::new(),
+            "a literal brace in a substitution does not change where the line ends"
+        );
+
+        // AND THEY NEST. `${x:-${y}z)}` expands to `qz)` in bash, so
+        // the `)` is the expansion's, and a scanner that stopped at the
+        // INNER `}` would resume at `z)}` and take that `)` for a
+        // separator -- which ends the `&&` chain early and drops a real
+        // gate. Measured: `bash -e -c 'y=q; false && echo ${x:-${y}z)}'`
+        // exits 1 and the `true` spelling exits 0.
+        let line = "cargo test --locked --lib && echo ${x:-${y}z)}";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            vec![line.to_string()],
+            "{line}: the nested expansion owns both braces and the `)`, so the && list              still ends the step"
+        );
+        assert_eq!(
+            runs_with_overflow_checks("$(echo ${x:-${y:+)}} ; cargo test --locked --lib)"),
+            Vec::<String>::new(),
+            "a nested brace expansion's braces are its own inside a substitution too"
+        );
+    }
+
     #[test]
     fn a_paren_the_shell_reads_as_data_does_not_end_a_substitution() {
         for line in [
@@ -2261,6 +2623,69 @@ mod handshake {
     /// whole step, so every `cargo test` in it counted as proving the
     /// build traps, while the process received no variable and the
     /// runtime probe returned without asserting anything.
+    /// AN ASSIGNMENT WITH NO COMMAND AFTER IT ARMS NOTHING.
+    ///
+    /// A prefix assignment is exported to the command it prefixes and
+    /// to nothing else, so a standalone `EXPECT_OVERFLOW_CHECKS=1` line
+    /// sets a SHELL variable that the next line's `cargo test` never
+    /// sees. The guard reported a probe that could not have run.
+    #[test]
+    fn an_assignment_with_no_command_after_it_arms_nothing() {
+        for line in [
+            "EXPECT_OVERFLOW_CHECKS=1",
+            "  EXPECT_OVERFLOW_CHECKS=1  ",
+            "env EXPECT_OVERFLOW_CHECKS=1",
+            "EXPECT_OVERFLOW_CHECKS=1 OTHER=2",
+            // `export` with nothing to export is the same shape.
+            "export",
+        ] {
+            assert!(
+                !super::line_assigns_the_handshake(line),
+                "{line}: nothing is exported, so no later cargo test can see the handshake"
+            );
+        }
+
+        // AND THE WHOLE STEP IS NOT ARMED BY ONE. This is the shape a
+        // workflow would actually be written in, and it is what
+        // `gating_runs_that_prove_the_build_traps` reads.
+        let block = "EXPECT_OVERFLOW_CHECKS=1\ncargo test --locked --lib\n";
+        assert_eq!(
+            super::debug_runs_that_prove_the_build_traps(block),
+            Vec::<String>::new(),
+            "the assignment is on its own line, so the cargo test runs without it"
+        );
+    }
+
+    /// ACCEPTANCE FOR THAT, AND IT IS THE HALF A `require export` FIX
+    /// WOULD HAVE BROKEN.
+    ///
+    /// `EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib` is the
+    /// spelling this repository's own workflow uses. Requiring `export`
+    /// would refuse it — the guard refusing a correct workflow, which
+    /// is the failure this file's history is made of.
+    #[test]
+    fn the_spellings_that_really_export_it_still_arm_the_step() {
+        for line in [
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+            "env EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 RUST_BACKTRACE=1 cargo test --locked --lib",
+            "RUST_BACKTRACE=1 EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+            "export EXPECT_OVERFLOW_CHECKS=1",
+            "export RUST_BACKTRACE=1 EXPECT_OVERFLOW_CHECKS=1",
+        ] {
+            assert!(
+                super::line_assigns_the_handshake(line),
+                "{line} really does put the handshake in an environment a child receives"
+            );
+        }
+
+        // And the printer is still refused, unchanged by any of this.
+        assert!(
+            !super::line_assigns_the_handshake("echo EXPECT_OVERFLOW_CHECKS=1"),
+            "a printed handshake still arms nothing"
+        );
+    }
+
     #[test]
     fn a_printed_handshake_does_not_arm_the_step() {
         for line in [
