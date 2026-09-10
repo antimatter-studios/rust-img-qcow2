@@ -753,6 +753,29 @@ impl Qcow2Reader {
             }
             // The replacement is uncompressed, so the old compressed
             // cluster loses its only L2 reference and can be released.
+            //
+            // WHAT THIS RELEASE DOES AND DOES NOT COVER, stated because
+            // the offset being bounded now makes it easy to assume the
+            // rest is settled. `decrement_refcount` treats the value as
+            // a cluster identity (`host_off / cluster_size`), and
+            // `lookup_cluster` now guarantees the whole payload lies
+            // inside the image -- so the decrement can no longer land on
+            // a cluster outside it. It still names only the cluster
+            // holding the payload's FIRST byte, and a compressed payload
+            // is byte-granular and up to about 4 MiB long, so it can end
+            // in a later cluster whose reference is not dropped here.
+            //
+            // NOT ESTABLISHED, and deliberately not guessed at: whether
+            // the format's accounting gives every spanned host cluster a
+            // reference at all. This crate never writes compressed
+            // clusters, so those refcounts came from an external
+            // producer, and the question is about what that producer
+            // wrote rather than about this code.
+            // `tests/qemu_validation.rs` is where it can be settled --
+            // build an image whose compressed payload straddles a
+            // cluster boundary, overwrite that virtual cluster, and ask
+            // the external validator whether the leftover clusters are
+            // still accounted for.
             ClusterMap::Compressed { host_off, byte_len } => WritePlan::Reallocate {
                 seed: ClusterSeed::Compressed { host_off, byte_len },
                 release: Some(host_off),
@@ -1424,6 +1447,33 @@ impl Qcow2Reader {
         if l2_entry & L2_FLAG_COMPRESSED != 0 {
             let (host_off, byte_len) =
                 decode_compressed_descriptor(l2_entry, self.header.cluster_bits);
+            // BOUNDED HERE, BECAUSE THIS ARM RETURNS BEFORE THE ONE
+            // BELOW REACHES `checked_host_offset`. Until this, a
+            // compressed descriptor was the only span in this file that
+            // reached the device unchecked: `read_decompressed_slice`
+            // adds no bound of its own, so an offset the image chose
+            // named a read address, and `plan_write` put the same value
+            // in `release` where `decrement_refcount` treats it as a
+            // cluster identity.
+            //
+            // NOT `checked_host_offset`, AND THAT IS THE WHOLE POINT.
+            // That guard also demands cluster alignment, and a
+            // compressed descriptor is byte-granular by design --
+            // `decode_compressed_descriptor` splits the 62-bit word at
+            // `62 - (cluster_bits - 8)`, so a legal offset can name any
+            // byte. Reusing it would reject valid compressed images.
+            // What is needed is the bound without the alignment demand,
+            // which is the shape the L1 and refcount tables already use.
+            //
+            // The END is checked too, not just the start: the payload
+            // runs `[host_off, host_off + byte_len)` and a descriptor
+            // can put the start inside the file and the end past it.
+            span_inside_the_image(
+                self.image_len(),
+                host_off,
+                byte_len as u64,
+                "L2 entry names a compressed cluster outside the image",
+            )?;
             return Ok(ClusterMap::Compressed { host_off, byte_len });
         }
         // From here the entry describes a standard cluster, so the

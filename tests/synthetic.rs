@@ -1476,3 +1476,232 @@ fn a_shared_l2_table_is_copied_before_it_is_written_into() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------
+// A compressed descriptor is bounded, and it is bounded WITHOUT being
+// aligned
+// ---------------------------------------------------------------------
+//
+// `lookup_cluster`'s compressed arm returned its host offset unchecked:
+// the `return` sits before the reserved-bit check and before
+// `checked_host_offset`, both of which the uncompressed arm reaches.
+// The value then went to `dev_read` as an address and, on the write
+// path, into `release` where `decrement_refcount` treats it as a
+// cluster identity.
+//
+// THE OBVIOUS REMEDY IS WRONG, which is why the acceptance test below
+// is not optional: `checked_host_offset` also demands cluster
+// alignment, and a compressed descriptor is byte-granular by design.
+// Reusing it would reject valid compressed images.
+
+/// The descriptor for a compressed cluster at `host_off` spanning
+/// `sectors` 512-byte sectors, in the encoding `build_compressed_image`
+/// uses (cluster_bits = 12, so the split is at bit 58).
+fn compressed_descriptor(host_off: u64, sectors: u64) -> u64 {
+    const X: u64 = 62 - (12 - 8);
+    L2_FLAG_COMPRESSED | host_off | ((sectors - 1) << X)
+}
+
+#[test]
+fn a_compressed_descriptor_pointing_past_the_image_is_refused() {
+    let path = tmp_path("compressed_past_end");
+    build_compressed_image(&path, 0xCC);
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    // Well past the end, and still a legal descriptor as far as the
+    // decoder is concerned.
+    patch(
+        &path,
+        L2_OFFSET,
+        &compressed_descriptor(len + CLUSTER_SIZE, 1).to_be_bytes(),
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "a compressed cluster outside the image must be refused, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// THE END IS CHECKED TOO. A descriptor can put the start inside the
+/// file and the payload's end past it, and a start-only bound reads off
+/// the end of the image.
+#[test]
+fn a_compressed_payload_running_off_the_end_is_refused() {
+    let path = tmp_path("compressed_span_past_end");
+    build_compressed_image(&path, 0xCC);
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    // Start in the last sector, claim eight sectors.
+    let start = len - 512;
+    patch(
+        &path,
+        L2_OFFSET,
+        &compressed_descriptor(start, 8).to_be_bytes(),
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; 512];
+    let err = r.read_at(0, &mut buf).unwrap_err();
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "a compressed payload ending past the image must be refused, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// THE ACCEPTANCE HALF, and the one that decides which guard is right.
+///
+/// A compressed payload may start at any 512-byte boundary, not only at
+/// a cluster boundary. `checked_host_offset` would reject this image;
+/// the bound must not. Built by moving a real payload off its cluster
+/// boundary and re-pointing the descriptor at it, so what is asserted is
+/// a round trip rather than an error message.
+#[test]
+fn a_compressed_payload_that_is_not_cluster_aligned_still_reads() {
+    let path = tmp_path("compressed_unaligned");
+    build_compressed_image(&path, 0xCC);
+
+    // The builder puts the payload at cluster 3 and the descriptor
+    // names it. Read the descriptor back rather than assuming it.
+    let entry = u64::from_be_bytes(raw_bytes(&path, L2_OFFSET, 8).try_into().unwrap());
+    assert!(
+        entry & L2_FLAG_COMPRESSED != 0,
+        "the fixture's first L2 entry must be compressed"
+    );
+    const X: u64 = 62 - (12 - 8);
+    let old_off = entry & ((1u64 << X) - 1);
+    let sectors = ((entry & ((1u64 << 62) - 1)) >> X) + 1;
+    assert_eq!(
+        old_off,
+        CLUSTER_SIZE * 3,
+        "the fixture's payload should start on a cluster boundary before it is moved"
+    );
+
+    // Move it forward by one sector: still 512-aligned, no longer
+    // cluster-aligned.
+    //
+    // The move stays INSIDE cluster 3 rather than running into the next
+    // one, and that matters: cluster 4 is the refcount table in this
+    // fixture, so a payload long enough to spill would overwrite the
+    // metadata and the test would be measuring a broken image instead
+    // of an unaligned descriptor. The fixture's payload is one 512-byte
+    // sector and a cluster holds eight, so there is room -- asserted
+    // rather than assumed, because the assertion is what notices if the
+    // builder's compressor ever emits more.
+    let payload = raw_bytes(&path, old_off, (sectors * 512) as usize);
+    let new_off = old_off + 512;
+    assert!(
+        new_off + sectors * 512 <= CLUSTER_SIZE * 4,
+        "the moved payload must stay inside cluster 3 (cluster 4 is the refcount table); \
+         it starts at {new_off} and runs {} bytes",
+        sectors * 512
+    );
+    patch(&path, new_off, &payload);
+    patch(
+        &path,
+        L2_OFFSET,
+        &compressed_descriptor(new_off, sectors).to_be_bytes(),
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; CLUSTER_SIZE as usize];
+    r.read_at(0, &mut buf)
+        .expect("a byte-granular compressed payload inside the image is legal and must read");
+    assert!(
+        buf.iter().all(|&b| b == 0xCC),
+        "the decompressed cluster must still be the pattern the builder wrote"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// THE WRITE PATH, which is the worse of the two consequences.
+///
+/// `plan_write` puts the same unchecked offset in `release`, and
+/// `write_at` does `let _ = self.decrement_refcount(old_host)`. An
+/// out-of-range value that lands inside the refcount table's coverage
+/// decrements a cluster the payload does not own, and the discarded
+/// result means nothing is reported. The bound has to refuse before the
+/// write path ever sees it.
+#[test]
+fn writing_over_an_out_of_range_compressed_cluster_is_refused_before_any_release() {
+    let path = tmp_path("compressed_write_past_end");
+    build_compressed_image(&path, 0xCC);
+    let len = std::fs::metadata(&path).unwrap().len();
+    patch(
+        &path,
+        L2_OFFSET,
+        &compressed_descriptor(len + CLUSTER_SIZE, 1).to_be_bytes(),
+    );
+
+    let before = std::fs::read(&path).unwrap();
+    let r = Qcow2Reader::open_rw(&path).unwrap();
+    let err = r
+        .write_at(0, &[0xAB; 512])
+        .expect_err("the write must be refused rather than releasing a cluster it invented");
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal, got {err:?}"
+    );
+
+    // AND NOTHING WAS WRITTEN. A refusal raised after
+    // `decrement_refcount` would satisfy the assertion above and still
+    // have handed a live cluster to the next `allocate_cluster`.
+    //
+    // MEASURED, AND UNWITNESSED TODAY -- said here so nobody mistakes
+    // it for a proven check. No mutation of the guard can make this
+    // assertion fire, because `write_at` orders the release last
+    // (seed -> allocate -> data -> L2 -> release), so every bound in
+    // the lookup or read path refuses before the first byte moves. With
+    // the guard deleted entirely this test fails on the `expect_err`
+    // above -- an `Io(UnexpectedEof)` from the seed read -- and the
+    // image is still byte-identical. The pair is kept for the
+    // reordering it would catch, not for a failure it has caught.
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        before, after,
+        "the image must be byte-identical after a refused write"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// WHY THE BOUND LIVES IN `lookup_cluster` AND NOT IN
+/// `read_decompressed_slice`, which is the other obvious place for it.
+///
+/// Moving it into the read path passes every other test in this group,
+/// because `write_at` seeds the replacement cluster from the old
+/// compressed payload before it releases anything -- so a bound in the
+/// read path happens to fire first on both paths that read.
+///
+/// `cluster_status_at` is the path that does not read. Its own doc says
+/// it "walks L1/L2 only -- does not read cluster data", and it maps
+/// `ClusterMap::Compressed` straight to `ClusterStatus::Allocated`. With
+/// the bound in the read path it answers `Allocated` for a descriptor
+/// pointing outside the image, and `extents()` is built on it, so a
+/// sparse-aware copier is told the cluster is fine to read. With the
+/// bound in `lookup_cluster` a `ClusterMap::Compressed` cannot be
+/// constructed out of range at all, and every consumer inherits that.
+#[test]
+fn the_status_of_an_out_of_range_compressed_cluster_is_refused_without_reading_it() {
+    let path = tmp_path("compressed_status_past_end");
+    build_compressed_image(&path, 0xCC);
+    let len = std::fs::metadata(&path).unwrap().len();
+    patch(
+        &path,
+        L2_OFFSET,
+        &compressed_descriptor(len + CLUSTER_SIZE, 1).to_be_bytes(),
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let err = r
+        .cluster_status_at(0)
+        .expect_err("a compressed descriptor outside the image must not report Allocated");
+    assert!(
+        matches!(err, qcow2::Error::Corrupt(_)),
+        "expected a refusal from the L1/L2 walk, got {err:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
