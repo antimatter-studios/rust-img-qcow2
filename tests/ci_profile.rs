@@ -241,6 +241,109 @@ enum Sep {
     Amp,
 }
 
+/// Index of the `)` that closes the `$( )` / `<( )` / `>( )` span whose
+/// `(` is at `open`, or `None` if the span is never closed.
+///
+/// # WHY THIS IS NOT A PAREN COUNT
+///
+/// It was one, and it was wrong in BOTH directions, because deciding
+/// where a span ends is itself shell parsing. Verdicts below taken from
+/// `bash -e -c`, not from reading this file:
+///
+/// | line | bash | a bare paren count |
+/// |---|---|---|
+/// | `cat <(echo a\) ; false)` | exit 0 — swallowed | closes at `\)`, so the `false` reads as top-level: **a swallowed suite counted as a gate** |
+/// | `cat <(echo "a)") ; false` | exit 1 — the `false` IS read | closes at the quoted `)`, then the stray `"` opens a quote that eats the rest: **a real gate refused** |
+///
+/// The first is the defect this file exists to prevent. The second is
+/// the one this file's own history warns about — a guard that starts
+/// refusing correct workflows — and it is why a `\)` special case would
+/// not have been a fix.
+///
+/// The rules are the shell's, and the same ones the tokeniser below
+/// already applies fifteen lines on: outside quotes a backslash escapes
+/// the next character; inside `"` it still does; inside `'` there are no
+/// escapes at all and a backslash is data. Parentheses inside any quote
+/// are data.
+fn end_of_substitution(chars: &[char], open: usize) -> Option<usize> {
+    debug_assert_eq!(chars.get(open), Some(&'('), "open must index the `(`");
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut j = open;
+    while j < chars.len() {
+        let c = chars[j];
+        match quote {
+            // No escapes inside `'`; only another `'` ends it.
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(q) => {
+                if c == '\\' && j + 1 < chars.len() {
+                    j += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\\' && j + 1 < chars.len() {
+                    j += 2;
+                    continue;
+                }
+                match c {
+                    '\'' | '"' => quote = Some(c),
+                    '(' => depth += 1,
+                    ')' => {
+                        // `depth` is at least 1 here because `open`
+                        // indexes a `(`; subtracting without checking
+                        // would panic in the debug profile the PR gate
+                        // runs precisely so an overflow is visible.
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Index of the backtick closing the span opened at `open`, or `None`.
+///
+/// Same blindness, same direction: inside backticks a `\` escapes the
+/// next character, so `` `echo a\` ; false` `` is ONE substitution and
+/// its status is swallowed — measured, `exit 0`. Stopping at the escaped
+/// backtick resumed tokenising inside the span and read the `false` as a
+/// top-level command, counting a suite whose failure nothing sees.
+///
+/// Quoting is deliberately NOT tracked here. Backtick spans nest quotes
+/// and escapes in a way that needs its own grammar, no workflow in this
+/// constellation writes one, and an untested branch in a guard is worth
+/// less than a stated limit. The escape is handled because it is the
+/// spelling that produces a FALSE PASS.
+fn end_of_backticks(chars: &[char], open: usize) -> Option<usize> {
+    debug_assert_eq!(chars.get(open), Some(&'`'), "open must index the backtick");
+    let mut j = open + 1;
+    while j < chars.len() {
+        if chars[j] == '\\' && j + 1 < chars.len() {
+            j += 2;
+            continue;
+        }
+        if chars[j] == '`' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
 /// One shell line split into the commands it invokes, each with the
 /// separator that follows it, and with the contents of quoted spans
 /// dropped.
@@ -324,31 +427,28 @@ fn shell_commands(line: &str) -> Vec<(Vec<String>, Sep)> {
         // --all-targets)` split at the `(` into a `cat <` command and a
         // `cargo test` one that looked status-read -- and the guard
         // counted a suite whose failure nothing could see.
+        //
+        // FINDING THE END OF THE SPAN IS ITSELF SHELL PARSING, and the
+        // first version of this counted bare parentheses. See
+        // [`end_of_substitution`]: a `\)` or a `")"` inside the span is
+        // data, and taking either for the close resumed tokenising in
+        // the middle of a span the shell had not left.
         if matches!(c, '$' | '<' | '>') && i + 1 < chars.len() && chars[i + 1] == '(' {
-            let mut depth = 0usize;
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '(' {
-                    depth += 1;
-                } else if chars[j] == ')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                j += 1;
-            }
             started = true;
-            i = if j < chars.len() { j + 1 } else { chars.len() };
+            i = match end_of_substitution(&chars, i + 1) {
+                Some(close) => close + 1,
+                // Unterminated: the shell would not accept this line at
+                // all, and there is no command after it to read.
+                None => chars.len(),
+            };
             continue;
         }
         if c == '`' {
-            let mut j = i + 1;
-            while j < chars.len() && chars[j] != '`' {
-                j += 1;
-            }
             started = true;
-            i = if j < chars.len() { j + 1 } else { chars.len() };
+            i = match end_of_backticks(&chars, i) {
+                Some(close) => close + 1,
+                None => chars.len(),
+            };
             continue;
         }
         match c {
@@ -1827,6 +1927,108 @@ cargo build --locked --release
     /// so `echo $(cargo test --locked --lib)` parsed as three commands
     /// with the inner one looking status-read. Measured:
     /// `bash -e -c 'echo $(false); echo R'` exits 0 and prints R.
+    /// WHERE A SUBSTITUTION ENDS IS SHELL PARSING, NOT A PAREN COUNT.
+    ///
+    /// The scanner counted bare parentheses, so a `)` that the shell
+    /// treats as DATA ended the span early and tokenising resumed
+    /// inside a span the shell had not left. Every verdict below is
+    /// `bash -e -c` on that exact line, taken from bash rather than
+    /// from this file; `exit 0` means the status was swallowed, so the
+    /// suite is not a gate and must not be counted.
+    ///
+    /// | line | bash | must |
+    /// |---|---|---|
+    /// | `cat <(echo a\) ; false)` | 0 | not count |
+    /// | `cat <(echo "a)" ; false)` | 0 | not count |
+    /// | `cat <(echo 'a\)' ; false)` | 0 | not count |
+    /// | `` echo `echo a\` ; false` `` | 0 | not count |
+    /// | `cat <(echo "a)") ; false` | 1 | **count** |
+    /// | `cat <(echo 'a)') ; false` | 1 | **count** |
+    /// | `cat <(echo a\\) ; false` | 1 | **count** |
+    #[test]
+    fn a_paren_the_shell_reads_as_data_does_not_end_a_substitution() {
+        for line in [
+            // THE FILED DEFECT, and it is the false-pass direction: the
+            // escaped `)` looked like the close, so the `cargo test`
+            // after it parsed as a top-level command whose status is
+            // read -- while bash keeps it inside the substitution and
+            // throws its status away.
+            "cat <(echo a\\) ; cargo test --locked --lib)",
+            // The same cause quoted. Correct today only by accident:
+            // the stray `\"` happened to swallow the rest of the line.
+            "cat <(echo \"a)\" ; cargo test --locked --lib)",
+            // Inside `'` a backslash is DATA, so `\\)` does not even
+            // escape -- the `)` is quoted and the span runs on.
+            "cat <(echo 'a\\)' ; cargo test --locked --lib)",
+            // `$( )` is the same span with a different opener.
+            "echo $(echo a\\) ; cargo test --locked --lib)",
+            "echo $(echo \"a)\" ; cargo test --locked --lib)",
+            // And the same `'a\'` shape with the suite INSIDE: bash
+            // closes the quote, so the cargo test is still in the
+            // substitution. `exit 0`, measured.
+            "cat <(echo 'a\\' ; cargo test --locked --lib)",
+        ] {
+            assert_eq!(
+                runs_with_overflow_checks(line),
+                Vec::<String>::new(),
+                "{line}: bash keeps the cargo test inside the substitution and discards \
+                 its status, so counting it would count a probe that does not gate the step"
+            );
+        }
+    }
+
+    /// A BACKSLASH EXTENDS A BACKTICK SPAN TOO, and this one was not in
+    /// the report -- the backtick skip had the identical blindness and
+    /// the identical false-pass direction. Measured:
+    /// `bash -e -c 'echo `echo a\` ; false`'` exits 0.
+    #[test]
+    fn an_escaped_backtick_does_not_end_a_backtick_substitution() {
+        let line = "echo `echo a\\` ; cargo test --locked --lib`";
+        assert_eq!(
+            runs_with_overflow_checks(line),
+            Vec::<String>::new(),
+            "{line}: the escaped backtick keeps the cargo test inside the substitution"
+        );
+    }
+
+    /// THE ACCEPTANCE HALF, AND IT IS THE HALF A `\)` SPECIAL CASE
+    /// WOULD HAVE LEFT BROKEN.
+    ///
+    /// These three end their substitution properly and leave a real
+    /// top-level `cargo test` whose failure DOES end the step. A
+    /// scanner that mis-closes early makes the guard refuse a correct
+    /// workflow, which is the direction this file's own history warns
+    /// about and the direction the quoted spelling actually failed in.
+    #[test]
+    fn a_substitution_that_really_closes_still_leaves_a_gate() {
+        for line in [
+            // Was refused before this change: the scanner closed at the
+            // quoted `)` and the leftover `"` ate the rest of the line.
+            "cat <(echo \"a)\") ; cargo test --locked --lib",
+            "cat <(echo 'a)') ; cargo test --locked --lib",
+            // `\\` is an escaped BACKSLASH, so the `)` after it really
+            // is the close. A scanner that skipped one character per
+            // backslash instead of two would get this backwards.
+            "cat <(echo a\\\\) ; cargo test --locked --lib",
+            // INSIDE `'` A BACKSLASH IS DATA, so `'a\'` is the
+            // literal `a\` and the quote CLOSES at the second `'`.
+            // Treating `'` the way `"` is treated makes the `\'` an
+            // escape, the quote never closes, no `)` is ever found, and
+            // this real gate is silently dropped. `bash -e -c
+            // "cat <(echo 'a\\') ; false"` exits 1 -- it is read.
+            "cat <(echo 'a\\') ; cargo test --locked --lib",
+            // The plain control, unchanged by any of this.
+            "cat <(echo a) ; cargo test --locked --lib",
+        ] {
+            assert_eq!(
+                runs_with_overflow_checks(line),
+                vec![line.to_string()],
+                "{line}: the substitution closes and the cargo test after it is top-level, \
+                 so its failure ends the step and it must still count"
+            );
+        }
+    }
+
     #[test]
     fn a_cargo_test_inside_a_command_substitution_is_not_a_gate() {
         for line in [
