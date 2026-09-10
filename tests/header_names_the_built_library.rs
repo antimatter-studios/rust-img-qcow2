@@ -1,20 +1,30 @@
 //! The header names the library the build actually produces.
 //!
-//! `include/qcow2.h` said "Link with libam_img_qcow2.a" for as long as
-//! the file existed, and cargo has never produced that name: `[lib]
-//! name` is `qcow2`, so the artefact is `libqcow2.a` — which is exactly
-//! what `chores.yml` copies. A C consumer following the header got a
-//! linker error for a library nobody builds.
+//! `include/qcow2.h` said "Link with libam_img_qcow2.a" for as long as the file
+//! existed, and cargo has never produced that name: `[lib] name` is
+//! `qcow2`, so the artefact is `libqcow2.a` — which is exactly what
+//! `chores.yml` copies. A C consumer following the header got a linker
+//! error for a library nobody builds.
 //!
-//! Six of the twelve constellation repositories had the same mismatch
-//! while five had it right and one named no library at all, so it is
-//! not a naming rule anybody applies once — it drifts, and therefore
-//! wants a check.
-//!
-//! **The expected name is DERIVED, not written down here.** It comes
-//! from `Cargo.toml`'s `[lib] name`, which is what decides the artefact
-//! name, so renaming the library fails this test instead of silently
+//! **The expected name is DERIVED from `Cargo.toml`, not written down
+//! here**, so renaming the library fails this test rather than silently
 //! making the header wrong again.
+//!
+//! # Why `toml` and not a hand parse
+//!
+//! The first version of this file hand-parsed `Cargo.toml` by scanning
+//! lines, and rejected three spellings cargo accepts: `name = 'qcow2'`
+//! in single quotes, `name = "qcow2" # comment` with a trailing
+//! comment, and `[lib] # comment` — the last making the test claim the
+//! manifest declares no library at all. A guard that a legal edit to the file it
+//! guards can break is one somebody deletes rather than fixes.
+//!
+//! A guard asserting something about a structured file must PARSE it.
+//! `toml` is a dev-dependency only, so nothing reaches a consumer.
+//!
+//! The C header is the exception, and deliberately: there is no parser
+//! for it here, so `libraries_named` scans. That is a stated limit
+//! rather than a quiet one.
 
 use std::path::Path;
 
@@ -23,28 +33,14 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// `[lib] name` out of `Cargo.toml`, by hand rather than by acquiring a
-/// toml dependency for a test.
+/// `[lib] name`, parsed.
 fn lib_name(cargo_toml: &str) -> Option<String> {
-    let mut in_lib = false;
-    for line in cargo_toml.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_lib = t == "[lib]";
-            continue;
-        }
-        if !in_lib {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("name") {
-            let rest = rest.trim_start().strip_prefix('=')?.trim();
-            return Some(rest.trim_matches('"').to_owned());
-        }
-    }
-    None
+    let doc: toml::Value = toml::from_str(cargo_toml).ok()?;
+    Some(doc.get("lib")?.get("name")?.as_str()?.to_owned())
 }
 
-/// Every `lib<something>.a` the header mentions.
+/// Every `lib<something>.a` the header mentions. A scan, because a C
+/// header has no parser here — see the module note.
 fn libraries_named(header: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in header.lines() {
@@ -70,10 +66,21 @@ fn the_header_tells_consumers_to_link_the_library_that_is_built() {
     let name = lib_name(&cargo).expect("Cargo.toml declares [lib] name");
     let want = format!("lib{name}.a");
 
-    let header = read(&format!("include/{name}.h"));
+    // Named explicitly: a missing header here almost always means the
+    // manifest and the shipped files have drifted apart, and "No such
+    // file" on its own does not say so.
+    let header_path = format!("include/{name}.h");
+    let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(&header_path);
+    assert!(
+        full.exists(),
+        "Cargo.toml declares [lib] name {name:?}, so the build produces {want} and \
+         the C header for it should be {header_path} -- which does not exist. The \
+         manifest and the shipped headers have drifted apart."
+    );
+    let header = read(&header_path);
     let named = libraries_named(&header);
 
-    // Asserted before it is compared: a parse that found nothing would
+    // Asserted before it is compared: a scan that found nothing would
     // make the loop below pass over an empty list, which is the shape
     // of defect this file exists for.
     assert!(
@@ -92,23 +99,125 @@ fn the_header_tells_consumers_to_link_the_library_that_is_built() {
     }
 }
 
-/// The `[lib] name` parse reads the right section.
+/// THE SPELLINGS A HAND PARSE GOT WRONG.
+///
+/// Every one of these is valid TOML that cargo accepts, and every one
+/// of them broke the previous version of this file — two by reading a
+/// mangled name, one by concluding there was no `[lib]` section. They
+/// are here as acceptance cases rather than rejection cases, because
+/// the fix has to be shown to ACCEPT what it used to refuse; a parser
+/// that merely still handles the plain spelling proves nothing.
+#[test]
+fn the_lib_name_is_parsed_rather_than_scanned() {
+    let plain = "[package]\nname = \"am-img-qcow2\"\n\n[lib]\nname = \"qcow2\"\n";
+    let single_quoted = "[package]\nname = \"am-img-qcow2\"\n\n[lib]\nname = 'qcow2'\n";
+    let trailing_comment =
+        "[package]\nname = \"am-img-qcow2\"\n\n[lib]\nname = \"qcow2\" # the exported ABI name\n";
+    let commented_section =
+        "[package]\nname = \"am-img-qcow2\"\n\n[lib] # the staticlib consumers link\nname = \"qcow2\"\n";
+
+    for (what, toml) in [
+        ("the plain spelling", plain),
+        ("a single-quoted string", single_quoted),
+        ("a trailing comment", trailing_comment),
+        ("a comment on the section header", commented_section),
+    ] {
+        assert_eq!(
+            lib_name(toml).as_deref(),
+            Some("qcow2"),
+            "{what} is valid TOML and cargo accepts it, so this guard must too"
+        );
+    }
+}
+
+/// The package name is not the library name.
 #[test]
 fn the_lib_name_comes_from_the_lib_section_and_not_the_package() {
-    let toml = "\
-[package]
-name = \"am-img-qcow2\"
-version = \"0.4.5\"
-
-[lib]
-name = \"qcow2\"
-crate-type = [\"staticlib\", \"rlib\"]
-";
+    let toml = "[package]\nname = \"am-img-qcow2\"\nversion = \"0.4.5\"\n\n\
+                [lib]\nname = \"qcow2\"\ncrate-type = [\"staticlib\", \"rlib\"]\n";
     assert_eq!(
         lib_name(toml).as_deref(),
         Some("qcow2"),
-        "the package name is not the library name, and using it would look for \
-         libam-img-qcow2.a"
+        "using the package name would look for libam-img-qcow2.a"
+    );
+    // And a manifest with no [lib] section has no library name to give.
+    assert_eq!(lib_name("[package]\nname = \"am-img-qcow2\"\n"), None);
+}
+
+/// `vars.LIBNAME` out of `chores.yml`, parsed.
+///
+/// YAML, so it is parsed rather than scanned -- `saphyr` is the adopted
+/// parser for it, the way `toml` is for the manifest, and it is already
+/// a dev-dependency here for `tests/ci_profile.rs`.
+fn chores_libname(chores_yml: &str) -> Option<String> {
+    use saphyr::{LoadableYamlNode, Yaml};
+    let docs = Yaml::load_from_str(chores_yml).ok()?;
+    let doc = docs.first()?;
+    // as_mapping_get, not indexing: saphyr's Index PANICS on a missing
+    // key, so a chores file without the variable would abort the test
+    // rather than report its absence -- and reporting absence is half
+    // of what this function is for.
+    doc.as_mapping_get("vars")?
+        .as_mapping_get("LIBNAME")?
+        .as_str()
+        .map(|s| s.to_owned())
+}
+
+/// THE PACKAGING VARIABLE AGREES WITH THE MANIFEST.
+///
+/// Deleting the shell guard closed the check that could not fail. It
+/// did not give `LIBNAME` a second source: `chores.yml` copies
+/// `target/<triple>/release/lib{{.LIBNAME}}.a`, and what cargo builds is
+/// named by `[lib] name`. Nothing tied the two together, so the header
+/// check compared against the manifest while `LIBNAME` was free to
+/// drift from it independently.
+///
+/// A drift did fail -- but LATE and unrecognisably, after a full release
+/// cross-compile, as `cp: cannot stat .../libNAME.a`. The guard runs
+/// first precisely so a naming mistake costs no build, and this was the
+/// one naming mistake it did not cover.
+#[test]
+fn the_packaging_variable_matches_the_manifest() {
+    let name = lib_name(&read("Cargo.toml")).expect("Cargo.toml declares [lib] name");
+    let libname = chores_libname(&read("chores.yml")).expect("chores.yml declares vars.LIBNAME");
+    assert_eq!(
+        libname, name,
+        "chores.yml sets LIBNAME={libname:?} and Cargo.toml sets [lib] name={name:?}. \
+         cargo builds lib{name}.a, chores copies lib{libname}.a, and the packaging step \
+         fails with `cp: cannot stat` after the release build rather than here."
+    );
+}
+
+/// The chores parse reads YAML rather than matching a line.
+///
+/// The acceptance half, which is the one that gets forgotten: every
+/// spelling below is legal YAML that a maintainer may write, and a
+/// scanner that only handled the plain one would break on an edit to
+/// the file it guards.
+#[test]
+fn the_libname_is_parsed_rather_than_scanned() {
+    for (what, yml) in [
+        ("a plain value", "vars:\n  LIBNAME: qcow2\n"),
+        ("a quoted value", "vars:\n  LIBNAME: \"qcow2\"\n"),
+        (
+            "a trailing comment",
+            "vars:\n  LIBNAME: qcow2 # the linked name\n",
+        ),
+        (
+            "the key named in a comment first",
+            "# LIBNAME: wrong\nvars:\n  LIBNAME: qcow2\n",
+        ),
+    ] {
+        assert_eq!(
+            chores_libname(yml).as_deref(),
+            Some("qcow2"),
+            "{what} is valid YAML, so this guard must read it"
+        );
+    }
+    assert_eq!(
+        chores_libname("tasks:\n  build:\n    cmds: ['cargo build']\n"),
+        None,
+        "a chores file with no LIBNAME has none to report"
     );
 }
 

@@ -72,11 +72,21 @@ zstd = "0.13"
 # JSON parsing for `qemu-img info --output=json` in the qemu-validation
 # test harness. Test-only.
 serde_json = "1"
-# TOML parser for tests/siblings_the_contract_promises.rs, which reads this
-# manifest and refuses a path dependency on an undeclared sibling. It PARSES
-# rather than scans: `path` is legal in four dependency tables, in
-# `[target.'cfg(..)'.dependencies]` and in `[patch]`, and it can be spelled
-# with either quote style, inline or as its own table. Dev-only.
+# TOML parser for the two guards that read this manifest, both of which
+# PARSE rather than scan -- which is the whole point of depending on a
+# parser at all.
+#
+# tests/siblings_the_contract_promises.rs refuses a path dependency on an
+# undeclared sibling: `path` is legal in four dependency tables, in
+# `[target.'cfg(..)'.dependencies]` and in `[patch]`, and it can be
+# spelled with either quote style, inline or as its own table.
+#
+# tests/header_names_the_built_library.rs reads `[lib] name` to check
+# include/qcow2.h's link instruction: a hand-written reader there
+# rejected single quotes, a trailing comment and a commented-out `[lib]`
+# header, all of which are valid TOML this manifest is free to use.
+#
+# Dev-only: neither reaches a consumer of this crate.
 toml = "1.1.5"
 
 [profile.release]
