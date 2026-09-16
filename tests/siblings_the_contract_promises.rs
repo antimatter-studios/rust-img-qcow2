@@ -308,8 +308,9 @@ fn collect_siblings(node: &Yaml, found: &mut BTreeSet<String>) {
 
 /// The words of a shell command line, each paired with whether it sits
 /// in assignment position: among the leading `NAME=value` words of its
-/// command, before the command name. `env` keeps that position open
-/// until its command, and every operand of `export`/`readonly` is in it.
+/// command, before the command name. `env` keeps that position open,
+/// past its options, until its command; every operand of
+/// `export`/`readonly` is in it.
 ///
 /// Deliberately small: quotes, backslash escapes and the separators
 /// that start a new command, and a `#` comment. It does not expand anything, so it cannot
@@ -318,9 +319,7 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    let mut at_command_start = true;
-    // Inside `export`/`readonly`, every operand is an assignment.
-    let mut declaring = false;
+    let mut position = Position::Leading;
     let mut quote: Option<char> = None;
     let mut chars = text.chars();
 
@@ -328,23 +327,11 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
         words: &mut Vec<(String, bool)>,
         word: &mut String,
         in_word: &mut bool,
-        at_command_start: &mut bool,
-        declaring: &mut bool,
+        position: &mut Position,
     ) {
         if *in_word {
-            let assignment =
-                (*at_command_start || *declaring) && shell_assignment_value(word).is_some();
-            if *at_command_start && !assignment {
-                match word.as_str() {
-                    // `env` takes assignments before the command it runs.
-                    "env" => {}
-                    "export" | "readonly" => {
-                        *declaring = true;
-                        *at_command_start = false;
-                    }
-                    _ => *at_command_start = false,
-                }
-            }
+            let (assignment, next) = position.after(word);
+            *position = next;
             words.push((std::mem::take(word), assignment));
             *in_word = false;
         }
@@ -377,8 +364,7 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
                             break;
                         }
                     }
-                    at_command_start = true;
-                    declaring = false;
+                    position = Position::Leading;
                 }
                 '\'' | '"' => {
                     quote = Some(c);
@@ -391,24 +377,11 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
                     }
                 }
                 ';' | '&' | '|' | '\n' => {
-                    finish(
-                        &mut words,
-                        &mut word,
-                        &mut in_word,
-                        &mut at_command_start,
-                        &mut declaring,
-                    );
-                    at_command_start = true;
-                    declaring = false;
+                    finish(&mut words, &mut word, &mut in_word, &mut position);
+                    position = Position::Leading;
                 }
                 c if c.is_whitespace() => {
-                    finish(
-                        &mut words,
-                        &mut word,
-                        &mut in_word,
-                        &mut at_command_start,
-                        &mut declaring,
-                    );
+                    finish(&mut words, &mut word, &mut in_word, &mut position);
                 }
                 _ => {
                     in_word = true;
@@ -417,14 +390,64 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
             },
         }
     }
-    finish(
-        &mut words,
-        &mut word,
-        &mut in_word,
-        &mut at_command_start,
-        &mut declaring,
-    );
+    finish(&mut words, &mut word, &mut in_word, &mut position);
     words
+}
+
+/// Where a word sits in its command, for deciding whether a
+/// `NAME=value` word is an assignment.
+#[derive(Clone, Copy)]
+enum Position {
+    /// Before the command name: a `NAME=value` word is an assignment.
+    Leading,
+    /// After `env`: its options, then assignments, then its command.
+    EnvOptions,
+    /// The operand of an `env` option that takes one (`-u NAME`,
+    /// `-C DIR`). It is never an assignment.
+    EnvOperand,
+    /// The operands of `export`/`readonly`: every `NAME=value` is one.
+    Declaring,
+    /// Arguments to a command: nothing is an assignment.
+    Arguments,
+}
+
+impl Position {
+    /// Whether `word` is an assignment here, and the position of the
+    /// word after it.
+    fn after(self, word: &str) -> (bool, Position) {
+        let shaped = shell_assignment_value(word).is_some();
+        match self {
+            Position::Leading if shaped => (true, Position::Leading),
+            Position::Leading => match word {
+                "env" => (false, Position::EnvOptions),
+                "export" | "readonly" => (false, Position::Declaring),
+                _ => (false, Position::Arguments),
+            },
+            Position::EnvOptions if shaped => (true, Position::Leading),
+            Position::EnvOptions => {
+                // `--` needs no case of its own: it is read as a long
+                // option, and what follows is assignments or the command.
+                if word == "--unset" || word == "--chdir" {
+                    (false, Position::EnvOperand)
+                } else if word.starts_with("--") {
+                    (false, Position::EnvOptions)
+                } else if let Some(flags) = word.strip_prefix('-').filter(|f| !f.is_empty()) {
+                    // A cluster such as `-iu` takes the next word as the
+                    // operand of its last flag.
+                    if flags.ends_with(['u', 'C']) {
+                        (false, Position::EnvOperand)
+                    } else {
+                        (false, Position::EnvOptions)
+                    }
+                } else {
+                    (false, Position::Arguments)
+                }
+            }
+            Position::EnvOperand => (false, Position::EnvOptions),
+            Position::Declaring => (shaped, Position::Declaring),
+            Position::Arguments => (false, Position::Arguments),
+        }
+    }
 }
 
 fn manifest() -> String {
@@ -804,6 +827,8 @@ fn an_assignment_shaped_argument_declares_nothing() {
         "echo a # ; NOTE=../rust-partitions",
         "env make NOTE=../rust-partitions",
         "export SRC=x; echo NOTE=../rust-partitions",
+        "env -i make NOTE=../rust-partitions",
+        "env -u NOTE=../rust-partitions make",
     ] {
         let chores = format!(
             "tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n    sources:\n      - Cargo.toml\n"
@@ -829,6 +854,13 @@ fn an_assignment_shaped_argument_declares_nothing() {
         "readonly SRC=../rust-fs-core/include",
         "env SRC=../rust-fs-core/include make",
         "env A=1 SRC=../rust-fs-core/include make",
+        "env -i SRC=../rust-fs-core/include make",
+        "env -u NAME SRC=../rust-fs-core/include make",
+        "env -iu NAME SRC=../rust-fs-core/include make",
+        "env --unset=NAME SRC=../rust-fs-core/include make",
+        "env --unset NAME SRC=../rust-fs-core/include make",
+        "env -C dir SRC=../rust-fs-core/include make",
+        "env -- SRC=../rust-fs-core/include make",
     ] {
         let chores = format!("tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n");
         let declares = siblings_the_contract_declares(&chores);
