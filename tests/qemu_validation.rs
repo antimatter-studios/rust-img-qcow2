@@ -318,6 +318,67 @@ fn qemu_info_reports_backing_path_on_our_child() {
     assert_eq!(backing, &Value::String(rel));
 }
 
+/// The backing-file name must END inside the first cluster, not only
+/// start there.
+///
+/// A real qemu child's name is moved so it starts 3 bytes before the end
+/// of the header cluster and runs into cluster 1. The validator refuses
+/// that ("Backing file name too long": `size > cluster_size - offset`).
+/// This reader used to open it and follow the name to the parent, which
+/// is how bytes outside the header cluster, possibly the guest's own,
+/// come to choose the host file opened as the parent.
+#[test]
+fn a_backing_name_running_past_the_first_cluster_is_refused_by_the_validator_and_by_us() {
+    let parent = tmp_path("longname-parent");
+    let child = tmp_path("longname-child");
+    qemu_create(&parent, "1M");
+    let name = parent.file_name().unwrap().to_str().unwrap();
+    assert_qemu(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-b",
+        name,
+        "-F",
+        "qcow2",
+        child.to_str().unwrap(),
+    ]);
+    // Control: the unmodified child opens in both, with its parent.
+    qemu_check(&child);
+    assert!(Qcow2Reader::open(&child).unwrap().has_backing());
+
+    let cluster_size = 1u64 << read_be32(&child, 20);
+    let size = read_be32(&child, 16) as u64;
+    assert_eq!(size, name.len() as u64, "qemu wrote the name we gave it");
+    let moved = cluster_size - 3;
+    patch(&child, moved, name.as_bytes());
+    patch(&child, 8, &moved.to_be_bytes());
+
+    let out = run_qemu(&["info", child.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "the validator was expected to refuse a name ending past the first cluster:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    match Qcow2Reader::open(&child) {
+        Err(qcow2::Error::Corrupt(_)) => {}
+        Err(other) => panic!("expected Corrupt, got {other:?}"),
+        Ok(r) => panic!(
+            "expected a refusal; opened it with has_backing() = {}",
+            r.has_backing()
+        ),
+    }
+}
+
+/// Read a big-endian `u32` out of an image on disk.
+fn read_be32(path: &Path, off: u64) -> u32 {
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut b = [0u8; 4];
+    f.read_exact_at(&mut b, off).unwrap();
+    u32::from_be_bytes(b)
+}
+
 /// Read a big-endian `u64` out of an image on disk.
 fn read_be64(path: &Path, off: u64) -> u64 {
     let mut f = std::fs::File::open(path).unwrap();
