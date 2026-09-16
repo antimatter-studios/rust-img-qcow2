@@ -69,6 +69,35 @@ jobs:
         working-directory: rust-img-qcow2
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  # A 32-bit target, because some defects only exist there: a `u64` narrowed
+  # with `as usize` keeps its low 32 bits, and on a 64-bit runner every
+  # `u64` fits, so the test for it is `#[cfg(target_pointer_width = "32")]`
+  # and compiles out of every other job (#62). Library unit tests only.
+  test-32bit:
+    name: test / i686-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rust-img-qcow2
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.10
+          path: rust-fs-core
+      - name: install a 32-bit C toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-img-qcow2
+      - name: lib tests (32-bit)
+        working-directory: rust-img-qcow2
+        run: cargo test --locked --lib --target i686-unknown-linux-gnu
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
