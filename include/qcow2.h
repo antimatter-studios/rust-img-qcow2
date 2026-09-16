@@ -43,12 +43,15 @@ extern "C" {
  * maintain refcounts, and copy a cluster up from the backing chain
  * before overwriting part of it.
  *
- * Still refused, with FS_CORE_CUSTOM and detail in
- * fs_core_last_error_message():
- *   - images with internal snapshots (nb_snapshots > 0)
+ * Images with internal snapshots are writable: a cluster or L2 table a
+ * snapshot shares is copied before it is written.
+ *
+ * Still refused when a write has to allocate a cluster or read a refcount,
+ * with FS_CORE_CUSTOM and detail in fs_core_last_error_message():
  *   - refcount_order != 4 (only u16 refcounts are handled)
- *   - images with no refcount table, or whose refcount blocks are all
- *     full (refcount-block growth is not implemented)
+ *   - images with no refcount table
+ *   - images whose refcount blocks are all full AND whose refcount table
+ *     has no empty slot for a new block (the table itself is not grown)
  *
  * A write to a COMPRESSED cluster allocates an uncompressed one in its
  * place rather than re-compressing.

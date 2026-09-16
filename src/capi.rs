@@ -27,11 +27,10 @@ pub unsafe extern "C" fn qcow2_open(path: *const c_char) -> *mut FsCoreDevice {
     open_path(path, false)
 }
 
-/// Open `path` read-write. Subject to the Phase A constraints documented
-/// on [`Qcow2Reader::write_at`] — writes succeed only against
-/// already-allocated, single-reference, uncompressed clusters; everything
-/// else returns `FS_CORE_CUSTOM` with detail in
-/// `fs_core_last_error_message()`.
+/// Open `path` read-write. Writes allocate clusters, copy shared ones
+/// before changing them, and copy up from the backing chain; the few
+/// refusals left are listed on [`Qcow2Reader::write_at`] and return
+/// `FS_CORE_CUSTOM` with detail in `fs_core_last_error_message()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qcow2_open_rw(path: *const c_char) -> *mut FsCoreDevice {
     open_path(path, true)
