@@ -252,15 +252,23 @@ fn shell_assignment_value(token: &str) -> Option<&str> {
 /// each to `sibling_of` puts one normaliser in charge of both halves,
 /// which is what makes the manifest side and this side agree.
 ///
-/// A `cmds:` entry is shell, so quotes and redirections are stripped
-/// from each word: `cp "../rust-fs-core/include/fs_core.h" "$OUT"` has
+/// A `cmds:` entry is shell, so it is split into words the way the
+/// shell splits it -- quotes removed, a backslash escaping the next
+/// character -- and `cp "../rust-fs-core/include/fs_core.h" "$OUT"` has
 /// to yield `rust-fs-core`.
+///
+/// ASSIGNMENTS ARE RECOGNISED BY POSITION. `SRC=../rust-fs-core/include`
+/// is an assignment only among the leading words of a command, before
+/// its name; after it, `echo NOTE=../rust-partitions` is an argument and
+/// reading its value as a path would declare a sibling nothing
+/// provisions. A new command starts at an unquoted, unescaped `;`, `&`,
+/// `|` or newline, so `&&` and `||` are covered and a separator inside
+/// quotes is not one.
 fn collect_siblings(node: &Yaml, found: &mut BTreeSet<String>) {
     match node {
         Yaml::Value(_) => {
             if let Some(text) = node.as_str() {
-                for word in text.split_whitespace() {
-                    let word = word.trim_matches(|c| c == '"' || c == '\'' || c == ';');
+                for (word, in_assignment_position) in shell_words(text) {
                     // A SHELL ASSIGNMENT CARRIES A PATH, and dropping
                     // it was a regression this tokeniser introduced.
                     // `SRC=../rust-fs-core/include; cp "$SRC/..." ...`
@@ -273,7 +281,11 @@ fn collect_siblings(node: &Yaml, found: &mut BTreeSet<String>) {
                     // undeclared. On this half that is the
                     // false-POSITIVE direction: loud, not silent, but
                     // still a guard refusing a correct file.
-                    let word = shell_assignment_value(word).unwrap_or(word);
+                    let word = if in_assignment_position {
+                        shell_assignment_value(&word).unwrap_or(&word)
+                    } else {
+                        &word
+                    };
                     if let Some(sibling) = sibling_of(word) {
                         found.insert(sibling);
                     }
@@ -292,6 +304,92 @@ fn collect_siblings(node: &Yaml, found: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// The words of a shell command line, each paired with whether it sits
+/// in assignment position: among the leading `NAME=value` words of its
+/// command, before the command name.
+///
+/// Deliberately small: quotes, backslash escapes and the separators
+/// that start a new command, and a `#` comment. It does not expand anything, so it cannot
+/// invent a word the text does not contain.
+fn shell_words(text: &str) -> Vec<(String, bool)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut at_command_start = true;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+
+    fn finish(
+        words: &mut Vec<(String, bool)>,
+        word: &mut String,
+        in_word: &mut bool,
+        at_command_start: &mut bool,
+    ) {
+        if *in_word {
+            let assignment = *at_command_start && shell_assignment_value(word).is_some();
+            words.push((std::mem::take(word), assignment));
+            *at_command_start = assignment;
+            *in_word = false;
+        }
+    }
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                _ => word.push(c),
+            },
+            None => match c {
+                // A comment starts only where a word could, and runs to
+                // the end of the line: text in it provisions nothing.
+                '#' if !in_word => {
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            break;
+                        }
+                    }
+                    at_command_start = true;
+                }
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                '\\' => {
+                    in_word = true;
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                ';' | '&' | '|' | '\n' => {
+                    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+                    at_command_start = true;
+                }
+                c if c.is_whitespace() => {
+                    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+                }
+                _ => {
+                    in_word = true;
+                    word.push(c);
+                }
+            },
+        }
+    }
+    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+    words
 }
 
 fn manifest() -> String {
@@ -639,6 +737,59 @@ fn a_path_carried_by_a_shell_assignment_still_declares() {
         assert!(
             !declares.contains("rust-partitions"),
             "{what} is not a shell assignment; it declares nothing. Read {declares:?}"
+        );
+    }
+}
+
+/// AN ASSIGNMENT IS ONE ONLY IN ASSIGNMENT POSITION: the leading run of
+/// `NAME=value` words of a command, before its command name.
+///
+/// `echo NOTE=../rust-partitions` is an ARGUMENT that happens to look
+/// like an assignment. Reading it as one puts `rust-partitions` in
+/// `declares` while nothing provisions it, which silences the guard for
+/// that name -- #75's defect one level down, inside a shell command.
+/// A separator inside quotes, escaped, or in a comment does not start a
+/// new command either.
+///
+/// The positive half pins what position does admit: a prefix
+/// assignment, a second prefix after the first, and a leading
+/// assignment after each of `;`, `&&`, `||`, `|` and a newline.
+#[test]
+fn an_assignment_shaped_argument_declares_nothing() {
+    for command in [
+        "echo NOTE=../rust-partitions",
+        "cp a b NOTE=../rust-partitions",
+        "make -j4 SRC=../rust-partitions",
+        "echo \"a; NOTE=../rust-partitions\"",
+        "echo 'a && NOTE=../rust-partitions'",
+        "echo a\\; NOTE=../rust-partitions",
+        "echo a # ; NOTE=../rust-partitions",
+    ] {
+        let chores = format!(
+            "tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n    sources:\n      - Cargo.toml\n"
+        );
+        let declares = siblings_the_contract_declares(&chores);
+        assert!(
+            !declares.contains("rust-partitions"),
+            "`{command}` passes an argument, not an assignment; it declares nothing. \
+             Read {declares:?}"
+        );
+    }
+
+    for command in [
+        "SRC=../rust-fs-core/include make",
+        "A=1 SRC=../rust-fs-core/include make",
+        "cd x; SRC=../rust-fs-core/include make",
+        "true && SRC=../rust-fs-core/include make",
+        "false || SRC=../rust-fs-core/include make",
+        "echo x | SRC=../rust-fs-core/include make",
+        "echo x\nSRC=../rust-fs-core/include make",
+    ] {
+        let chores = format!("tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n");
+        let declares = siblings_the_contract_declares(&chores);
+        assert!(
+            declares.contains("rust-fs-core"),
+            "`{command}` assigns in assignment position, so it declares. Read {declares:?}"
         );
     }
 }
