@@ -121,6 +121,10 @@ const L1_RESERVED_MASK: u64 = 0x7f00_0000_0000_01ff;
 /// 56..=61. Bit 0 is the v3 zero flag, 9..=55 the host offset, 62 the
 /// compressed flag and 63 COPIED.
 ///
+/// ON A VERSION 2 IMAGE BIT 0 IS RESERVED TOO ("With version 2 ... this
+/// is always 0"), so it is added to this mask there rather than being
+/// ignored; see `lookup_cluster`.
+///
 /// The disk-image validator reports a violation as "found l2 entry with
 /// reserved bits set" and refuses to convert the image; the bits are
 /// how a producer says something this reader would not understand, so
@@ -1494,7 +1498,15 @@ impl Qcow2Reader {
         // reserved spans either side of the offset field must be clear
         // before anything in it is believed — including the zero flag,
         // which is bit 0 of the same word.
-        if l2_entry & L2_RESERVED_MASK != 0 {
+        let reserved = if self.header.version >= 3 {
+            L2_RESERVED_MASK
+        } else {
+            // Bit 0 is the zero flag only from v3. Ignoring it on v2
+            // served the host cluster where the validator refuses the
+            // image ("Zero cluster entry found in pre-v3 image").
+            L2_RESERVED_MASK | L2_FLAG_ZERO
+        };
+        if l2_entry & reserved != 0 {
             return Err(Error::Corrupt("L2 entry has reserved bits set"));
         }
         if self.header.version >= 3 && (l2_entry & L2_FLAG_ZERO) != 0 {
