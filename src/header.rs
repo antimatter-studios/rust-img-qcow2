@@ -277,6 +277,22 @@ impl Header {
                 "backing_file_offset is past the first cluster, where the name cannot be",
             ));
         }
+        // AND THE NAME MUST END THERE TOO. The offset gate alone let
+        // `offset + size` run into cluster 1, which can be a guest data
+        // cluster, so the guest could still supply the path. The
+        // reference refuses "Backing file name too long" when
+        // `size > cluster_size - offset`. The subtraction cannot wrap
+        // because of the check above, which is why the two are ordered.
+        let room = cluster_size
+            .checked_sub(backing_file_offset)
+            .ok_or(Error::Corrupt(
+                "backing_file_offset is past the first cluster",
+            ))?;
+        if u64::from(backing_file_size) > room {
+            return Err(Error::Corrupt(
+                "backing-file name runs past the first cluster, where it cannot be",
+            ));
+        }
 
         Ok(Header {
             version,
@@ -803,6 +819,48 @@ mod tests {
             set_u64(&mut b, offsets::BACKING_FILE_OFFSET, off);
             Header::parse(&b)
                 .unwrap_or_else(|e| panic!("offset {off} is inside the first cluster: {e:?}"));
+        }
+    }
+
+    /// The NAME must END inside the first cluster too, not only start
+    /// there.
+    ///
+    /// Bounding the offset alone let `offset + size` run into cluster 1,
+    /// which can be a guest data cluster: the guest then supplies the
+    /// parent's path. The reference refuses with "Backing file name too
+    /// long" when `size > cluster_size - offset`.
+    #[test]
+    fn a_backing_file_name_that_runs_past_the_first_cluster_is_refused() {
+        // cluster_bits is 16 in the fixture, so one cluster is 65536.
+        for (off, size) in [(65536u64, 1u32), (65526, 11), (0, 65537), (1, 65536)] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, offsets::BACKING_FILE_OFFSET, off);
+            set_u32(&mut b, offsets::BACKING_FILE_SIZE, size);
+            match Header::parse(&b) {
+                Err(Error::Corrupt(m)) => assert!(
+                    m.contains("first cluster"),
+                    "offset {off} size {size}: the refusal must name the bound, got {m:?}"
+                ),
+                other => panic!(
+                    "offset {off} size {size} ends past the first cluster; expected Corrupt, \
+                     got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The other side of that bound: a name ending exactly at the end of
+    /// the first cluster is accepted, and a zero size at offset 65536 is
+    /// how a name-less offset still parses.
+    #[test]
+    fn a_backing_file_name_ending_inside_the_first_cluster_is_accepted() {
+        for (off, size) in [(65526u64, 10u32), (65536, 0), (512, 64), (0, 1024)] {
+            let mut b = valid_v3_header();
+            set_u64(&mut b, offsets::BACKING_FILE_OFFSET, off);
+            set_u32(&mut b, offsets::BACKING_FILE_SIZE, size);
+            Header::parse(&b).unwrap_or_else(|e| {
+                panic!("offset {off} size {size} ends inside the first cluster: {e:?}")
+            });
         }
     }
 
