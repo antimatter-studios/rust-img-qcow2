@@ -371,12 +371,10 @@ impl Qcow2Reader {
     /// Open `path` read-write. Backing parents (if any) are still opened
     /// read-only — writes only ever land in the leaf image.
     ///
-    /// Phase A scope: writes succeed only against clusters that are already
-    /// allocated in this image with refcount = 1 (uncompressed, not
-    /// zero-flagged, no snapshots). Writes that would need cluster
-    /// allocation, copy-on-write, decompression, or snapshot-aware refcount
-    /// updates return `Error::Unsupported(...)`. See `write_at` for the
-    /// exact rejection list.
+    /// Writes allocate clusters, copy shared clusters and shared L2
+    /// tables before changing them, replace compressed clusters with
+    /// uncompressed ones, and copy up from the backing chain. See
+    /// [`Qcow2Reader::write_at`] for what is still refused.
     pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
         let dev = FileDevice::open_rw(p).map_err(fs_core_to_qcow2_error)?;
@@ -643,12 +641,18 @@ impl Qcow2Reader {
     /// `dev.flush()` between each step. A crash mid-allocation may leak a
     /// cluster but never corrupts the image.
     ///
-    /// Refused with [`Error::Unsupported`]:
+    /// Internal snapshots are not refused: a cluster or L2 table they
+    /// share is copied before it is written (see `plan_write` and
+    /// `update_l2_entry`).
     ///
-    /// - Image with `nb_snapshots > 0` (snapshot-aware CoW is Phase D).
+    /// Refused with [`Error::Unsupported`] when the write has to allocate
+    /// a cluster or read a refcount (a cluster whose L2 entry lacks
+    /// COPIED); a plain in-place write reaches none of these:
+    ///
     /// - Image with `refcount_order != 4` (only u16 refcounts handled).
-    /// - Image with no refcount table, or no free entry in any refcount
-    ///   block (refcount-block growth is Phase D).
+    /// - Image with no refcount table.
+    /// - Every refcount block full AND no empty refcount-table slot to
+    ///   grow a new block into (the refcount table itself is never grown).
     ///
     /// Refused with [`Error::ReadOnly`]: image opened via `open()`.
     /// Refused with [`Error::OutOfBounds`]: range past virtual size.
@@ -1724,7 +1728,7 @@ impl fs_core::BlockRead for Qcow2Reader {
     }
 }
 
-/// Phase A write support: forwards to inherent `write_at` / `flush` /
+/// Write support: forwards to inherent `write_at` / `flush` /
 /// `is_writable`. Read-only images keep returning `ReadOnly` from the
 /// inherent `write_at`, which maps cleanly to `fs_core::Error::ReadOnly`.
 impl fs_core::BlockDevice for Qcow2Reader {
