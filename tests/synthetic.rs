@@ -1705,3 +1705,192 @@ fn the_status_of_an_out_of_range_compressed_cluster_is_refused_without_reading_i
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Counts the bytes written through a device, so a test can say how much
+/// metadata a write carried.
+struct CountingWrites {
+    inner: fs_core::FileDevice,
+    written: std::sync::atomic::AtomicU64,
+    /// Every read as `(offset, len)`, so a test can say what was re-read.
+    reads: std::sync::Mutex<Vec<(u64, usize)>>,
+}
+
+impl fs_core::BlockRead for CountingWrites {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.reads.lock().unwrap().push((offset, buf.len()));
+        self.inner.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        fs_core::BlockRead::size_bytes(&self.inner)
+    }
+}
+
+impl fs_core::BlockDevice for CountingWrites {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        self.written
+            .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        fs_core::BlockDevice::write_at(&self.inner, offset, buf)
+    }
+    fn flush(&self) -> fs_core::Result<()> {
+        fs_core::BlockDevice::flush(&self.inner)
+    }
+    fn is_writable(&self) -> bool {
+        fs_core::BlockDevice::is_writable(&self.inner)
+    }
+}
+
+/// #44: AN ALLOCATING WRITE CARRIES THE METADATA IT CHANGES, NOT WHOLE
+/// METADATA CLUSTERS.
+///
+/// Allocating one cluster changes a 2-byte refcount entry and an 8-byte
+/// L2 entry. The writer read the whole refcount block and the whole L2
+/// table and wrote both back, so every allocated cluster cost two
+/// clusters of metadata writes (measured at a 64 KiB cluster: 192 KiB
+/// written per 64 KiB of payload). Two allocating writes here, each one
+/// cluster of payload.
+#[test]
+fn an_allocating_write_writes_back_only_the_metadata_it_changes() {
+    let path = tmp_path("metadata_write_bytes");
+    build_image(&path);
+
+    let dev = std::sync::Arc::new(CountingWrites {
+        inner: fs_core::FileDevice::open_rw(&path).unwrap(),
+        written: std::sync::atomic::AtomicU64::new(0),
+        reads: std::sync::Mutex::new(Vec::new()),
+    });
+    let r = Qcow2Reader::open_rw_on_device(dev.clone()).unwrap();
+
+    // Virt cluster 1 is unallocated and 3 is zero-flagged: both allocate.
+    let payload = CLUSTER_SIZE as usize;
+    r.write_at(CLUSTER_SIZE, &vec![0x11; payload]).unwrap();
+    r.write_at(3 * CLUSTER_SIZE, &vec![0x33; payload]).unwrap();
+    r.flush().unwrap();
+
+    let written = dev.written.load(std::sync::atomic::Ordering::SeqCst);
+    let metadata = written - 2 * payload as u64;
+    // 2 bytes of refcount + 8 bytes of L2 per allocation is 20; allow
+    // slack for a layout that also touches an L1 entry, but not a cluster.
+    assert!(
+        metadata <= 64,
+        "two allocating writes carried {metadata} bytes of metadata ({written} written in \
+         all); each changes a 2-byte refcount entry and an 8-byte L2 entry"
+    );
+
+    // And the writes landed.
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; payload];
+    r.read_at(CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x11));
+    r.read_at(3 * CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x33));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #44: AN ALLOCATION DOES NOT RE-READ THE REFCOUNT TABLE, OR THE FULL
+/// BLOCKS AN EARLIER ALLOCATION ALREADY WALKED PAST.
+///
+/// `allocate_cluster` read the whole refcount table and then every
+/// present refcount block from block 0, entry 0, on every call, so as an
+/// image filled each allocation walked more full blocks first. Here block
+/// 0 is full and block 1 has room: the first allocation has to read block
+/// 0 to learn that, and the second must not.
+#[test]
+fn a_second_allocation_resumes_where_the_first_left_off() {
+    use std::os::unix::fs::FileExt;
+    let path = tmp_path("allocation_resumes");
+    build_image(&path);
+    let refcount_block_1 = 7 * CLUSTER_SIZE;
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Block 0 governs host clusters 0..2048: all in use.
+        f.write_all_at(
+            &[0u8, 1].repeat(CLUSTER_SIZE as usize / 2),
+            REFCOUNT_BLOCK_OFFSET,
+        )
+        .unwrap();
+        // Refcount table slot 1 -> an empty block 1 at host cluster 7.
+        f.write_all_at(&refcount_block_1.to_be_bytes(), REFCOUNT_TABLE_OFFSET + 8)
+            .unwrap();
+    }
+
+    let dev = std::sync::Arc::new(CountingWrites {
+        inner: fs_core::FileDevice::open_rw(&path).unwrap(),
+        written: std::sync::atomic::AtomicU64::new(0),
+        reads: std::sync::Mutex::new(Vec::new()),
+    });
+    let r = Qcow2Reader::open_rw_on_device(dev.clone()).unwrap();
+    let payload = CLUSTER_SIZE as usize;
+
+    r.write_at(CLUSTER_SIZE, &vec![0x11; payload]).unwrap();
+    dev.reads.lock().unwrap().clear();
+    r.write_at(3 * CLUSTER_SIZE, &vec![0x33; payload]).unwrap();
+    r.flush().unwrap();
+
+    let reads = dev.reads.lock().unwrap().clone();
+    let touches = |start: u64| {
+        reads
+            .iter()
+            .any(|&(off, len)| off < start + CLUSTER_SIZE && start < off + len as u64)
+    };
+    assert!(
+        !touches(REFCOUNT_TABLE_OFFSET),
+        "the second allocation re-read the refcount table: {reads:?}"
+    );
+    assert!(
+        !touches(REFCOUNT_BLOCK_OFFSET),
+        "the second allocation re-read full refcount block 0: {reads:?}"
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; payload];
+    r.read_at(CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x11));
+    r.read_at(3 * CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x33));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #44: A CLUSTER FREED BEHIND THE ALLOCATOR'S CURSOR IS HANDED OUT AGAIN.
+///
+/// The allocator resumes its scan where the last allocation succeeded
+/// rather than from host cluster 0. Rewriting a compressed cluster frees
+/// the old one, which sits below that point; if freeing it did not move
+/// the cursor back, the image would grow forever past a free cluster.
+#[test]
+fn a_freed_cluster_behind_the_allocation_cursor_is_reused() {
+    use std::os::unix::fs::FileExt;
+    let path = tmp_path("freed_cluster_reused");
+    build_compressed_image(&path, 0xCC);
+    let compressed_host = CLUSTER_SIZE * 3;
+    {
+        let r = Qcow2Reader::open_rw(&path).unwrap();
+        // Replaces compressed cluster 3 with a fresh one and frees 3.
+        r.write_at(0, &[0x11u8; 16]).unwrap();
+        // Virt cluster 1 is unallocated: this allocation should take 3.
+        r.write_at(CLUSTER_SIZE, &vec![0x22u8; CLUSTER_SIZE as usize])
+            .unwrap();
+        r.flush().unwrap();
+    }
+    let mut entry = [0u8; 8];
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_exact_at(&mut entry, L2_OFFSET + 8)
+        .unwrap();
+    let host = u64::from_be_bytes(entry) & HOST_OFFSET_MASK;
+    assert_eq!(
+        host, compressed_host,
+        "virt cluster 1 landed at host {host:#x}, not the freed cluster at {compressed_host:#x}"
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; CLUSTER_SIZE as usize];
+    r.read_at(CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x22));
+    r.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..16], &[0x11; 16]);
+    assert!(buf[16..].iter().all(|&b| b == 0xCC));
+
+    let _ = std::fs::remove_file(&path);
+}

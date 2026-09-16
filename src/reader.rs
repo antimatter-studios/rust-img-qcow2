@@ -325,6 +325,19 @@ pub struct Qcow2Reader {
     /// then reject a cluster this reader had just written. This is the
     /// same number, kept honest.
     image_len: Mutex<u64>,
+    /// The refcount table, read on the first allocation and kept (#44).
+    ///
+    /// Every allocation used to read it whole. Only this reader writes it
+    /// -- pass 2 of [`Qcow2Reader::allocate_cluster`] publishing a new
+    /// block -- and that write updates the copy here too.
+    refcount_table: Mutex<Option<Vec<u8>>>,
+    /// The host cluster index the allocator's scan resumes from (#44).
+    ///
+    /// Every present refcount entry below it was non-zero when last
+    /// looked at. The scan used to restart at block 0, entry 0, so each
+    /// allocation walked every full block before it; it now starts here,
+    /// and a refcount dropped to zero moves the cursor back down.
+    alloc_cursor: Mutex<u64>,
 }
 
 /// The length of a table, once it is known to be inside the image.
@@ -528,6 +541,8 @@ impl Qcow2Reader {
             backing,
             writable,
             image_len: Mutex::new(image_len),
+            refcount_table: Mutex::new(None),
+            alloc_cursor: Mutex::new(0),
         })
     }
 
@@ -942,24 +957,38 @@ impl Qcow2Reader {
         let rt_size = rt_clusters
             .checked_mul(cluster_size)
             .ok_or(Error::Corrupt("refcount table size overflows"))?;
-        let mut rt_bytes = vec![
-            0u8;
-            span_inside_the_image(
-                self.dev.size_bytes(),
-                rt_off,
-                rt_size,
-                "refcount table reaches past the end of the image",
-            )?
-        ];
-        self.dev_read(rt_off, &mut rt_bytes)?;
+        let mut rt_guard = self.refcount_table.lock().expect("refcount table lock");
+        if rt_guard.is_none() {
+            let mut rt_bytes = vec![
+                0u8;
+                span_inside_the_image(
+                    self.dev.size_bytes(),
+                    rt_off,
+                    rt_size,
+                    "refcount table reaches past the end of the image",
+                )?
+            ];
+            self.dev_read(rt_off, &mut rt_bytes)?;
+            *rt_guard = Some(rt_bytes);
+        }
+        let rt_bytes = rt_guard.as_mut().expect("loaded above");
+        let mut cursor = self.alloc_cursor.lock().expect("alloc cursor lock");
 
-        let rt_entries_total = (rt_size / TABLE_ENTRY_BYTES) as usize;
+        let rt_entries_total = rt_bytes.len() / TABLE_ENTRY_BYTES as usize;
+        let start_block = usize::try_from(*cursor / entries_per_block).unwrap_or(usize::MAX);
+        let start_entry = (*cursor % entries_per_block) as usize;
 
-        // Pass 1: walk the table. For each present block try to claim a
-        // free slot. Remember the first absent slot in case pass 1 yields
-        // nothing.
-        let mut first_empty_block_slot: Option<usize> = None;
-        for block_idx in 0..rt_entries_total {
+        // The first absent slot, for pass 2, over the whole table: it is
+        // resident, so this costs no device reads, and a slot below the
+        // cursor may still be absent.
+        let first_empty_block_slot = (0..rt_entries_total).find(|&i| {
+            let at = i * TABLE_ENTRY_BYTES as usize;
+            rt_bytes[at..at + TABLE_ENTRY_BYTES as usize] == [0u8; 8]
+        });
+
+        // Pass 1: walk the table from the cursor. For each present block
+        // try to claim a free slot.
+        for block_idx in start_block..rt_entries_total {
             let entry_off = block_idx * TABLE_ENTRY_BYTES as usize;
             let block_off = u64::from_be_bytes(
                 rt_bytes[entry_off..entry_off + TABLE_ENTRY_BYTES as usize]
@@ -967,16 +996,18 @@ impl Qcow2Reader {
                     .unwrap(),
             );
             if block_off == 0 {
-                if first_empty_block_slot.is_none() {
-                    first_empty_block_slot = Some(block_idx);
-                }
                 continue;
             }
 
             let mut block_bytes = vec![0u8; cluster_size as usize];
             self.dev_read(block_off, &mut block_bytes)?;
 
-            for entry_idx in 0..entries_per_block as usize {
+            let first_entry = if block_idx == start_block {
+                start_entry
+            } else {
+                0
+            };
+            for entry_idx in first_entry..entries_per_block as usize {
                 let off = entry_idx * 2;
                 let refcount = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
                 if refcount == 0 {
@@ -1000,9 +1031,11 @@ impl Qcow2Reader {
 
                     let host_off = host_cluster_idx * cluster_size;
 
-                    block_bytes[off..off + 2].copy_from_slice(&1u16.to_be_bytes());
-                    self.dev_write(block_off, &block_bytes)?;
+                    // Only the two bytes that changed go back to the
+                    // device, not the whole block (#44).
+                    self.dev_write(block_off + off as u64, &1u16.to_be_bytes())?;
                     self.dev_flush()?;
+                    *cursor = host_cluster_idx + 1;
                     return Ok(host_off);
                 }
             }
@@ -1056,7 +1089,14 @@ impl Qcow2Reader {
         // before it the only loss is two host clusters at a known offset.
         let entry_off_in_rt = (block_idx as u64) * TABLE_ENTRY_BYTES;
         self.dev_write(rt_off + entry_off_in_rt, &new_block_off.to_be_bytes())?;
+        // The resident copy follows the device before the flush can fail,
+        // so a failed flush cannot leave it offering this slot again.
+        let at = entry_off_in_rt as usize;
+        rt_bytes[at..at + TABLE_ENTRY_BYTES as usize].copy_from_slice(&new_block_off.to_be_bytes());
         self.dev_flush()?;
+        // The rest of the new block is free; blocks before it were full
+        // when the scan passed them.
+        *cursor = caller_cluster_idx + 1;
 
         Ok(caller_off)
     }
@@ -1121,7 +1161,6 @@ impl Qcow2Reader {
     }
 
     fn decrement_refcount(&self, host_off: u64) -> Result<()> {
-        let cluster_size = self.header.cluster_size;
         let (block_off, off) = match self.locate_refcount_entry(host_off)? {
             RefcountEntryLocation::At {
                 block_off,
@@ -1142,20 +1181,27 @@ impl Qcow2Reader {
             }
         };
 
-        let mut block_bytes = vec![0u8; cluster_size as usize];
-        self.dev_read(block_off, &mut block_bytes)?;
+        // The two bytes of this entry, not the whole block (#44).
+        let mut entry = [0u8; 2];
+        self.dev_read(block_off + off as u64, &mut entry)?;
 
-        let cur = u16::from_be_bytes([block_bytes[off], block_bytes[off + 1]]);
+        let cur = u16::from_be_bytes(entry);
         if cur == 0 {
             return Err(Error::Corrupt(
                 "decrement: refcount already zero (double free?)",
             ));
         }
         let new_refcount = cur - 1;
-        block_bytes[off..off + 2].copy_from_slice(&new_refcount.to_be_bytes());
 
-        self.dev_write(block_off, &block_bytes)?;
+        // Only the entry that changed, not the whole block (#44).
+        self.dev_write(block_off + off as u64, &new_refcount.to_be_bytes())?;
         self.dev_flush()?;
+        if new_refcount == 0 {
+            // Free again: the allocator's scan must be able to reach it.
+            let freed = host_off / self.header.cluster_size;
+            let mut cursor = self.alloc_cursor.lock().expect("alloc cursor lock");
+            *cursor = (*cursor).min(freed);
+        }
         Ok(())
     }
 
@@ -1231,10 +1277,6 @@ impl Qcow2Reader {
             None => self.allocate_l2_table(l1_idx)?,
         };
 
-        let cluster_size = self.header.cluster_size as usize;
-        let mut l2_bytes = vec![0u8; cluster_size];
-        self.dev_read(l2_table_off, &mut l2_bytes)?;
-
         // An L2 table can be shared, and when an internal snapshot
         // exists it is exactly what is shared: the active L1 and the
         // snapshot's L1 point at the same table, and the format says so
@@ -1254,6 +1296,9 @@ impl Qcow2Reader {
         // between the first two leaks a cluster and changes nothing a
         // reader can see.
         let l2_table_off = if self.l2_table_is_shared(l1_entry, l2_table_off)? {
+            // Read whole only when it has to be copied whole (#44).
+            let mut l2_bytes = vec![0u8; self.header.cluster_size as usize];
+            self.dev_read(l2_table_off, &mut l2_bytes)?;
             let copy_off = self.allocate_cluster()?;
             self.dev_write(copy_off, &l2_bytes)?;
             self.dev_flush()?;
@@ -1264,10 +1309,11 @@ impl Qcow2Reader {
             l2_table_off
         };
 
-        let off = l2_idx as usize * TABLE_ENTRY_BYTES as usize;
-        l2_bytes[off..off + TABLE_ENTRY_BYTES as usize].copy_from_slice(&new_entry.to_be_bytes());
-
-        self.dev_write(l2_table_off, &l2_bytes)?;
+        // Only the eight bytes of this entry go back, not the whole table
+        // (#44). A copied table was written whole just above, so the entry
+        // lands on top of the copy.
+        let off = l2_idx as u64 * TABLE_ENTRY_BYTES;
+        self.dev_write(l2_table_off + off, &new_entry.to_be_bytes())?;
         self.dev_flush()?;
 
         // Invalidate caches keyed off this L2 cluster.
