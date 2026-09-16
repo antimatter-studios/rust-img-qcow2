@@ -585,12 +585,22 @@ impl Qcow2Reader {
     /// cluster-aligned (except possibly the last, which is clamped
     /// to virtual_size).
     ///
-    /// This is the cheap way to drive a sparse-aware copy: every
-    /// [`ClusterStatus::Zero`] / [`ClusterStatus::Unallocated`]
-    /// extent can be written as zeros directly on the destination
-    /// without invoking the qcow2 read path at all. For a 100 GiB
-    /// image with 12 GiB allocated, the iterator yields ~13 extents
-    /// rather than ~1.6M cluster lookups.
+    /// This is the cheap way to drive a sparse-aware copy, and the
+    /// saving is on the CONSUMER's side: every [`ClusterStatus::Zero`] /
+    /// [`ClusterStatus::Unallocated`] extent can be written as zeros
+    /// directly on the destination without reading any data through the
+    /// qcow2 read path. For a 100 GiB image with 12 GiB allocated, a
+    /// consumer handles ~13 extents rather than ~1.6M clusters.
+    ///
+    /// THE WALK ITSELF IS NOT CHEAPER. The iterator looks up the status
+    /// of every cluster of the virtual disk, and looks up the first
+    /// cluster of each extent after the first twice (once to end the
+    /// previous extent, once to start its own): clusters + extents - 1
+    /// lookups, ~1.6M for that 100 GiB image at a 64 KiB cluster. Each
+    /// takes the L1 lock and, where the L1 entry is present, the
+    /// L2-cache lock, and each L2 table reached is read. No data cluster
+    /// is read. Budget a full walk as time proportional to the virtual
+    /// size, not to the number of extents.
     pub fn extents(&self) -> ExtentIter<'_> {
         ExtentIter::new(self)
     }
