@@ -1011,14 +1011,24 @@ impl Qcow2Reader {
             "refcount table is full and every block is full (refcount-table grow not implemented)",
         ))?;
 
-        // Place the new refcount block at the device's current tail. The
-        // host cluster we pick is the one immediately past the highest
-        // cluster index covered by any populated entry — i.e. one slot past
-        // the last seen block. That corresponds to host_cluster_idx =
-        // block_idx * entries_per_block (the very first entry the new
-        // block manages), which lets the new block point at *itself* with
-        // refcount = 1 and claim a fresh host cluster from its own range
-        // for the caller.
+        // Place the new refcount block at the first host cluster of the
+        // range this slot governs: host_cluster_idx =
+        // block_idx * entries_per_block. That lets the new block point at
+        // *itself* with refcount = 1 and claim a fresh host cluster from
+        // its own range for the caller.
+        //
+        // This is NOT the device's tail. `block_idx` is the FIRST absent
+        // slot pass 1 saw scanning up from 0, so with a hole in the table
+        // (slot 0 full, slot 1 absent, slot 2 present) the block lands at
+        // the start of slot 1's range, in the middle of the image. The two
+        // coincide only for a table populated densely from slot 0.
+        //
+        // ASSUMPTION, not checked: an absent slot means no cluster in its
+        // range is in use. True of a well-formed image. On a malformed one
+        // with live data at these offsets, the new block written below
+        // overwrites `new_block_off`, and the caller later overwrites
+        // `caller_off` -- unlike pass 1, which refuses the one malformed
+        // case it can see (a free header cluster).
         //
         // Concretely: the new refcount block lives at host cluster idx
         // `new_block_cluster`, which is the first entry inside the slot it
