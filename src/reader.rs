@@ -1804,6 +1804,36 @@ fn fs_core_to_qcow2_error(e: fs_core::Error) -> Error {
 }
 
 #[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    /// A span that fits the image is its length, in every width.
+    #[test]
+    fn a_span_inside_the_image_is_its_length() {
+        assert_eq!(span_inside_the_image(8192, 4096, 4096, "outside").unwrap(), 4096);
+        assert!(span_inside_the_image(8192, 4097, 4096, "outside").is_err());
+    }
+
+    /// #62: A LENGTH `usize` CANNOT HOLD IS REFUSED, NOT TRUNCATED.
+    ///
+    /// On a 32-bit target `length as usize` kept the low 32 bits, so a
+    /// 5 GiB refcount table inside a 6 GiB image came back as a 1 GiB
+    /// buffer while the walk over it was bounded by the full 5 GiB, and
+    /// the slice index ran past the buffer. Only a 32-bit build can
+    /// observe it, because on 64 bits every `u64` fits.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn a_span_longer_than_usize_is_refused_rather_than_truncated() {
+        let gib = 1u64 << 30;
+        let got = span_inside_the_image(6 * gib, 0, 5 * gib, "outside");
+        assert!(
+            matches!(got, Err(Error::Corrupt("outside"))),
+            "a 5 GiB span does not fit a 32-bit usize; got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod descriptor_tests {
     use super::*;
 
