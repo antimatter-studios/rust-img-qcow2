@@ -104,9 +104,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-img-qcow2
       - name: qemu cross-validation tests
         working-directory: rust-img-qcow2
         run: cargo test --locked --features qemu-validation --test qemu_validation
+      # The test job's `--all-targets` no longer builds this target: its
+      # [[test]] entry requires the feature (#50). So it is linted here,
+      # where it is built.
+      - name: clippy (qemu cross-validation tests)
+        working-directory: rust-img-qcow2
+        run: cargo clippy --locked --features qemu-validation --test qemu_validation -- -D warnings
