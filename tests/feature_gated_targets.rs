@@ -44,40 +44,83 @@ fn feature_gated_test_targets(root: &Path) -> Vec<(String, String)> {
     found
 }
 
-/// The features a file's crate-level `#![cfg(feature = "...")]` lines
+/// The features a file's crate-level `#![cfg(feature = "...")]` attributes
 /// require.
 ///
-/// A LINE SCAN, SO IT REFUSES WHAT IT CANNOT READ. Any other crate-level
-/// `cfg` that mentions a feature -- `#![cfg(all(feature = "x"))]`,
-/// `#![cfg(any(...))]`, a different spacing -- is an `Err` naming the
-/// line, not a silent skip: skipped, that target would escape the check
-/// while the control on `qemu_validation` still passed.
+/// A SCAN, SO IT REFUSES WHAT IT CANNOT READ. Any other crate-level `cfg`
+/// that mentions a feature -- `#![cfg(all(feature = "x"))]`,
+/// `#![cfg(any(...))]` -- is an `Err` naming the attribute, not a silent
+/// skip: skipped, that target would escape the check while the control on
+/// `qemu_validation` still passed.
+///
+/// Two valid spellings used to stop the scan early and skip every gate
+/// after them: a block comment, including an inner `/*! ... */` doc, and
+/// an attribute broken over several lines. Both are read now -- comments
+/// skipped wherever they end, an attribute gathered until its brackets
+/// close -- and whitespace inside an attribute does not change what it
+/// says.
 fn crate_feature_gates(text: &str) -> Result<Vec<String>, String> {
     let mut features = Vec::new();
+    let mut in_block_comment = false;
+    let mut attribute = String::new();
     // Inner attributes precede every item, so the scan stops at the first
-    // line that is not blank, a comment or an inner attribute. That also
-    // keeps it out of string literals further down that happen to start
-    // with `#![`, such as the ones in this file.
+    // line that is not blank, a comment or (part of) an inner attribute.
+    // That also keeps it out of string literals further down that happen
+    // to start with `#![`, such as the ones in this file.
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") {
+        let mut line = line.trim();
+        if in_block_comment {
+            match line.find("*/") {
+                Some(close) => {
+                    in_block_comment = false;
+                    line = line[close + 2..].trim();
+                }
+                None => continue,
+            }
+        }
+        if attribute.is_empty() {
+            if line.starts_with("/*") {
+                match line.find("*/") {
+                    Some(close) if line[close + 2..].trim().is_empty() => continue,
+                    Some(_) => {
+                        return Err(format!("unsupported line `{line}` in the crate header"))
+                    }
+                    None => {
+                        in_block_comment = true;
+                        continue;
+                    }
+                }
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if !line.starts_with("#![") {
+                break;
+            }
+        }
+        attribute.push_str(line);
+        attribute.push(' ');
+        if attribute.matches('[').count() > attribute.matches(']').count() {
             continue;
         }
-        if !line.starts_with("#![") {
-            break;
-        }
-        if let Some(feature) = line
-            .strip_prefix("#![cfg(feature = \"")
+        let whole = std::mem::take(&mut attribute);
+        let compact: String = whole.split_whitespace().collect();
+        if let Some(feature) = compact
+            .strip_prefix("#![cfg(feature=\"")
             .and_then(|rest| rest.strip_suffix("\")]"))
             .filter(|f| !f.contains('"'))
         {
             features.push(feature.to_string());
-        } else if line.contains("feature") {
+        } else if compact.contains("feature") {
             return Err(format!(
-                "unsupported crate-level feature gate `{line}`; spell it \
-                 #![cfg(feature = \"...\")] or extend this check"
+                "unsupported crate-level feature gate `{}`; spell it \
+                 #![cfg(feature = \"...\")] or extend this check",
+                whole.trim()
             ));
         }
+    }
+    if !attribute.is_empty() {
+        return Err(format!("an attribute never closes: `{}`", attribute.trim()));
     }
     Ok(features)
 }
@@ -148,11 +191,27 @@ fn a_crate_level_feature_gate_is_read_or_refused() {
         ),
         Ok(vec![])
     );
+    // Valid spellings that stopped the scan before it reached the gate:
+    // a block comment, an inner block doc, an attribute over several
+    // lines, and different spacing.
+    for text in [
+        "/* licence\n   text */\n#![cfg(feature = \"qemu-validation\")]\n",
+        "/*! crate doc */\n#![cfg(feature = \"qemu-validation\")]\n",
+        "#![allow(\n    dead_code\n)]\n#![cfg(\n    feature = \"qemu-validation\"\n)]\nmod x;\n",
+        "#![cfg(feature=\"qemu-validation\")]",
+    ] {
+        assert_eq!(
+            crate_feature_gates(text),
+            Ok(vec!["qemu-validation".to_string()]),
+            "{text:?}"
+        );
+    }
     for line in [
         "#![cfg(all(feature = \"qemu-validation\"))]",
         "#![cfg(any(feature = \"a\", feature = \"b\"))]",
-        "#![cfg(feature=\"qemu-validation\")]",
         "#![cfg_attr(feature = \"x\", allow(dead_code))]",
+        "#![cfg(all(\n    feature = \"qemu-validation\",\n))]",
+        "/*! doc */\n#![cfg(any(feature = \"a\"))]",
     ] {
         assert!(
             crate_feature_gates(line).is_err(),
