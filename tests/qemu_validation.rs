@@ -153,6 +153,85 @@ fn qemu_check_passes_on_image_we_wrote_to() {
     qemu_check(&p);
 }
 
+/// #39: WRITES FROM TWO THREADS LEAVE THE IMAGE AS CLEAN AS FROM ONE.
+///
+/// `Qcow2Reader` is `Sync` and the C ABI hands one handle to any thread,
+/// but allocation and the L2 update were unlocked read-modify-write: a
+/// whole L2 cluster read before another thread's entry landed was written
+/// back over it, leaving that thread's cluster allocated with nothing
+/// pointing at it. Measured before the fix: the same 48 writes to
+/// distinct unallocated clusters were clean from one thread and left
+/// ~22 leaked clusters from two, every run.
+///
+/// The one-thread run is the control: identical writes, so a failure in
+/// the threaded run is the concurrency and not the write set. Every
+/// offset is in bounds and every write must succeed, so a leak cannot
+/// come from a failed write.
+#[test]
+fn concurrent_writes_leave_the_image_clean() {
+    const CLUSTER: u64 = 65_536;
+    const WRITES: u64 = 48;
+    for threads in [1u64, 2, 4] {
+        let p = tmp_path(&format!("concurrent-writes-{threads}"));
+        // The geometry is pinned rather than left to qemu-img's default,
+        // which CI installs unversioned: every offset below is a whole
+        // number of these clusters.
+        assert_qemu(&[
+            "create",
+            "-f",
+            "qcow2",
+            "-o",
+            &format!("cluster_size={CLUSTER}"),
+            p.to_str().unwrap(),
+            "64M",
+        ]);
+        {
+            let r = std::sync::Arc::new(Qcow2Reader::open_rw(&p).unwrap());
+            assert_eq!(
+                r.cluster_size(),
+                CLUSTER,
+                "the image must have the cluster size the writes assume"
+            );
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let r = r.clone();
+                    std::thread::spawn(move || {
+                        // Interleaved, so no two threads touch one cluster.
+                        for i in (0..WRITES).filter(|i| i % threads == t) {
+                            let byte = 1 + i as u8;
+                            r.write_at(i * 3 * CLUSTER, &vec![byte; CLUSTER as usize])
+                                .unwrap_or_else(|e| panic!("write {i}: {e:?}"));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            r.flush().unwrap();
+        }
+
+        let out = run_qemu(&["check", p.to_str().unwrap()]);
+        assert!(
+            out.status.success(),
+            "threads={threads}: qemu-img check exited {:?}:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let r = Qcow2Reader::open(&p).unwrap();
+        let mut buf = vec![0u8; CLUSTER as usize];
+        for i in 0..WRITES {
+            r.read_at(i * 3 * CLUSTER, &mut buf).unwrap();
+            assert!(
+                buf.iter().all(|&b| b == 1 + i as u8),
+                "threads={threads}: write {i} did not survive; first byte {:02x}",
+                buf[0]
+            );
+        }
+    }
+}
+
 /// Direction 3 (cross-write, content): write bytes via our crate,
 /// have qemu-img convert the resulting qcow2 back to raw, and verify
 /// the bytes survived the round-trip. This is the strongest single
