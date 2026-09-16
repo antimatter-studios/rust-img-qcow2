@@ -173,9 +173,25 @@ fn concurrent_writes_leave_the_image_clean() {
     const WRITES: u64 = 48;
     for threads in [1u64, 2, 4] {
         let p = tmp_path(&format!("concurrent-writes-{threads}"));
-        qemu_create(&p, "64M");
+        // The geometry is pinned rather than left to qemu-img's default,
+        // which CI installs unversioned: every offset below is a whole
+        // number of these clusters.
+        assert_qemu(&[
+            "create",
+            "-f",
+            "qcow2",
+            "-o",
+            &format!("cluster_size={CLUSTER}"),
+            p.to_str().unwrap(),
+            "64M",
+        ]);
         {
             let r = std::sync::Arc::new(Qcow2Reader::open_rw(&p).unwrap());
+            assert_eq!(
+                r.cluster_size(),
+                CLUSTER,
+                "the image must have the cluster size the writes assume"
+            );
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
                     let r = r.clone();
