@@ -1025,8 +1025,9 @@ impl Qcow2Reader {
         //
         // ASSUMPTION, not checked: an absent slot means no cluster in its
         // range is in use. True of a well-formed image. On a malformed one
-        // whose data lives in an unrepresented range, the two writes below
-        // overwrite it -- unlike pass 1, which refuses the one malformed
+        // with live data at these offsets, the new block written below
+        // overwrites `new_block_off`, and the caller later overwrites
+        // `caller_off` -- unlike pass 1, which refuses the one malformed
         // case it can see (a free header cluster).
         //
         // Concretely: the new refcount block lives at host cluster idx
