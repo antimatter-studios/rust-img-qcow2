@@ -35,19 +35,51 @@ fn feature_gated_test_targets(root: &Path) -> Vec<(String, String)> {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(feature) = line
-                .strip_prefix("#![cfg(feature = \"")
-                .and_then(|rest| rest.strip_suffix("\")]"))
-            {
-                let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
-                found.push((stem, feature.to_string()));
-            }
-        }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let features =
+            crate_feature_gates(&text).unwrap_or_else(|line| panic!("tests/{stem}.rs: {line}"));
+        found.extend(features.into_iter().map(|f| (stem.clone(), f)));
     }
     found.sort();
     found
+}
+
+/// The features a file's crate-level `#![cfg(feature = "...")]` lines
+/// require.
+///
+/// A LINE SCAN, SO IT REFUSES WHAT IT CANNOT READ. Any other crate-level
+/// `cfg` that mentions a feature -- `#![cfg(all(feature = "x"))]`,
+/// `#![cfg(any(...))]`, a different spacing -- is an `Err` naming the
+/// line, not a silent skip: skipped, that target would escape the check
+/// while the control on `qemu_validation` still passed.
+fn crate_feature_gates(text: &str) -> Result<Vec<String>, String> {
+    let mut features = Vec::new();
+    // Inner attributes precede every item, so the scan stops at the first
+    // line that is not blank, a comment or an inner attribute. That also
+    // keeps it out of string literals further down that happen to start
+    // with `#![`, such as the ones in this file.
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if !line.starts_with("#![") {
+            break;
+        }
+        if let Some(feature) = line
+            .strip_prefix("#![cfg(feature = \"")
+            .and_then(|rest| rest.strip_suffix("\")]"))
+            .filter(|f| !f.contains('"'))
+        {
+            features.push(feature.to_string());
+        } else if line.contains("feature") {
+            return Err(format!(
+                "unsupported crate-level feature gate `{line}`; spell it \
+                 #![cfg(feature = \"...\")] or extend this check"
+            ));
+        }
+    }
+    Ok(features)
 }
 
 /// The features `Cargo.toml` requires before building the test target `name`.
@@ -93,6 +125,38 @@ fn a_feature_gated_test_target_requires_its_feature() {
             "tests/{stem}.rs is compiled only with feature `{feature}`, but Cargo.toml's \
              [[test]] entry for `{stem}` requires {required:?}; without it `cargo test \
              --all-targets` runs an empty binary and reports `ok`"
+        );
+    }
+}
+
+/// The scan's own two halves: the one spelling it reads, and every other
+/// crate-level feature gate refused rather than skipped.
+#[test]
+fn a_crate_level_feature_gate_is_read_or_refused() {
+    assert_eq!(
+        crate_feature_gates("//! doc\n#![cfg(feature = \"qemu-validation\")]\nmod x;\n"),
+        Ok(vec!["qemu-validation".to_string()])
+    );
+    assert_eq!(
+        crate_feature_gates("#![allow(dead_code)]\nfn f() {}\n"),
+        Ok(vec![])
+    );
+    // After the first item a line is code, not a crate attribute.
+    assert_eq!(
+        crate_feature_gates(
+            "fn f() {}\nconst S: &str = \"\n#![cfg(all(feature = \\\"x\\\"))]\";\n"
+        ),
+        Ok(vec![])
+    );
+    for line in [
+        "#![cfg(all(feature = \"qemu-validation\"))]",
+        "#![cfg(any(feature = \"a\", feature = \"b\"))]",
+        "#![cfg(feature=\"qemu-validation\")]",
+        "#![cfg_attr(feature = \"x\", allow(dead_code))]",
+    ] {
+        assert!(
+            crate_feature_gates(line).is_err(),
+            "`{line}` is a feature gate the scan cannot read; it must be refused"
         );
     }
 }
