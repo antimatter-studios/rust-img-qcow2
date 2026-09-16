@@ -387,6 +387,79 @@ fn an_unaligned_l2_entry_is_refused_by_the_validator_and_by_us() {
     );
 }
 
+/// Bit 0 of an L2 entry is the zero flag only from version 3. The
+/// specification says of it: "With version 2 ... this is always 0", so
+/// on a v2 image it is reserved. The validator refuses such an image
+/// ("Zero cluster entry found in pre-v3 image"); this reader used to
+/// neither refuse nor honour the bit, and returned the host cluster's
+/// bytes. The v3 image with the same patch is the control: there the
+/// flag is meaningful and both readers return zeros.
+#[test]
+fn the_zero_flag_on_a_v2_image_is_refused_by_the_validator_and_by_us() {
+    for (compat, refused) in [("0.10", true), ("1.1", false)] {
+        let raw = tmp_path(&format!("v2zero-src-{compat}"));
+        let qcow = tmp_path(&format!("v2zero-dst-{compat}"));
+        std::fs::write(&raw, vec![0xAAu8; 4096 * 8]).unwrap();
+        assert_qemu(&[
+            "convert",
+            "-f",
+            "raw",
+            "-O",
+            "qcow2",
+            "-o",
+            &format!("compat={compat}"),
+            raw.to_str().unwrap(),
+            qcow.to_str().unwrap(),
+        ]);
+        qemu_check(&qcow);
+
+        let l2 = first_l2_table_offset(&qcow);
+        assert_ne!(l2, 0, "qemu-produced image should have an L2 table");
+        let entry = read_be64(&qcow, l2);
+        assert_ne!(entry & HOST_OFFSET_MASK, 0, "cluster 0 should be allocated");
+        patch(&qcow, l2, &(entry | 1).to_be_bytes());
+
+        let out_path = tmp_path(&format!("v2zero-out-{compat}"));
+        let out = run_qemu(&[
+            "convert",
+            "-f",
+            "qcow2",
+            "-O",
+            "raw",
+            qcow.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+        ]);
+        let r = Qcow2Reader::open(&qcow).unwrap();
+        let mut buf = vec![0u8; 512];
+        let ours = r.read_at(0, &mut buf);
+
+        if refused {
+            assert!(
+                !out.status.success(),
+                "compat={compat}: the validator was expected to refuse bit 0 on a v2 L2 entry"
+            );
+            assert!(
+                matches!(ours, Err(qcow2::Error::Corrupt(_))),
+                "compat={compat}: expected a refusal, got {ours:?} with buf starting {:02x?}",
+                &buf[..8]
+            );
+        } else {
+            assert!(
+                out.status.success(),
+                "compat={compat}: the validator should read a v3 zero cluster:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let theirs = std::fs::read(&out_path).unwrap();
+            assert!(theirs[..512].iter().all(|&b| b == 0), "validator: zeros");
+            assert!(
+                ours.is_ok() && buf.iter().all(|&b| b == 0),
+                "compat={compat}: v3 zero flag reads as zeros, got {ours:?} {:02x?}",
+                &buf[..8]
+            );
+        }
+    }
+}
+
 /// Take an internal snapshot with the reference tool.
 fn qemu_snapshot_create(path: &Path, name: &str) {
     assert_qemu(&["snapshot", "-c", name, path.to_str().unwrap()]);
