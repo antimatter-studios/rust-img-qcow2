@@ -308,7 +308,8 @@ fn collect_siblings(node: &Yaml, found: &mut BTreeSet<String>) {
 
 /// The words of a shell command line, each paired with whether it sits
 /// in assignment position: among the leading `NAME=value` words of its
-/// command, before the command name.
+/// command, before the command name. `env` keeps that position open
+/// until its command, and every operand of `export`/`readonly` is in it.
 ///
 /// Deliberately small: quotes, backslash escapes and the separators
 /// that start a new command, and a `#` comment. It does not expand anything, so it cannot
@@ -318,6 +319,8 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
     let mut word = String::new();
     let mut in_word = false;
     let mut at_command_start = true;
+    // Inside `export`/`readonly`, every operand is an assignment.
+    let mut declaring = false;
     let mut quote: Option<char> = None;
     let mut chars = text.chars();
 
@@ -326,11 +329,23 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
         word: &mut String,
         in_word: &mut bool,
         at_command_start: &mut bool,
+        declaring: &mut bool,
     ) {
         if *in_word {
-            let assignment = *at_command_start && shell_assignment_value(word).is_some();
+            let assignment =
+                (*at_command_start || *declaring) && shell_assignment_value(word).is_some();
+            if *at_command_start && !assignment {
+                match word.as_str() {
+                    // `env` takes assignments before the command it runs.
+                    "env" => {}
+                    "export" | "readonly" => {
+                        *declaring = true;
+                        *at_command_start = false;
+                    }
+                    _ => *at_command_start = false,
+                }
+            }
             words.push((std::mem::take(word), assignment));
-            *at_command_start = assignment;
             *in_word = false;
         }
     }
@@ -363,6 +378,7 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
                         }
                     }
                     at_command_start = true;
+                    declaring = false;
                 }
                 '\'' | '"' => {
                     quote = Some(c);
@@ -375,11 +391,24 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
                     }
                 }
                 ';' | '&' | '|' | '\n' => {
-                    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+                    finish(
+                        &mut words,
+                        &mut word,
+                        &mut in_word,
+                        &mut at_command_start,
+                        &mut declaring,
+                    );
                     at_command_start = true;
+                    declaring = false;
                 }
                 c if c.is_whitespace() => {
-                    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+                    finish(
+                        &mut words,
+                        &mut word,
+                        &mut in_word,
+                        &mut at_command_start,
+                        &mut declaring,
+                    );
                 }
                 _ => {
                     in_word = true;
@@ -388,7 +417,13 @@ fn shell_words(text: &str) -> Vec<(String, bool)> {
             },
         }
     }
-    finish(&mut words, &mut word, &mut in_word, &mut at_command_start);
+    finish(
+        &mut words,
+        &mut word,
+        &mut in_word,
+        &mut at_command_start,
+        &mut declaring,
+    );
     words
 }
 
@@ -752,8 +787,11 @@ fn a_path_carried_by_a_shell_assignment_still_declares() {
 /// new command either.
 ///
 /// The positive half pins what position does admit: a prefix
-/// assignment, a second prefix after the first, and a leading
-/// assignment after each of `;`, `&&`, `||`, `|` and a newline.
+/// assignment, a second prefix after the first, a leading assignment
+/// after each of `;`, `&&`, `||`, `|` and a newline, the operands of
+/// `export`/`readonly`, and the assignments `env` takes before its
+/// command. Missing those is the loud direction -- the guard refusing a
+/// contract that does provision the sibling -- but still a wrong answer.
 #[test]
 fn an_assignment_shaped_argument_declares_nothing() {
     for command in [
@@ -764,6 +802,8 @@ fn an_assignment_shaped_argument_declares_nothing() {
         "echo 'a && NOTE=../rust-partitions'",
         "echo a\\; NOTE=../rust-partitions",
         "echo a # ; NOTE=../rust-partitions",
+        "env make NOTE=../rust-partitions",
+        "export SRC=x; echo NOTE=../rust-partitions",
     ] {
         let chores = format!(
             "tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n    sources:\n      - Cargo.toml\n"
@@ -784,6 +824,11 @@ fn an_assignment_shaped_argument_declares_nothing() {
         "false || SRC=../rust-fs-core/include make",
         "echo x | SRC=../rust-fs-core/include make",
         "echo x\nSRC=../rust-fs-core/include make",
+        "export SRC=../rust-fs-core/include",
+        "export A=1 SRC=../rust-fs-core/include",
+        "readonly SRC=../rust-fs-core/include",
+        "env SRC=../rust-fs-core/include make",
+        "env A=1 SRC=../rust-fs-core/include make",
     ] {
         let chores = format!("tasks:\n  staticlib:\n    cmds:\n      - {command:?}\n");
         let declares = siblings_the_contract_declares(&chores);
