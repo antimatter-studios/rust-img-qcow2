@@ -592,13 +592,15 @@ impl Qcow2Reader {
     /// qcow2 read path. For a 100 GiB image with 12 GiB allocated, a
     /// consumer handles ~13 extents rather than ~1.6M clusters.
     ///
-    /// THE WALK ITSELF IS NOT CHEAPER. The iterator resolves the status
-    /// of every cluster of the virtual disk, one lookup per cluster —
-    /// ~1.6M for that 100 GiB image at a 64 KiB cluster, each taking
-    /// the L1 lock and, where the L1 entry is present, the L2-cache
-    /// lock — and reads each L2 table it reaches.
-    /// No data cluster is read. Budget a full walk as time proportional
-    /// to the virtual size, not to the number of extents.
+    /// THE WALK ITSELF IS NOT CHEAPER. The iterator looks up the status
+    /// of every cluster of the virtual disk, and looks up the first
+    /// cluster of each extent after the first twice (once to end the
+    /// previous extent, once to start its own): clusters + extents - 1
+    /// lookups, ~1.6M for that 100 GiB image at a 64 KiB cluster. Each
+    /// takes the L1 lock and, where the L1 entry is present, the
+    /// L2-cache lock, and each L2 table reached is read. No data cluster
+    /// is read. Budget a full walk as time proportional to the virtual
+    /// size, not to the number of extents.
     pub fn extents(&self) -> ExtentIter<'_> {
         ExtentIter::new(self)
     }
