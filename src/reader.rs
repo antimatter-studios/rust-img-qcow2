@@ -354,7 +354,10 @@ fn span_inside_the_image(
     if end > dev_size {
         return Err(Error::Corrupt(outside));
     }
-    Ok(length as usize)
+    // Checked, not `as`: on a 32-bit target `as` keeps the low bits, and a
+    // truncated buffer beside a walk bounded by the full length indexes
+    // past its end (#62).
+    usize::try_from(length).map_err(|_| Error::Corrupt(outside))
 }
 
 impl Qcow2Reader {
@@ -1810,7 +1813,10 @@ mod span_tests {
     /// A span that fits the image is its length, in every width.
     #[test]
     fn a_span_inside_the_image_is_its_length() {
-        assert_eq!(span_inside_the_image(8192, 4096, 4096, "outside").unwrap(), 4096);
+        assert_eq!(
+            span_inside_the_image(8192, 4096, 4096, "outside").unwrap(),
+            4096
+        );
         assert!(span_inside_the_image(8192, 4097, 4096, "outside").is_err());
     }
 
