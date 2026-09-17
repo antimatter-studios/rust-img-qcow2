@@ -25,6 +25,17 @@ path = "src/bin/qcow2_tool.rs"
 # linked, never bundled into our release artifacts.
 qemu-validation = []
 
+# Without the feature `tests/qemu_validation.rs` compiles to an empty
+# binary, and `cargo test --all-targets` ran it and printed `test result:
+# ok. 0 passed` under the cross-validation suite's own name. Requiring the
+# feature takes the target out of that run, so the line is absent rather
+# than green. tests/feature_gated_targets.rs holds every feature-gated test
+# target to this. See #50.
+[[test]]
+name = "qemu_validation"
+path = "tests/qemu_validation.rs"
+required-features = ["qemu-validation"]
+
 [dependencies]
 # Pure-Rust deflate backend (default when `default-features = true`).
 # Used to decompress zlib-compressed clusters per the qcow2 spec.

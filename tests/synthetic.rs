@@ -680,17 +680,27 @@ fn open_rw_then_read_through_fs_core_blockdevice() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5b: snapshot-aware copy-on-write
+// Copy-on-write of a SHARED DATA CLUSTER
 //
 // The check is per-cluster, not per-image: a write to a cluster whose host
-// refcount > 1 must clone the cluster before mutating it, so the snapshot's
-// view stays untouched. We simulate a snapshot by bumping the refcount of
-// virt-cluster-0's host cluster to 2.
+// refcount > 1 must clone the cluster before mutating it. These fixtures
+// share ONE DATA CLUSTER: virt-cluster-0's host cluster gets refcount 2 and
+// its L2 entry loses COPIED.
+//
+// THAT IS NOT A SNAPSHOT, and these tests do not check one (#42). A real
+// internal snapshot, measured after `qemu-img snapshot -c`, also shares the
+// L2 TABLE (its refcount goes to 2), clears COPIED on the active L1 entry,
+// and adds a second L1 table naming the same L2 table -- and the snapshot's
+// view is read through that second L1, which nothing here has. The test
+// that does check a snapshot is qemu_validation's
+// `a_write_leaves_an_internal_snapshot_holding_what_it_held`: a real
+// `qemu-img snapshot`, one write through this writer, `qemu-img check`, and
+// the snapshot converted out by the reference and compared.
 // ---------------------------------------------------------------------------
 
-/// Bump the on-disk refcount of `host_cluster_idx` by `delta`. Used to
-/// simulate the effect of taking an internal snapshot — every L2-referenced
-/// cluster's refcount goes up by 1 when a snapshot lands.
+/// Bump the on-disk refcount of `host_cluster_idx` by `delta`, so that one
+/// cluster reads as shared. Only the cluster named is changed; a real
+/// snapshot also raises the L2 table's own refcount, which this does not.
 fn bump_refcount(path: &PathBuf, refcount_block_off: u64, host_cluster_idx: usize, delta: u16) {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -708,9 +718,9 @@ fn bump_refcount(path: &PathBuf, refcount_block_off: u64, host_cluster_idx: usiz
     f.write_all(&new.to_be_bytes()).unwrap();
 }
 
-/// Clear the COPIED bit (bit 63) on virt cluster 0's L2 entry. qemu does
-/// this for every L2 entry in the image when a snapshot lands, signalling
-/// that the cluster is now shared and writes need CoW.
+/// Clear the COPIED bit (bit 63) on virt cluster 0's L2 entry, signalling
+/// that the cluster may be shared and a write has to consult its refcount.
+/// A real snapshot clears COPIED on the L1 entry too; this does not.
 fn clear_copied_l2_entry_0(path: &PathBuf) {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -757,8 +767,8 @@ fn read_refcount_entry(path: &PathBuf, refcount_block_off: u64, host_cluster_idx
 #[test]
 fn write_to_shared_cluster_clones_via_cow() {
     // virt cluster 0 starts pointed at host cluster 3 (DATA0_OFFSET).
-    // Bumping that host cluster's refcount to 2 simulates a snapshot
-    // referencing the same data. The next write must NOT mutate cluster
+    // Bumping that host cluster's refcount to 2 makes it a shared data
+    // cluster (not a snapshot; see the section comment). The next write must NOT mutate cluster
     // 3 in place — it must allocate a fresh cluster, copy the existing
     // data into it, splice in the user payload, repoint L2 there, and
     // drop cluster 3's refcount back to 1.
@@ -766,8 +776,8 @@ fn write_to_shared_cluster_clones_via_cow() {
     build_image(&path);
 
     // Cluster 3 (DATA0_OFFSET / CLUSTER_SIZE) currently has refcount=1.
-    // Bump to 2 and clear the L2 entry's COPIED bit to mimic the on-disk
-    // state qemu produces when an internal snapshot lands.
+    // Bump to 2 and clear the L2 entry's COPIED bit: the data-cluster half
+    // of what a snapshot does, and only that half.
     bump_refcount(&path, REFCOUNT_BLOCK_OFFSET, 3, 1);
     assert_eq!(read_refcount_entry(&path, REFCOUNT_BLOCK_OFFSET, 3), 2);
     clear_copied_l2_entry_0(&path);
@@ -807,10 +817,12 @@ fn write_to_shared_cluster_clones_via_cow() {
 }
 
 #[test]
-fn snapshot_view_unchanged_after_cow_write() {
-    // After the write CoW's the cluster, an outsider reading the OLD
-    // host cluster directly (the snapshot's view) must still see the
-    // original 0xAA bytes — the writer must not have touched it.
+fn a_shared_data_cluster_is_not_written_in_place() {
+    // After the write CoW's the cluster, the OLD host cluster read directly
+    // off disk must still hold the original 0xAA bytes: the payload went to
+    // a copy, not in place. This is NOT a snapshot's view -- that is read
+    // through the snapshot's own L1, and is checked by qemu_validation's
+    // `a_write_leaves_an_internal_snapshot_holding_what_it_held`.
     let path = tmp_path("cow_snap_view");
     build_image(&path);
     bump_refcount(&path, REFCOUNT_BLOCK_OFFSET, 3, 1);
@@ -831,14 +843,14 @@ fn snapshot_view_unchanged_after_cow_write() {
     f.read_exact(&mut buf).unwrap();
     assert!(
         buf.iter().all(|&b| b == 0xAA),
-        "snapshot's host cluster must remain untouched after CoW write"
+        "the shared host cluster must remain untouched after a CoW write"
     );
 
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn live_view_sees_cow_write() {
+fn the_live_view_sees_a_cow_write() {
     // Mirror of the previous test: the live image's view at virt 0 must
     // reflect the new bytes (CoW means the writer points L2 at a fresh
     // cluster carrying the spliced data).
@@ -1797,12 +1809,11 @@ fn an_allocating_write_writes_back_only_the_metadata_it_changes() {
 /// 0 to learn that, and the second must not.
 #[test]
 fn a_second_allocation_resumes_where_the_first_left_off() {
-    use std::os::unix::fs::FileExt;
     let path = tmp_path("allocation_resumes");
     build_image(&path);
     let refcount_block_1 = 7 * CLUSTER_SIZE;
     {
-        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         // Block 0 governs host clusters 0..2048: all in use.
         f.write_all_at(
             &[0u8, 1].repeat(CLUSTER_SIZE as usize / 2),
@@ -1860,7 +1871,6 @@ fn a_second_allocation_resumes_where_the_first_left_off() {
 /// the cursor back, the image would grow forever past a free cluster.
 #[test]
 fn a_freed_cluster_behind_the_allocation_cursor_is_reused() {
-    use std::os::unix::fs::FileExt;
     let path = tmp_path("freed_cluster_reused");
     build_compressed_image(&path, 0xCC);
     let compressed_host = CLUSTER_SIZE * 3;

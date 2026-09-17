@@ -338,6 +338,18 @@ pub struct Qcow2Reader {
     /// allocation walked every full block before it; it now starts here,
     /// and a refcount dropped to zero moves the cursor back down.
     alloc_cursor: Mutex<u64>,
+    /// Held for the whole of every `write_at`.
+    ///
+    /// Allocation, copy-on-write and the L2/L1 updates are read-modify-
+    /// write sequences over whole metadata clusters: read a refcount block
+    /// or an L2 table, change a few bytes, write the cluster back. The
+    /// type is `Sync` and the C ABI hands one handle to any thread, so two
+    /// writers interleaving those sequences each wrote back a cluster read
+    /// before the other's change landed. Measured (#39): 48 writes to
+    /// distinct clusters from two threads left `qemu-img check` reporting
+    /// corruption and leaked clusters, where one thread left it clean.
+    /// Serialising writers makes each sequence atomic against the others.
+    write_lock: Mutex<()>,
 }
 
 /// The length of a table, once it is known to be inside the image.
@@ -543,6 +555,7 @@ impl Qcow2Reader {
             image_len: Mutex::new(image_len),
             refcount_table: Mutex::new(None),
             alloc_cursor: Mutex::new(0),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -706,6 +719,9 @@ impl Qcow2Reader {
                 size: self.header.virtual_size,
             });
         }
+
+        // One writer at a time: see `write_lock`.
+        let _writer = self.write_lock.lock().unwrap();
 
         // Snapshot safety is handled per-cluster below: a shared cluster
         // (host refcount > 1) is CoW'd before the user payload lands. The
