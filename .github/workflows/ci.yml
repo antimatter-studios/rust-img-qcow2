@@ -54,15 +54,56 @@ jobs:
         # trap an overflow -- asking the build directly rather than
         # inferring it from which spellings of "disabled" happen to be
         # absent from Cargo.toml. It is declared as an `env:` mapping
-        # rather than inline as `VAR=1 cargo test` because this job also
-        # runs on windows-latest, where that prefix is a PowerShell
-        # syntax error.
+        # rather than inline as `VAR=1 cargo test`. That was originally
+        # because this job also runs on windows-latest, where the prefix
+        # is a PowerShell syntax error; the step now asks for
+        # `shell: bash` on every runner (the floor below needs `awk`),
+        # and the mapping stays because it reaches the run wherever the
+        # run sits in the script, which an inline prefix does not.
         #
         # Do not add `--release` to this run, and do not drop the
         # variable: tests/ci_profile.rs reads this file and fails if no
         # `cargo test` in it runs without `--release` while setting this.
         # See #60.
-        run: cargo test --locked --all-targets
+        shell: bash
+        run: |
+          # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE (#99).
+          # `cargo test` exits 0 on "0 passed; 0 failed", so a filter that
+          # selects nothing, a build that produced no test binaries, and a
+          # suite that ran in full all report the same green. Nothing in
+          # this workflow could tell them apart, because nothing counted.
+          #
+          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 210
+          # executed on each of the three runners -- 41 library unit tests
+          # plus 94, 52, 15, 6 and 2 across the integration targets. The
+          # floor is 190, roughly a tenth below, so deleting a test does
+          # not turn the gate red while a run that stopped early does. It
+          # moves up with the suite and never down.
+          #
+          # THE OUTPUT IS REDIRECTED RATHER THAN PIPED THROUGH `tee`, and
+          # that is not a style choice. tests/ci_profile.rs refuses a
+          # `cargo test` whose exit status the step does not read, and
+          # Actions runs a step's shell without `pipefail`, so
+          # `cargo test | tee` would report tee's status -- turning the
+          # one run that can see an arithmetic overflow into an advisory
+          # one, which is the exact defect that file exists to prevent.
+          # The `trap` puts the suite's output back on the step's log.
+          # It also means the count does not run after a FAILED suite:
+          # `set -e` ends the step at the run, which is right -- a red
+          # suite is already red, and this floor is here for a green one.
+          #
+          # A count answers "did anything run", not "did it check
+          # anything": a test that returns early because a tool is
+          # missing still counts as passed (#97).
+          log=$(mktemp)
+          trap 'cat "$log"' EXIT
+          cargo test --locked --all-targets > "$log" 2>&1
+          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+          echo "tests executed: $n (floor 190)"
+          if [ "$n" -lt 190 ]; then
+              echo "::error::only $n tests executed, floor is 190 — 210 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+              exit 1
+          fi
         env:
           EXPECT_OVERFLOW_CHECKS: "1"
       - name: clippy
@@ -96,7 +137,31 @@ jobs:
           workspaces: rust-img-qcow2
       - name: lib tests (32-bit)
         working-directory: rust-img-qcow2
-        run: cargo test --locked --lib --target i686-unknown-linux-gnu
+        run: |
+          # ITS OWN FLOOR, BECAUSE THIS SELECTION CAN EMPTY ON ITS OWN.
+          # See the floor in the `test` job above for why a count is the
+          # only thing that can see an absence. This run needs a separate
+          # number because it selects a different set: `--lib` on a
+          # 32-bit target compiles the `#[cfg(target_pointer_width =
+          # "32")]` tests that no other job in this workflow builds, and
+          # drops every integration target the matrix runs. Either set
+          # can empty without touching the other -- a missing
+          # `rustup target add`, a cfg that stops matching, or a
+          # `--target` that no longer resolves would leave this job
+          # green having compiled nothing to run.
+          #
+          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 42
+          # executed, one more than the 41 the 64-bit legs run, and that
+          # one is the whole reason this job exists. Floor 38.
+          log=$(mktemp)
+          trap 'cat "$log"' EXIT
+          cargo test --locked --lib --target i686-unknown-linux-gnu > "$log" 2>&1
+          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+          echo "tests executed: $n (floor 38)"
+          if [ "$n" -lt 38 ]; then
+              echo "::error::only $n tests executed, floor is 38 — 42 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+              exit 1
+          fi
 
   fmt:
     name: fmt
@@ -139,7 +204,35 @@ jobs:
           workspaces: rust-img-qcow2
       - name: qemu cross-validation tests
         working-directory: rust-img-qcow2
-        run: cargo test --locked --features qemu-validation --test qemu_validation
+        run: |
+          # ITS OWN FLOOR, AND THE MOST EXPOSED SELECTION IN THE FILE.
+          # `--test qemu_validation` names a target: rename
+          # tests/qemu_validation.rs, or the `[[test]]` entry in
+          # Cargo.toml that gives it that name, and the selection matches
+          # nothing. `cargo test` then exits 0 having run no test, this
+          # job reports green, and the crate's only cross-validation
+          # against `qemu-img` -- the thing that decides whether the
+          # images we write are qcow2 rather than merely self-consistent
+          # -- silently stops running. The feature gate makes that more
+          # likely, not less: the `[[test]]` entry requires
+          # `qemu-validation`, so the matrix's `--all-targets` does not
+          # build this target and nothing else would notice (#50, #99).
+          #
+          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 24
+          # executed. Floor 22.
+          #
+          # The floor counts what RAN, not what checked: a test here that
+          # returns early because `qemu-img` is absent still reports as
+          # passed, which is #97 and is not fixed by a number.
+          log=$(mktemp)
+          trap 'cat "$log"' EXIT
+          cargo test --locked --features qemu-validation --test qemu_validation > "$log" 2>&1
+          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+          echo "tests executed: $n (floor 22)"
+          if [ "$n" -lt 22 ]; then
+              echo "::error::only $n tests executed, floor is 22 — 24 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+              exit 1
+          fi
       # The test job's `--all-targets` no longer builds this target: its
       # [[test]] entry requires the feature (#50). So it is linted here,
       # where it is built.
