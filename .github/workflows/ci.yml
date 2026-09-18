@@ -73,12 +73,16 @@ jobs:
           # suite that ran in full all report the same green. Nothing in
           # this workflow could tell them apart, because nothing counted.
           #
-          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 210
-          # executed on each of the three runners -- 41 library unit tests
-          # plus 94, 52, 15, 6 and 2 across the integration targets. The
-          # floor is 190, roughly a tenth below, so deleting a test does
-          # not turn the gate red while a run that stopped early does. It
-          # moves up with the suite and never down.
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
+          # 226 executed on each of the three runners -- 41 library unit
+          # tests plus 111, 51, 15, 6 and 2 across the integration
+          # targets. The floor is 205, roughly a tenth below, so deleting
+          # a test does not turn the gate red while a run that stopped
+          # early does. It moves up with the suite and never down: it was
+          # 190 against 210 on run 35174965656 (main, df6a954), and the
+          # suite grew by the seventeen guards tests/ci_profile.rs gained
+          # for #97, less the one test #97 moved out of
+          # tests/synthetic.rs and into tests/qemu_validation.rs.
           #
           # THE OUTPUT IS REDIRECTED RATHER THAN PIPED THROUGH `tee`, and
           # that is not a style choice. tests/ci_profile.rs refuses a
@@ -92,16 +96,21 @@ jobs:
           # `set -e` ends the step at the run, which is right -- a red
           # suite is already red, and this floor is here for a green one.
           #
-          # A count answers "did anything run", not "did it check
-          # anything": a test that returns early because a tool is
-          # missing still counts as passed (#97).
+          # A COUNT ANSWERS "DID ANYTHING RUN", NOT "DID IT CHECK
+          # ANYTHING". A test that returns early because a tool is
+          # missing still counts as passed, which is what #97 was: a
+          # `qemu-img` probe in tests/synthetic.rs that returned on
+          # every runner in every job because only the qemu-validation
+          # job installs qemu-utils, and this count could not see it.
+          # That test now lives in tests/qemu_validation.rs, where the
+          # tool's absence is a panic rather than a pass.
           log=$(mktemp)
           trap 'cat "$log"' EXIT
           cargo test --locked --all-targets > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 190)"
-          if [ "$n" -lt 190 ]; then
-              echo "::error::only $n tests executed, floor is 190 — 210 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 205)"
+          if [ "$n" -lt 205 ]; then
+              echo "::error::only $n tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
         env:
@@ -163,6 +172,111 @@ jobs:
               exit 1
           fi
 
+  # THE PROFILE THAT SHIPS IS NOT THE PROFILE THE TESTS RUN IN (#98).
+  #
+  # Every `cargo test` above this line builds the `test` profile, which
+  # inherits from `dev`: `opt-level = 1`, no LTO, `codegen-units` at the
+  # default, `debug_assert!` bodies live and overflow checks on. The
+  # crate published to crates.io is built with `[profile.release]` --
+  # `lto = true`, `codegen-units = 1`, `opt-level = 3` -- and until now
+  # nothing ran a single test against it.
+  #
+  # The two profiles do not agree on behaviour, and the disagreements
+  # are in this crate's blast radius:
+  #
+  #   * `debug_assert!` bodies vanish under `--release`. An invariant
+  #     the debug run enforces is unchecked in the shipped build, and
+  #     the failure moves from a panic to whatever the following code
+  #     does with the bad value. `patch_be` in tests/synthetic.rs and
+  #     several sites in the reader rely on them.
+  #   * ARITHMETIC WRAPS INSTEAD OF PANICKING, which is the inverse of
+  #     the debug job's job above. A test guarding a wrapping
+  #     computation passes the debug run for the WRONG REASON -- the
+  #     panic -- while the behaviour it guards against is live in the
+  #     built library. `rust-fs-ntfs` recorded exactly this:
+  #     `signed_bytes_needed` negated `i64::MIN`, panicked in debug,
+  #     wrapped in release, and the wrap happened to reach the right
+  #     answer. Four tests ran in CI and could not fail there.
+  #   * `lto = true` and `codegen-units = 1` change inlining across the
+  #     C ABI boundary, which is where `panic = "unwind"` and
+  #     `catch_unwind` are load-bearing here -- Cargo.toml's own comment
+  #     on that key says so.
+  #
+  # So this is not a duplicate of the matrix above and must not be
+  # tidied into one. The matrix is the only run that can SEE an
+  # overflow; this is the only run that tests what we PUBLISH. Deleting
+  # either leaves a whole class of defect with no run that could catch
+  # it before release.
+  #
+  # ONE RUNNER RATHER THAN THE MATRIX. Overflow behaviour and
+  # optimisation are properties of the profile, not of the platform, and
+  # three of these would buy the same evidence three times on a crate
+  # whose cross-platform risk the debug matrix already covers. The
+  # siblings rust-img-vhdx, rust-img-vmdk and rust-partitions all made
+  # the same call.
+  #
+  # NO `EXPECT_OVERFLOW_CHECKS` HERE, DELIBERATELY. Overflow checks are
+  # meant to be off under `--release` -- that is what ships -- and
+  # `overflow_checks::the_build_the_gate_asked_to_check_does_check` in
+  # src/lib.rs fails when the handshake is set and the build does not
+  # trap. Setting it here would turn a correct release run red on every
+  # green build.
+  test-release:
+    name: test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rust-img-qcow2
+      # The same single sibling the matrix checks out, for the same
+      # reason: chores.yml:11 says `staticlib` is the whole interface a
+      # consumer needs, and tests/siblings_the_contract_promises.rs
+      # refuses a path dependency on any sibling the contract does not
+      # declare. Cargo builds the resolve graph for every command, so
+      # this directory has to exist here exactly as it does above.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.10
+          path: rust-fs-core
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-img-qcow2
+      - name: test --release
+        working-directory: rust-img-qcow2
+        shell: bash
+        run: |
+          # ITS OWN FLOOR, NOT THE MATRIX'S, BECAUSE THIS IS A DIFFERENT
+          # RUN SELECTION. It builds the same targets today and counts
+          # the same number, but it is a separate `cargo test` in a
+          # separate profile: a release-only build failure, a
+          # `#[cfg(debug_assertions)]` that takes a module out of the
+          # release build, or a future narrowing of this command empties
+          # this run without touching the matrix, and one shared number
+          # would be satisfied by the other job while proving nothing
+          # about this one. See the floor in the `test` job above for
+          # why a green `cargo test` is not evidence on its own, and why
+          # the output is redirected rather than piped through `tee`.
+          #
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
+          # 226 executed, the same number the debug matrix ran in the
+          # same run and deliberately counted separately from it. Floor
+          # 205, roughly a tenth below, so deleting a test does not turn
+          # the gate red while a run that stopped early does. It moves up
+          # with the suite and never down.
+          log=$(mktemp)
+          trap 'cat "$log"' EXIT
+          cargo test --locked --release --all-targets > "$log" 2>&1
+          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
+          echo "tests executed: $n (floor 205)"
+          if [ "$n" -lt 205 ]; then
+              echo "::error::only $n release-profile tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
+              exit 1
+          fi
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -218,19 +332,32 @@ jobs:
           # `qemu-validation`, so the matrix's `--all-targets` does not
           # build this target and nothing else would notice (#50, #99).
           #
-          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 24
-          # executed. Floor 22.
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72): 25
+          # executed. Floor 23 -- the same margin of two as the 24-against-
+          # 22 it replaces. The twenty-fifth is the test #97 moved here
+          # from tests/synthetic.rs, where it had never run.
           #
-          # The floor counts what RAN, not what checked: a test here that
-          # returns early because `qemu-img` is absent still reports as
-          # passed, which is #97 and is not fixed by a number.
+          # The floor counts what RAN, not what checked, and no number
+          # can fix a test that returns early when its tool is missing.
+          # Nothing in this file does that any more: the helpers here go
+          # through `run_qemu`, which panics naming the package when
+          # `qemu-img` cannot be spawned. That was #97.
+          #
+          # THE JOB ITSELF IS NOW GUARDED TOO.
+          # `the_pr_gate_still_cross_validates_against_qemu_img` in
+          # tests/ci_profile.rs reads this file and fails unless a
+          # gating job named `qemu-validation` installs `qemu-utils`
+          # and runs `--features qemu-validation --test
+          # qemu_validation`. Before it, deleting this whole job left
+          # every test in the repository green -- the floor goes with
+          # the step it lives in.
           log=$(mktemp)
           trap 'cat "$log"' EXIT
           cargo test --locked --features qemu-validation --test qemu_validation > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 22)"
-          if [ "$n" -lt 22 ]; then
-              echo "::error::only $n tests executed, floor is 22 — 24 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 23)"
+          if [ "$n" -lt 23 ]; then
+              echo "::error::only $n qemu cross-validation tests executed, floor is 23 — 25 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
       # The test job's `--all-targets` no longer builds this target: its

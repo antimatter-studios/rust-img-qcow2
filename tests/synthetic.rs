@@ -978,33 +978,6 @@ fn extents_iter_yields_run_length_encoded_status_runs() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[test]
-fn extents_iter_handles_freshly_created_all_unallocated_image() {
-    use qcow2::ClusterStatus;
-    use std::process::Command;
-    if Command::new("qemu-img").arg("--version").output().is_err() {
-        return;
-    }
-    let p = tmp_path("freshly_created");
-    let status = Command::new("qemu-img")
-        .args(["create", "-f", "qcow2", p.to_str().unwrap(), "1M"])
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    let r = Qcow2Reader::open(&p).unwrap();
-    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
-
-    // Brand-new qcow2 has no allocated clusters at all — the iterator
-    // collapses the whole virtual disk into one Unallocated extent.
-    assert_eq!(extents.len(), 1);
-    assert_eq!(extents[0].virt_offset, 0);
-    assert_eq!(extents[0].length, r.virtual_size());
-    assert_eq!(extents[0].status, ClusterStatus::Unallocated);
-
-    let _ = std::fs::remove_file(&p);
-}
-
 /// Patch `len` big-endian bytes of `val` into `path` at byte `off`.
 fn patch_be(path: &PathBuf, off: u64, val: u64, len: usize) {
     use std::io::{Seek, SeekFrom, Write};

@@ -112,6 +112,61 @@ fn our_reader_returns_zeros_for_empty_qemu_image() {
     );
 }
 
+/// Direction 2 (cross-read, extents): what our extent iterator reports
+/// for an image QEMU built and we did not.
+///
+/// THIS TEST USED TO LIVE IN `tests/synthetic.rs` AND HAD NEVER RUN
+/// ANYWHERE (#97). It opened with
+///
+/// ```ignore
+/// if Command::new("qemu-img").arg("--version").output().is_err() {
+///     return;
+/// }
+/// ```
+///
+/// and `synthetic.rs` is an ordinary integration target, compiled by
+/// `cargo test --locked --all-targets` in the `test` job. That job's
+/// matrix is ubuntu/macos/windows and it installs no `qemu-utils`; the
+/// only `apt-get install` of it in the repository is in the
+/// `qemu-validation` job, which runs `--test qemu_validation` and so
+/// never compiles `synthetic.rs` at all. The probe therefore returned
+/// early on every runner, in every job, on every push and pull request,
+/// and the test reported `ok` for a run that had asserted nothing. A
+/// floor cannot see that: an early return still counts as passed.
+///
+/// Here the absence of the tool is a FAILURE rather than an early
+/// return. `qemu_create` goes through `run_qemu`, which panics naming
+/// the package when the binary cannot be spawned, and this target is
+/// behind `required-features = ["qemu-validation"]` so a checkout
+/// without QEMU does not build it in the first place. The tool being
+/// missing is now either "this target was not selected" or "the job is
+/// broken" -- never "the assertions were skipped and we passed".
+///
+/// What it checks is the all-unallocated case specifically, which is
+/// the one our own writer produces nothing to compare against: a
+/// brand-new qcow2 has no allocated clusters, so the iterator must
+/// collapse the whole virtual disk into a single `Unallocated` extent
+/// rather than emitting one extent per cluster or stopping short.
+#[test]
+fn extents_iter_handles_freshly_created_all_unallocated_image() {
+    use qcow2::ClusterStatus;
+
+    let p = tmp_path("freshly_created");
+    qemu_create(&p, "1M");
+
+    let r = Qcow2Reader::open(&p).unwrap();
+    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
+
+    // Brand-new qcow2 has no allocated clusters at all — the iterator
+    // collapses the whole virtual disk into one Unallocated extent.
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].virt_offset, 0);
+    assert_eq!(extents[0].length, r.virtual_size());
+    assert_eq!(extents[0].status, ClusterStatus::Unallocated);
+
+    let _ = std::fs::remove_file(&p);
+}
+
 /// Direction 2 (cross-read, populated): convert a raw file with a
 /// known byte pattern into qcow2 via qemu-img, then read it back with
 /// our reader and compare. Validates our L1/L2/data-cluster decode

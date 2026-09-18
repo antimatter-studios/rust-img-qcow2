@@ -1569,6 +1569,22 @@ struct Step {
 #[derive(Debug)]
 struct Job {
     keys: Vec<String>,
+    /// The name GitHub reports this job's check-run under.
+    ///
+    /// Which is the rendered `name:` when there is one, and the job's
+    /// key in `jobs:` when there is not -- the same rule Actions
+    /// itself applies, and the reason `.github-guard` declares
+    /// `qemu-validation` and `test / ubuntu-latest` in two different
+    /// spellings. A guard that asked for the key would miss a job
+    /// renamed out from under a required context; one that asked only
+    /// for `name:` would miss a job that never had one.
+    ///
+    /// The `name:` is taken VERBATIM. `test / ${{ matrix.os }}` is
+    /// stored with its expression unexpanded, because nothing here can
+    /// expand it: the matrix is Actions' to evaluate. Guards over this
+    /// field therefore belong on jobs whose name is a literal, which
+    /// `qemu-validation` is.
+    name: String,
     steps: Vec<Step>,
 }
 
@@ -1666,7 +1682,7 @@ fn parse_workflow(text: &str) -> Workflow {
 
     let mut jobs = Vec::new();
     if let Some(mapping) = field(document, "jobs").and_then(Yaml::as_mapping) {
-        for (_, body) in mapping.iter() {
+        for (key, body) in mapping.iter() {
             let steps = field(body, "steps")
                 .and_then(Yaml::as_sequence)
                 .into_iter()
@@ -1697,6 +1713,9 @@ fn parse_workflow(text: &str) -> Workflow {
                 .collect();
             jobs.push(Job {
                 keys: keys_of(body),
+                name: field(body, "name")
+                    .and_then(scalar_text)
+                    .unwrap_or_else(|| key.as_str().unwrap_or_default().to_string()),
                 steps,
             });
         }
@@ -2394,6 +2413,453 @@ fn the_profile_that_cargo_test_builds_still_checks_for_overflow() {
          debug step is costing a compile and buying nothing.",
         path.display()
     );
+}
+
+/// The names this repository's cross-validation job is made of.
+///
+/// Four literals, because four separate things have to keep agreeing
+/// and each can be changed on its own: the job's rendered `name:` (what
+/// GitHub reports and what `.github-guard` declares as required), the
+/// package that puts `qemu-img` on `PATH`, the integration target the
+/// job selects by name, and the cargo feature without which that target
+/// is not built at all.
+const QEMU_JOB: &str = "qemu-validation";
+const QEMU_PACKAGE: &str = "qemu-utils";
+const QEMU_TARGET: &str = "qemu_validation";
+const QEMU_FEATURE: &str = "qemu-validation";
+
+/// The gating job of `workflow` whose check-run name is `name`.
+///
+/// Gating in the same sense [`collect_steps`] means it -- the workflow
+/// still triggers on a pull request, and neither the job nor the step
+/// carries a key from [`NON_GATING_KEYS`] -- because a job that cannot
+/// turn a pull request red is not a gate whatever it is called. The
+/// steps handed back are only the gating ones, so an `if:` on the
+/// install step hides it from the assertions below rather than
+/// satisfying them.
+fn gating_job_named(workflow: &str, name: &str) -> Option<Job> {
+    let wf = parse_workflow(workflow);
+    if !runs_on_pull_request(&wf) {
+        return None;
+    }
+    let carries_a_non_gating_key =
+        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
+    let mut job = wf
+        .jobs
+        .into_iter()
+        .find(|job| job.name == name && !carries_a_non_gating_key(&job.keys))?;
+    job.steps
+        .retain(|step| !carries_a_non_gating_key(&step.keys));
+    Some(job)
+}
+
+/// Every command a job's gating steps actually run, tokenised.
+///
+/// Through [`command_lines`] and [`shell_commands`], which is the same
+/// grammar the overflow guards above read the workflow with. Reading
+/// `step.run` raw would count a command named in a `#` line -- the
+/// recurring defect this file records in three other places.
+fn job_commands(job: &Job) -> Vec<Vec<String>> {
+    job.steps
+        .iter()
+        .flat_map(|step| command_lines(&step.run))
+        .flat_map(|line| shell_commands(&line))
+        .map(|(words, _)| words)
+        .collect()
+}
+
+/// Whether one tokenised command installs `package` with a system
+/// package manager.
+///
+/// `sudo`, an `env` prefix and leading `NAME=value` assignments are
+/// stepped over; anything else in front of the manager means the
+/// command is not recognised and does not count. An UNRECOGNISED
+/// installer therefore fails the guard rather than passing it, which is
+/// the direction that has to be wrong: someone who changes how
+/// `qemu-img` gets onto the runner changes this list in the same
+/// commit, and someone who deletes the install step gets a red suite
+/// instead of a job that installs nothing and cross-validates against
+/// whatever the image happened to ship.
+fn installs_package(words: &[String], package: &str) -> bool {
+    let mut words = words
+        .iter()
+        .map(String::as_str)
+        .skip_while(|w| *w == "sudo" || *w == "env" || (!w.starts_with('-') && w.contains('=')));
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(program, "apt-get" | "apt" | "brew" | "dnf" | "yum" | "apk") {
+        return false;
+    }
+    let rest: Vec<&str> = words.collect();
+    // `apt-get update` is not an install, and neither is
+    // `apt-get install` with the package named nowhere in it.
+    rest.iter().any(|w| *w == "install" || *w == "add") && rest.contains(&package)
+}
+
+/// Whether one tokenised command is the `cargo test` that runs the
+/// cross-validation suite: the target selected BY NAME and the feature
+/// that makes its bodies compile enabled.
+///
+/// Both halves, because either one alone empties the run silently. The
+/// `[[test]]` entry in `Cargo.toml` carries
+/// `required-features = ["qemu-validation"]`, so without the feature
+/// cargo does not build the target; and `tests/qemu_validation.rs`
+/// opens with `#![cfg(feature = "qemu-validation")]`, so if the
+/// `required-features` entry went away the target would build to an
+/// empty binary and report `0 passed` under the suite's own name. That
+/// is #50, and this is the assertion that the pair is still in place.
+///
+/// `--all-features` counts as enabling it: it does.
+fn runs_the_cross_validation_target(words: &[String]) -> bool {
+    let Some(arguments) = cargo_test_arguments(words) else {
+        return false;
+    };
+    let mut selects_the_target = false;
+    let mut enables_the_feature = false;
+    // The option whose value is the NEXT argument, when the previous
+    // argument was one of the two this cares about.
+    let mut expecting: Option<&str> = None;
+    let names_the_feature = |value: &str| value.split(',').any(|f| f == QEMU_FEATURE);
+
+    for argument in arguments {
+        // Everything after `--` belongs to the test harness.
+        if argument == "--" {
+            break;
+        }
+        if let Some(option) = expecting.take() {
+            match option {
+                "--test" => selects_the_target |= argument == QEMU_TARGET,
+                _ => enables_the_feature |= names_the_feature(argument),
+            }
+            continue;
+        }
+        if let Some((option, value)) = argument.split_once('=') {
+            match option {
+                "--test" => selects_the_target |= value == QEMU_TARGET,
+                "--features" | "-F" => enables_the_feature |= names_the_feature(value),
+                _ => {}
+            }
+            continue;
+        }
+        match argument {
+            "--test" => expecting = Some("--test"),
+            "--features" | "-F" => expecting = Some("--features"),
+            "--all-features" => enables_the_feature = true,
+            // `-Fqemu-validation`, cargo's short form with the value
+            // glued on.
+            _ => {
+                if let Some(value) = argument.strip_prefix("-F") {
+                    if !value.is_empty() {
+                        enables_the_feature |= names_the_feature(value);
+                    }
+                }
+            }
+        }
+    }
+    selects_the_target && enables_the_feature
+}
+
+/// THE ORACLE JOB ITSELF IS NOT GUARDED BY ANYTHING ELSE (#97).
+///
+/// `qemu-validation` is the only job in this repository that compares
+/// what we write with an implementation we did not write. Everything
+/// else here agrees with our own reader about our own writer's output,
+/// which is a statement about internal consistency and not about qcow2.
+/// Twenty-five tests hang off it.
+///
+/// Nothing in the repository asserted that the job still exists. The
+/// floor inside it counts what ran, so it sees the suite emptying --
+/// but only if the step is still there to run the count. Delete the job
+/// and every test in this repository stays green: the floor goes with
+/// it, `--all-targets` does not build the target (its `[[test]]` entry
+/// requires the feature), and the guards above ask about `cargo test`
+/// runs without `--release`, which this job's is not the only one of.
+/// Branch protection would then require a context nothing produces,
+/// which blocks merges rather than letting them through -- so the
+/// failure mode is a repository nobody can merge into, with no test
+/// naming the cause.
+///
+/// This asserts the three facts the job is made of, separately, because
+/// they fail separately:
+///
+/// 1. a gating job whose check-run name is `qemu-validation` -- the
+///    exact string `.github-guard` declares as required;
+/// 2. one of its steps installs `qemu-utils`, so `qemu-img` is on
+///    `PATH`. Without it every test in the suite panics in `run_qemu`,
+///    which is loud; but it is the step most likely to be removed as
+///    "the runner has it", and it is what makes the absence of the tool
+///    a failure rather than a skip -- which is the other half of #97;
+/// 3. one of its steps runs `cargo test` selecting `--test
+///    qemu_validation` WITH `--features qemu-validation`. Either half
+///    missing empties the run while it still exits 0.
+///
+/// It deliberately does not read the floor: what the floor is worth is
+/// its own question, and a guard that asserted the whole step verbatim
+/// would fail on every edit to it and be deleted for that.
+#[test]
+fn the_pr_gate_still_cross_validates_against_qemu_img() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+
+    let job = gating_job_named(&workflow, QEMU_JOB).unwrap_or_else(|| {
+        panic!(
+            "{} defines no gating job whose check-run name is `{QEMU_JOB}`. That \
+             is the only job that compares this crate's output with qemu-img, \
+             it is a required context in .github-guard, and nothing else in \
+             this repository would notice it was gone -- a required check that \
+             no workflow produces blocks every merge instead of gating one.",
+            path.display()
+        )
+    });
+
+    let commands = job_commands(&job);
+
+    assert!(
+        commands
+            .iter()
+            .any(|words| installs_package(words, QEMU_PACKAGE)),
+        "the `{QEMU_JOB}` job in {} no longer installs `{QEMU_PACKAGE}`, so \
+         `qemu-img` is on PATH only if the runner image happens to ship it. \
+         The suite's whole claim is that another implementation agrees with \
+         us; installing the other implementation is not optional.",
+        path.display()
+    );
+
+    assert!(
+        commands
+            .iter()
+            .any(|words| runs_the_cross_validation_target(words)),
+        "the `{QEMU_JOB}` job in {} no longer runs `cargo test --features \
+         {QEMU_FEATURE} --test {QEMU_TARGET}`. Both halves matter: the \
+         `[[test]]` entry requires the feature, so without it the target is \
+         not built, and without the target named this job runs some other \
+         selection under the cross-validation job's name. Either way it exits \
+         0 having cross-validated nothing.",
+        path.display()
+    );
+}
+
+/// The scanner behind `the_pr_gate_still_cross_validates_against_qemu_img`,
+/// checked against the shapes it has to tell apart.
+///
+/// Each of these is a near miss of the real job rather than an obvious
+/// wrong answer: the point of the guard is that the job can be hollowed
+/// out while still looking like itself.
+mod cross_validation_job {
+    use super::{
+        gating_job_named, installs_package, job_commands, runs_the_cross_validation_target,
+        QEMU_JOB, QEMU_PACKAGE,
+    };
+
+    /// The job as `ci.yml` has it, reduced to the three facts the guard
+    /// reads. Every case below is this with one thing changed.
+    const CONTROL: &str = "\
+on:
+  pull_request:
+jobs:
+  qemu-validation:
+    name: qemu-validation
+    steps:
+      - name: install qemu-utils
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
+      - name: qemu cross-validation tests
+        run: |
+          cargo test --locked --features qemu-validation --test qemu_validation
+";
+
+    /// `(job found, installs, runs the target)` for a workflow.
+    fn verdict(workflow: &str) -> (bool, bool, bool) {
+        let Some(job) = gating_job_named(workflow, QEMU_JOB) else {
+            return (false, false, false);
+        };
+        let commands = job_commands(&job);
+        (
+            true,
+            commands
+                .iter()
+                .any(|words| installs_package(words, QEMU_PACKAGE)),
+            commands
+                .iter()
+                .any(|words| runs_the_cross_validation_target(words)),
+        )
+    }
+
+    #[test]
+    fn the_control_shape_satisfies_every_half() {
+        assert_eq!(verdict(CONTROL), (true, true, true));
+    }
+
+    #[test]
+    fn a_job_key_without_a_name_is_still_found_by_its_key() {
+        let without_a_name = CONTROL.replace("    name: qemu-validation\n", "");
+        assert_eq!(
+            verdict(&without_a_name),
+            (true, true, true),
+            "Actions reports a job with no `name:` under its key, so the guard \
+             has to as well"
+        );
+    }
+
+    #[test]
+    fn a_renamed_job_is_not_this_job() {
+        // The key stays, so a guard that looked the job up by key would
+        // still find it -- and the required context, which names the
+        // RENDERED name, would have stopped reporting.
+        let renamed = CONTROL.replace("    name: qemu-validation\n", "    name: qemu\n");
+        assert_eq!(verdict(&renamed), (false, false, false));
+    }
+
+    #[test]
+    fn a_job_that_cannot_fail_a_pull_request_does_not_count() {
+        let conditional = CONTROL.replace(
+            "  qemu-validation:\n",
+            "  qemu-validation:\n    if: github.event_name == 'push'\n",
+        );
+        assert_eq!(verdict(&conditional), (false, false, false));
+
+        let tolerated = CONTROL.replace(
+            "  qemu-validation:\n",
+            "  qemu-validation:\n    continue-on-error: true\n",
+        );
+        assert_eq!(verdict(&tolerated), (false, false, false));
+    }
+
+    #[test]
+    fn a_workflow_that_no_longer_gates_pull_requests_does_not_count() {
+        let pushes_only = CONTROL.replace("  pull_request:\n", "  push:\n");
+        assert_eq!(verdict(&pushes_only), (false, false, false));
+    }
+
+    #[test]
+    fn an_install_step_that_cannot_run_does_not_install() {
+        let conditional = CONTROL.replace(
+            "      - name: install qemu-utils\n",
+            "      - name: install qemu-utils\n        if: runner.os == 'Linux'\n",
+        );
+        assert_eq!(
+            verdict(&conditional),
+            (true, false, true),
+            "an `if:` on the install step means the gate does not depend on it"
+        );
+    }
+
+    #[test]
+    fn updating_the_package_lists_is_not_installing_anything() {
+        let only_update = CONTROL.replace(
+            "sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils",
+            "sudo apt-get update",
+        );
+        assert_eq!(verdict(&only_update), (true, false, true));
+    }
+
+    #[test]
+    fn installing_a_different_package_is_not_installing_this_one() {
+        let other = CONTROL.replace(
+            "--no-install-recommends qemu-utils",
+            "--no-install-recommends qemu-system-x86",
+        );
+        assert_eq!(verdict(&other), (true, false, true));
+    }
+
+    #[test]
+    fn a_package_named_only_in_a_comment_is_not_installed() {
+        let commented = CONTROL.replace(
+            "        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils\n",
+            "        run: |\n          # sudo apt-get install -y qemu-utils\n          sudo apt-get update\n",
+        );
+        assert_eq!(verdict(&commented), (true, false, true));
+    }
+
+    #[test]
+    fn the_spellings_that_really_install_it_still_count() {
+        for command in [
+            "sudo apt-get install -y --no-install-recommends qemu-utils",
+            "sudo apt install -y qemu-utils",
+            "apt-get install qemu-utils",
+            "/usr/bin/apt-get install -y qemu-utils",
+            "brew install qemu-utils",
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-utils",
+        ] {
+            let workflow = CONTROL.replace(
+                "sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils",
+                command,
+            );
+            assert_eq!(
+                verdict(&workflow),
+                (true, true, true),
+                "`{command}` does install the package"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_selected_without_the_feature_builds_nothing() {
+        let featureless = CONTROL.replace("--features qemu-validation ", "");
+        assert_eq!(
+            verdict(&featureless),
+            (true, true, false),
+            "the [[test]] entry requires the feature, so cargo would not build \
+             the target at all"
+        );
+    }
+
+    #[test]
+    fn the_feature_without_the_target_is_some_other_selection() {
+        let unnamed = CONTROL.replace("--test qemu_validation", "--all-targets");
+        assert_eq!(verdict(&unnamed), (true, true, false));
+    }
+
+    #[test]
+    fn another_targets_name_is_not_this_targets_name() {
+        let elsewhere = CONTROL.replace("--test qemu_validation", "--test synthetic");
+        assert_eq!(verdict(&elsewhere), (true, true, false));
+    }
+
+    #[test]
+    fn a_filter_that_merely_reads_like_the_target_does_not_select_it() {
+        // `cargo test --features qemu-validation qemu_validation` runs
+        // every target and filters by NAME. That is not the same run --
+        // it does not build `tests/qemu_validation.rs` under its
+        // `required-features` entry -- and the option spelling is what
+        // tells them apart.
+        let filtered = CONTROL.replace("--test qemu_validation", "qemu_validation");
+        assert_eq!(verdict(&filtered), (true, true, false));
+    }
+
+    #[test]
+    fn the_spellings_that_really_select_it_still_count() {
+        for command in [
+            "cargo test --locked --features qemu-validation --test qemu_validation",
+            "cargo test --locked --features=qemu-validation --test=qemu_validation",
+            "cargo test --locked -F qemu-validation --test qemu_validation",
+            "cargo test --locked -Fqemu-validation --test qemu_validation",
+            "cargo test --locked --features zstd,qemu-validation --test qemu_validation",
+            "cargo test --locked --all-features --test qemu_validation",
+        ] {
+            let workflow = CONTROL.replace(
+                "cargo test --locked --features qemu-validation --test qemu_validation",
+                command,
+            );
+            assert_eq!(
+                verdict(&workflow),
+                (true, true, true),
+                "`{command}` does run the cross-validation suite"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_argument_is_not_cargos() {
+        // Everything after `--` is the test harness's, where
+        // `--features` would be a filter and not a feature.
+        let harness = CONTROL.replace(
+            "cargo test --locked --features qemu-validation --test qemu_validation",
+            "cargo test --locked --test qemu_validation -- --features qemu-validation",
+        );
+        assert_eq!(verdict(&harness), (true, true, false));
+    }
 }
 
 /// The shell scanner is the part of this that can rot, so it is checked
