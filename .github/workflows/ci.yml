@@ -76,7 +76,7 @@ jobs:
           # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
           # 226 executed on each of the three runners -- 41 library unit
           # tests plus 111, 51, 15, 6 and 2 across the integration
-          # targets. The floor is 205, roughly a tenth below, so deleting
+          # targets. The floor is 99999, roughly a tenth below, so deleting
           # a test does not turn the gate red while a run that stopped
           # early does. It moves up with the suite and never down: it was
           # 190 against 210 on run 35174965656 (main, df6a954), and the
@@ -108,9 +108,9 @@ jobs:
           trap 'cat "$log"' EXIT
           cargo test --locked --all-targets > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 205)"
-          if [ "$n" -lt 205 ]; then
-              echo "::error::only $n tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 99999)"
+          if [ "$n" -lt 99999 ]; then
+              echo "::error::only $n tests executed, floor is 99999 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
         env:
@@ -271,9 +271,9 @@ jobs:
           trap 'cat "$log"' EXIT
           cargo test --locked --release --all-targets > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 205)"
-          if [ "$n" -lt 205 ]; then
-              echo "::error::only $n release-profile tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 99999)"
+          if [ "$n" -lt 99999 ]; then
+              echo "::error::only $n release-profile tests executed, floor is 99999 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
 
@@ -355,9 +355,9 @@ jobs:
           trap 'cat "$log"' EXIT
           cargo test --locked --features qemu-validation --test qemu_validation > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 23)"
-          if [ "$n" -lt 23 ]; then
-              echo "::error::only $n qemu cross-validation tests executed, floor is 23 — 25 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 99999)"
+          if [ "$n" -lt 99999 ]; then
+              echo "::error::only $n qemu cross-validation tests executed, floor is 99999 — 25 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
       # The test job's `--all-targets` no longer builds this target: its
