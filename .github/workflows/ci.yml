@@ -73,12 +73,16 @@ jobs:
           # suite that ran in full all report the same green. Nothing in
           # this workflow could tell them apart, because nothing counted.
           #
-          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 210
-          # executed on each of the three runners -- 41 library unit tests
-          # plus 94, 52, 15, 6 and 2 across the integration targets. The
-          # floor is 190, roughly a tenth below, so deleting a test does
-          # not turn the gate red while a run that stopped early does. It
-          # moves up with the suite and never down.
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
+          # 226 executed on each of the three runners -- 41 library unit
+          # tests plus 111, 51, 15, 6 and 2 across the integration
+          # targets. The floor is 205, roughly a tenth below, so deleting
+          # a test does not turn the gate red while a run that stopped
+          # early does. It moves up with the suite and never down: it was
+          # 190 against 210 on run 35174965656 (main, df6a954), and the
+          # suite grew by the seventeen guards tests/ci_profile.rs gained
+          # for #97, less the one test #97 moved out of
+          # tests/synthetic.rs and into tests/qemu_validation.rs.
           #
           # THE OUTPUT IS REDIRECTED RATHER THAN PIPED THROUGH `tee`, and
           # that is not a style choice. tests/ci_profile.rs refuses a
@@ -104,9 +108,9 @@ jobs:
           trap 'cat "$log"' EXIT
           cargo test --locked --all-targets > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 190)"
-          if [ "$n" -lt 190 ]; then
-              echo "::error::only $n tests executed, floor is 190 — 210 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 205)"
+          if [ "$n" -lt 205 ]; then
+              echo "::error::only $n tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
         env:
@@ -257,17 +261,19 @@ jobs:
           # why a green `cargo test` is not evidence on its own, and why
           # the output is redirected rather than piped through `tee`.
           #
-          # Measured 2026-09-18 on run RUN_ID_PLACEHOLDER: N_PLACEHOLDER
-          # executed. Floor 190, roughly a tenth below, so deleting a
-          # test does not turn the gate red while a run that stopped
-          # early does. It moves up with the suite and never down.
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
+          # 226 executed, the same number the debug matrix ran in the
+          # same run and deliberately counted separately from it. Floor
+          # 205, roughly a tenth below, so deleting a test does not turn
+          # the gate red while a run that stopped early does. It moves up
+          # with the suite and never down.
           log=$(mktemp)
           trap 'cat "$log"' EXIT
           cargo test --locked --release --all-targets > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 190)"
-          if [ "$n" -lt 190 ]; then
-              echo "::error::only $n release-profile tests executed, floor is 190 — N_PLACEHOLDER ran on 2026-09-18 in run RUN_ID_PLACEHOLDER, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 205)"
+          if [ "$n" -lt 205 ]; then
+              echo "::error::only $n release-profile tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
 
@@ -326,8 +332,10 @@ jobs:
           # `qemu-validation`, so the matrix's `--all-targets` does not
           # build this target and nothing else would notice (#50, #99).
           #
-          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 24
-          # executed. Floor 22.
+          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72): 25
+          # executed. Floor 23 -- the same margin of two as the 24-against-
+          # 22 it replaces. The twenty-fifth is the test #97 moved here
+          # from tests/synthetic.rs, where it had never run.
           #
           # The floor counts what RAN, not what checked, and no number
           # can fix a test that returns early when its tool is missing.
@@ -347,9 +355,9 @@ jobs:
           trap 'cat "$log"' EXIT
           cargo test --locked --features qemu-validation --test qemu_validation > "$log" 2>&1
           n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 22)"
-          if [ "$n" -lt 22 ]; then
-              echo "::error::only $n tests executed, floor is 22 — 24 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
+          echo "tests executed: $n (floor 23)"
+          if [ "$n" -lt 23 ]; then
+              echo "::error::only $n qemu cross-validation tests executed, floor is 23 — 25 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
               exit 1
           fi
       # The test job's `--all-targets` no longer builds this target: its
