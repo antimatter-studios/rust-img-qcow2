@@ -10,7 +10,7 @@
 # reporting under the github-actions app changes what is required without
 # anyone deciding to. Pinning it costs nothing and makes the intent reviewable.
 #
-# WRITTEN BECAUSE THE GUESS WAS ALREADY WRONG HERE (#99). ci.yml produces six
+# WRITTEN BECAUSE THE GUESS WAS ALREADY WRONG HERE (#99). ci.yml produced six
 # check runs; the settings page required five. The one left out was
 # `test / i686-unknown-linux-gnu`, and of the six it is the least redundant:
 # this crate addresses a disk image by 64-bit offsets and cluster indices, and
@@ -31,6 +31,31 @@
 # report on a PR. A required check that never reports is a permanent block,
 # which is why release.yml's jobs are deliberately absent.
 #
+# THE SEVENTH NAME, AND THE ORDER IN WHICH IT BECOMES A GATE (#98).
+#
+# `test (release)` is added to ci.yml in the same pull request that adds this
+# line. Until now every `cargo test` in this repository built the `test`
+# profile, which inherits from `dev`; the crate published to crates.io is built
+# with `[profile.release]`, and nothing ran a single test against it. It is not
+# a duplicate of the matrix: release lets an integer overflow wrap where debug
+# panics and drops every `debug_assert!` body, so a test guarding a wrapping
+# computation passes the debug run for the wrong reason while the behaviour it
+# guards against is live in the shipped library. The long comment above the job
+# has the rest.
+#
+# THE SPELLING IS `test (release)` AND NOTHING ELSE. It comes from the job's
+# `name:`, which is our own text: literal parentheses, a single space, and NO
+# slash. `test / release` -- the matrix shape a few lines up -- is a name
+# nothing will ever report, and with enforce_admins on that is a repository
+# nobody can merge into.
+#
+# ORDERING. github-guard promotes a declared name to required only once it has
+# been green on `main`, so declaring it here in the same commit that creates the
+# job does not strand this pull request: the job reports, the pull request
+# merges on the six names already required, and the seventh becomes a gate on
+# the next reconciliation after `main` is green. That is the intended sequence,
+# not a gap.
+#
 # THE BETTER END STATE IS ONE AGGREGATE JOB. A `ci-ok` job that `needs:` every
 # gating job and fails on failure/cancelled/skipped would let the matrix be
 # renamed, split or made conditional without ever stranding a merge, and this
@@ -43,3 +68,4 @@
 	required = test / macos-latest
 	required = test / windows-latest
 	required = test / i686-unknown-linux-gnu
+	required = test (release)
