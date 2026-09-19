@@ -45,76 +45,52 @@ jobs:
         run: cargo build --locked --all-targets
       - name: test
         working-directory: rust-img-qcow2
+        # QUIET BY DEFAULT: the whole run goes to tmp/logs/debug.log and is
+        # uploaded below; this step prints a verdict line and the executed-test
+        # count. A failure prints the tail of the log. See the measured budget
+        # table at the top of chores.yml, and scripts/tier.sh.
+        #
         # EXPECT_OVERFLOW_CHECKS ARMS THE ONE CHECK A TEXT SCAN CANNOT DO.
-        # This run has no `--release`, so overflow-checks are on, and it
-        # is what makes every arithmetic test in this crate mean anything.
+        # This run has no `--release`, so overflow-checks are on, and it is
+        # what makes every arithmetic test in this crate mean anything. The
+        # variable tells `overflow_checks::the_build_the_gate_asked_to_check
+        # _does_check` in src/lib.rs that THIS is the run that must trap an
+        # overflow. It is an `env:` mapping rather than an inline prefix
+        # because this job also runs on windows-latest. Do not add `--release`
+        # and do not drop the variable: tests/ci_profile.rs fails if no
+        # `cargo test` here runs without `--release` while setting it (#60).
         #
-        # The variable tells `overflow_checks::the_build_the_gate_asked_to
-        # _check_does_check` in src/lib.rs that THIS is the run that must
-        # trap an overflow -- asking the build directly rather than
-        # inferring it from which spellings of "disabled" happen to be
-        # absent from Cargo.toml. It is declared as an `env:` mapping
-        # rather than inline as `VAR=1 cargo test`. That was originally
-        # because this job also runs on windows-latest, where the prefix
-        # is a PowerShell syntax error; the step now asks for
-        # `shell: bash` on every runner (the floor below needs `awk`),
-        # and the mapping stays because it reaches the run wherever the
-        # run sits in the script, which an inline prefix does not.
+        # THE FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE (#99).
+        # `cargo test` exits 0 on "0 passed; 0 failed", so a filter that
+        # selects nothing, a build that produced no test binaries, and a suite
+        # that ran in full all report the same green -- and the empty run is
+        # also the one that fits its output budget best. Measured 2026-09-19
+        # on an arm64 Linux host: 248 executed on each runner. The floor is
+        # 225, roughly a tenth below, so deleting a test does not turn the gate
+        # red while a run that stopped early does. It only ever goes up: it was
+        # 205 against 226 on run 35294153437 before the output-budget guards
+        # added eighteen tests. A COUNT ANSWERS "DID ANYTHING RUN", NOT "DID IT
+        # CHECK ANYTHING" -- a test that returns early because a tool is
+        # missing still counts as passed, which is what #97 was.
         #
-        # Do not add `--release` to this run, and do not drop the
-        # variable: tests/ci_profile.rs reads this file and fails if no
-        # `cargo test` in it runs without `--release` while setting this.
-        # See #60.
+        # `shell: bash` on every runner, because the tier scripts are bash.
         shell: bash
         run: |
-          # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE (#99).
-          # `cargo test` exits 0 on "0 passed; 0 failed", so a filter that
-          # selects nothing, a build that produced no test binaries, and a
-          # suite that ran in full all report the same green. Nothing in
-          # this workflow could tell them apart, because nothing counted.
-          #
-          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
-          # 226 executed on each of the three runners -- 41 library unit
-          # tests plus 111, 51, 15, 6 and 2 across the integration
-          # targets. The floor is 205, roughly a tenth below, so deleting
-          # a test does not turn the gate red while a run that stopped
-          # early does. It moves up with the suite and never down: it was
-          # 190 against 210 on run 35174965656 (main, df6a954), and the
-          # suite grew by the seventeen guards tests/ci_profile.rs gained
-          # for #97, less the one test #97 moved out of
-          # tests/synthetic.rs and into tests/qemu_validation.rs.
-          #
-          # THE OUTPUT IS REDIRECTED RATHER THAN PIPED THROUGH `tee`, and
-          # that is not a style choice. tests/ci_profile.rs refuses a
-          # `cargo test` whose exit status the step does not read, and
-          # Actions runs a step's shell without `pipefail`, so
-          # `cargo test | tee` would report tee's status -- turning the
-          # one run that can see an arithmetic overflow into an advisory
-          # one, which is the exact defect that file exists to prevent.
-          # The `trap` puts the suite's output back on the step's log.
-          # It also means the count does not run after a FAILED suite:
-          # `set -e` ends the step at the run, which is right -- a red
-          # suite is already red, and this floor is here for a green one.
-          #
-          # A COUNT ANSWERS "DID ANYTHING RUN", NOT "DID IT CHECK
-          # ANYTHING". A test that returns early because a tool is
-          # missing still counts as passed, which is what #97 was: a
-          # `qemu-img` probe in tests/synthetic.rs that returned on
-          # every runner in every job because only the qemu-validation
-          # job installs qemu-utils, and this count could not see it.
-          # That test now lives in tests/qemu_validation.rs, where the
-          # tool's absence is a panic rather than a pass.
-          log=$(mktemp)
-          trap 'cat "$log"' EXIT
-          cargo test --locked --all-targets > "$log" 2>&1
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 205)"
-          if [ "$n" -lt 205 ]; then
-              echo "::error::only $n tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
-              exit 1
-          fi
+          bash scripts/tier.sh "test (debug)" debug 420 28000 -- cargo test --locked --all-targets
+          bash scripts/test-floor.sh debug 225
         env:
           EXPECT_OVERFLOW_CHECKS: "1"
+      - name: keep the tier log
+        # `always()`, so the log survives the failure it exists to explain.
+        # A failing tier already prints its tail into this job log; this is
+        # what keeps the whole run once the runner is gone.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-test-${{ matrix.os }}
+          path: rust-img-qcow2/tmp/logs/
+          if-no-files-found: warn
+          retention-days: 7
       - name: clippy
         working-directory: rust-img-qcow2
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -146,31 +122,30 @@ jobs:
           workspaces: rust-img-qcow2
       - name: lib tests (32-bit)
         working-directory: rust-img-qcow2
+        # ITS OWN TIER, ITS OWN BUDGET AND ITS OWN FLOOR, BECAUSE THIS
+        # SELECTION CAN EMPTY ON ITS OWN. `--lib` on a 32-bit target compiles
+        # the `#[cfg(target_pointer_width = "32")]` tests that no other job in
+        # this workflow builds, and drops every integration target the matrix
+        # runs. Either set can empty without touching the other -- a missing
+        # `rustup target add`, a cfg that stops matching, or a `--target` that
+        # no longer resolves would leave this job green having compiled
+        # nothing to run.
+        #
+        # Measured 2026-09-17 on run 35174965656 (main, df6a954): 42 executed,
+        # one more than the 41 the 64-bit legs run, and that one is the whole
+        # reason this job exists. Floor 38.
+        shell: bash
         run: |
-          # ITS OWN FLOOR, BECAUSE THIS SELECTION CAN EMPTY ON ITS OWN.
-          # See the floor in the `test` job above for why a count is the
-          # only thing that can see an absence. This run needs a separate
-          # number because it selects a different set: `--lib` on a
-          # 32-bit target compiles the `#[cfg(target_pointer_width =
-          # "32")]` tests that no other job in this workflow builds, and
-          # drops every integration target the matrix runs. Either set
-          # can empty without touching the other -- a missing
-          # `rustup target add`, a cfg that stops matching, or a
-          # `--target` that no longer resolves would leave this job
-          # green having compiled nothing to run.
-          #
-          # Measured 2026-09-17 on run 35174965656 (main, df6a954): 42
-          # executed, one more than the 41 the 64-bit legs run, and that
-          # one is the whole reason this job exists. Floor 38.
-          log=$(mktemp)
-          trap 'cat "$log"' EXIT
-          cargo test --locked --lib --target i686-unknown-linux-gnu > "$log" 2>&1
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 38)"
-          if [ "$n" -lt 38 ]; then
-              echo "::error::only $n tests executed, floor is 38 — 42 ran on 2026-09-17 in run 35174965656, and a run that executes less than that stopped early rather than passed"
-              exit 1
-          fi
+          bash scripts/tier.sh "test (32-bit lib)" lib32 200 14000 -- cargo test --locked --lib --target i686-unknown-linux-gnu
+          bash scripts/test-floor.sh lib32 38
+      - name: keep the tier log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-lib32
+          path: rust-img-qcow2/tmp/logs/
+          if-no-files-found: warn
+          retention-days: 7
 
   # THE PROFILE THAT SHIPS IS NOT THE PROFILE THE TESTS RUN IN (#98).
   #
@@ -247,35 +222,33 @@ jobs:
           workspaces: rust-img-qcow2
       - name: test --release
         working-directory: rust-img-qcow2
+        # ITS OWN TIER, NOT THE MATRIX'S, BECAUSE THIS IS A DIFFERENT RUN
+        # SELECTION. It builds the same targets today and counts the same
+        # number, but it is a separate `cargo test` in a separate profile: a
+        # release-only build failure, a `#[cfg(debug_assertions)]` that takes
+        # a module out of the release build, or a future narrowing of this
+        # command empties this run without touching the matrix, and one shared
+        # number would be satisfied by the other job while proving nothing
+        # about this one.
+        #
+        # Measured 2026-09-19 on this host: 248 executed, the same number the
+        # debug matrix ran and deliberately counted separately from it. Floor
+        # 225, roughly a tenth below, so deleting a test does not turn the gate
+        # red while a run that stopped early does. It moves up with the suite
+        # and never down: it was 205 against 226 before the output-budget
+        # guards added eighteen tests.
         shell: bash
         run: |
-          # ITS OWN FLOOR, NOT THE MATRIX'S, BECAUSE THIS IS A DIFFERENT
-          # RUN SELECTION. It builds the same targets today and counts
-          # the same number, but it is a separate `cargo test` in a
-          # separate profile: a release-only build failure, a
-          # `#[cfg(debug_assertions)]` that takes a module out of the
-          # release build, or a future narrowing of this command empties
-          # this run without touching the matrix, and one shared number
-          # would be satisfied by the other job while proving nothing
-          # about this one. See the floor in the `test` job above for
-          # why a green `cargo test` is not evidence on its own, and why
-          # the output is redirected rather than piped through `tee`.
-          #
-          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72):
-          # 226 executed, the same number the debug matrix ran in the
-          # same run and deliberately counted separately from it. Floor
-          # 205, roughly a tenth below, so deleting a test does not turn
-          # the gate red while a run that stopped early does. It moves up
-          # with the suite and never down.
-          log=$(mktemp)
-          trap 'cat "$log"' EXIT
-          cargo test --locked --release --all-targets > "$log" 2>&1
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 205)"
-          if [ "$n" -lt 205 ]; then
-              echo "::error::only $n release-profile tests executed, floor is 205 — 226 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
-              exit 1
-          fi
+          bash scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets
+          bash scripts/test-floor.sh release 225
+      - name: keep the tier log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-release
+          path: rust-img-qcow2/tmp/logs/
+          if-no-files-found: warn
+          retention-days: 7
 
   fmt:
     name: fmt
@@ -318,48 +291,43 @@ jobs:
           workspaces: rust-img-qcow2
       - name: qemu cross-validation tests
         working-directory: rust-img-qcow2
+        # THE MOST EXPOSED SELECTION IN THE FILE, so it has the loudest
+        # floor. `--test qemu_validation` names a target: rename
+        # tests/qemu_validation.rs, or the `[[test]]` entry in Cargo.toml that
+        # gives it that name, and the selection matches nothing. `cargo test`
+        # then exits 0 having run no test, this job reports green, and the
+        # crate's only cross-validation against `qemu-img` -- the thing that
+        # decides whether the images we write are qcow2 rather than merely
+        # self-consistent -- silently stops running. The feature gate makes
+        # that more likely, not less: the `[[test]]` entry requires
+        # `qemu-validation`, so the matrix's `--all-targets` does not build
+        # this target and nothing else would notice (#50, #99).
+        #
+        # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72): 25
+        # executed. Floor 23.
+        #
+        # The floor counts what RAN, not what checked, and no number can fix a
+        # test that returns early when its tool is missing. Nothing in this
+        # file does that any more: the helpers go through `run_qemu`, which
+        # panics naming the package when `qemu-img` cannot be spawned (#97).
+        #
+        # THE JOB ITSELF IS GUARDED TOO.
+        # `the_pr_gate_still_cross_validates_against_qemu_img` in
+        # tests/ci_profile.rs reads this file and fails unless a gating job
+        # named `qemu-validation` installs `qemu-utils` and runs `--features
+        # qemu-validation --test qemu_validation`.
+        shell: bash
         run: |
-          # ITS OWN FLOOR, AND THE MOST EXPOSED SELECTION IN THE FILE.
-          # `--test qemu_validation` names a target: rename
-          # tests/qemu_validation.rs, or the `[[test]]` entry in
-          # Cargo.toml that gives it that name, and the selection matches
-          # nothing. `cargo test` then exits 0 having run no test, this
-          # job reports green, and the crate's only cross-validation
-          # against `qemu-img` -- the thing that decides whether the
-          # images we write are qcow2 rather than merely self-consistent
-          # -- silently stops running. The feature gate makes that more
-          # likely, not less: the `[[test]]` entry requires
-          # `qemu-validation`, so the matrix's `--all-targets` does not
-          # build this target and nothing else would notice (#50, #99).
-          #
-          # Measured 2026-09-18 on run 35294153437 (PR #102, 909ec72): 25
-          # executed. Floor 23 -- the same margin of two as the 24-against-
-          # 22 it replaces. The twenty-fifth is the test #97 moved here
-          # from tests/synthetic.rs, where it had never run.
-          #
-          # The floor counts what RAN, not what checked, and no number
-          # can fix a test that returns early when its tool is missing.
-          # Nothing in this file does that any more: the helpers here go
-          # through `run_qemu`, which panics naming the package when
-          # `qemu-img` cannot be spawned. That was #97.
-          #
-          # THE JOB ITSELF IS NOW GUARDED TOO.
-          # `the_pr_gate_still_cross_validates_against_qemu_img` in
-          # tests/ci_profile.rs reads this file and fails unless a
-          # gating job named `qemu-validation` installs `qemu-utils`
-          # and runs `--features qemu-validation --test
-          # qemu_validation`. Before it, deleting this whole job left
-          # every test in the repository green -- the floor goes with
-          # the step it lives in.
-          log=$(mktemp)
-          trap 'cat "$log"' EXIT
-          cargo test --locked --features qemu-validation --test qemu_validation > "$log" 2>&1
-          n=$(grep -aoE 'test result: ok\. [0-9]+ passed' "$log" | awk '{s+=$4} END{print s+0}')
-          echo "tests executed: $n (floor 23)"
-          if [ "$n" -lt 23 ]; then
-              echo "::error::only $n qemu cross-validation tests executed, floor is 23 — 25 ran on 2026-09-18 in run 35294153437, and a run that executes less than that stopped early rather than passed"
-              exit 1
-          fi
+          bash scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation
+          bash scripts/test-floor.sh qemu 23
+      - name: keep the tier log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-qemu
+          path: rust-img-qcow2/tmp/logs/
+          if-no-files-found: warn
+          retention-days: 7
       # The test job's `--all-targets` no longer builds this target: its
       # [[test]] entry requires the feature (#50). So it is linted here,
       # where it is built.
