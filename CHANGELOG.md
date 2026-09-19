@@ -7,6 +7,26 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **The header and mapping parsers are fuzzed, on two tiers.** Every field
+  a qcow2 image controls is an offset or a shift used in arithmetic —
+  `cluster_bits`, `l1_size`, `l1_table_offset`, `refcount_table_offset` —
+  and none of it had a fuzz target. `fuzz/` holds `image` and `header`
+  and runs nightly on a bounded budget; `tests/fuzz_decoders.rs` is the
+  gate, replaying and mutating the same corpus deterministically on the
+  stable toolchain in under a second.
+
+  The corpus is five images `qemu-img` wrote: the default cluster size, a
+  small one, a version 2 file, a compressed one, and one with a backing
+  reference. `the_corpus_reads_back_what_qemu_img_wrote` checks that this
+  crate returns the pattern `qemu-img` put there — `A` at 0, `B` at
+  500,000, zeros in the hole between — so the reference implementation is
+  the standard on every pull request, on a machine with no `qemu-img`
+  installed. It also asserts that a backed image opened on a *device* is
+  refused for the backing chain rather than silently returning the holes
+  as zeros (#107).
+
 ## [0.4.5] — 2026-09-06
 
 ### Fixed
