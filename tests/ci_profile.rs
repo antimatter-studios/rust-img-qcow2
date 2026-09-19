@@ -53,6 +53,7 @@
 //! declaration to lose.
 
 use saphyr::{LoadableYamlNode, Yaml};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn manifest_dir() -> PathBuf {
@@ -818,6 +819,60 @@ fn scan_shell(line: &str) -> ShellScan {
     }
 }
 
+/// The command `scripts/tier.sh` was asked to run, or `words` unchanged.
+///
+/// # WHY A WRAPPER IS RECOGNISED HERE AND NOWHERE ELSE
+///
+/// Every test run in `ci.yml` now goes through `scripts/tier.sh`, which
+/// runs it quietly under an output budget:
+///
+/// ```text
+/// bash scripts/tier.sh "test (debug)" debug 360 24000 -- cargo test --locked --all-targets
+/// ```
+///
+/// That is still a `cargo test`, and every assertion in this file has
+/// to read it as one -- the profile it builds, the handshake that arms
+/// the overflow probe, the target the cross-validation job selects.
+/// Left unrecognised, `cargo_test_arguments` returns `None` for all of
+/// them and the guards go quiet: they would find NO debug run in the
+/// workflow and fail loudly, which is the safe direction but the wrong
+/// answer.
+///
+/// THE OPPOSITE DIRECTION IS THE DANGEROUS ONE, so this is deliberately
+/// narrow. Only a word that IS the tier script counts -- `tier.sh`
+/// under a `scripts/` directory -- and only what follows the first `--`
+/// after it is returned, which is exactly what `tier.sh` execs. A
+/// wrapper this file does not know is still unrecognised, and its
+/// `cargo test` still does not count.
+///
+/// A tier invocation with no `--` runs nothing at all (`tier.sh` exits
+/// 2 on it), so the empty slice is the honest answer and yields `None`
+/// from every caller.
+fn without_the_tier_wrapper(words: &[String]) -> &[String] {
+    let is_the_tier_script = |w: &String| {
+        matches!(
+            w.rsplit('/').next(),
+            Some("tier.sh") if w.contains('/') && w.split('/').any(|part| part == "scripts")
+        )
+    };
+    let Some(at) = words.iter().position(is_the_tier_script) else {
+        return words;
+    };
+    // Anything in front of it must be an interpreter or an environment
+    // assignment; `sudo scripts/tier.sh` or `echo scripts/tier.sh` is
+    // not a tier invocation and is not unwrapped.
+    let leading_is_harmless = words[..at].iter().all(|w| {
+        w == "env" || w == "bash" || w == "sh" || (!w.starts_with('-') && w.contains('='))
+    });
+    if !leading_is_harmless {
+        return words;
+    }
+    match words[at..].iter().position(|w| w == "--") {
+        Some(separator) => &words[at + separator + 1..],
+        None => &words[words.len()..],
+    }
+}
+
 /// The arguments of a `cargo test` invocation on this line, or `None`
 /// if the line does not invoke one.
 ///
@@ -838,7 +893,11 @@ fn scan_shell(line: &str) -> ShellScan {
 /// between `cargo` and its subcommand. A wrapper -- `sudo`, `xargs`, a
 /// script -- is not recognised and the command does not count, which is
 /// the strict direction.
+///
+/// `scripts/tier.sh` IS THE ONE EXCEPTION, and it is named rather than
+/// inferred: see [`without_the_tier_wrapper`].
 fn cargo_test_arguments(words: &[String]) -> Option<Vec<&str>> {
+    let words = without_the_tier_wrapper(words);
     let mut words = words
         .iter()
         .map(String::as_str)
@@ -5112,6 +5171,488 @@ jobs:
             gating_runs_that_prove_the_build_traps(&yaml).len(),
             1,
             "`env:` says nothing about whether the step's result is read"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE OUTPUT BUDGET
+// ---------------------------------------------------------------------------
+//
+// A test run that prints three thousand lines hides the twenty that matter,
+// and every reader pays for it: a person scrolling, a CI log viewer, and an
+// agent working in the repository, which re-reads its whole transcript on
+// every step and so pays for one loud run many times over. Measured across
+// this constellation: 4,661M cache-read tokens against 9.5M of output, with
+// command output the largest single contributor a repository controls.
+//
+// So every test run in `ci.yml` goes through `scripts/tier.sh`, which writes
+// the whole run to `tmp/logs/<tier>.log`, prints one verdict line, prints the
+// TAIL when the run fails, and fails a run that passed while printing more
+// than its measured budget (exit 65, told apart from a red suite by its
+// status).
+//
+// Three things can rot, and each has an assertion below:
+//
+//   1. a `cargo test` added to the workflow without the wrapper, which is
+//      quiet-by-default decaying back into a convention;
+//   2. a budget of zero, which `output-budget.sh` reads as "no budget" --
+//      the shape that looks like compliance and measures nothing;
+//   3. `chores.yml` and `ci.yml` drifting apart. They MUST carry the same
+//      numbers: a person runs the tiers through `chore` before pushing and
+//      the gate runs them through the workflow, and a tier that fits locally
+//      and not in CI is a gate that only fails after the push. The workflow
+//      cannot read `chores.yml` -- that would mean installing `chore` on
+//      three runner platforms to learn two integers -- so the numbers are
+//      written twice and CHECKED, rather than written twice and trusted.
+//
+// And the floor goes with the tier: wrapping a run must not cost the thing
+// that notices the run executed nothing (#99).
+
+/// `chores.yml`, beside this crate's `Cargo.toml`.
+fn chores_yml() -> PathBuf {
+    manifest_dir().join("chores.yml")
+}
+
+/// A tier's output budget: the two numbers `scripts/tier.sh` passes on to
+/// `output-budget.sh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    lines: u64,
+    bytes: u64,
+}
+
+/// The tier a command runs and the budget it runs it under, for
+/// `[env|bash] scripts/tier.sh LABEL LOG MAX-LINES MAX-BYTES -- COMMAND...`.
+///
+/// `None` for anything else, INCLUDING a malformed tier invocation: the
+/// numbers are read with `parse`, so `scripts/tier.sh t log a b -- ...`
+/// is not a budget this file will vouch for. `tier.sh` itself exits 2 on
+/// a short argument list, so the two agree about what counts.
+fn tier_invocation(words: &[String]) -> Option<(String, Budget)> {
+    let is_the_tier_script = |w: &&String| {
+        w.rsplit('/').next() == Some("tier.sh") && w.split('/').any(|part| part == "scripts")
+    };
+    let at = words.iter().position(|w| is_the_tier_script(&w))?;
+    if !words[..at]
+        .iter()
+        .all(|w| w == "env" || w == "bash" || w == "sh" || (!w.starts_with('-') && w.contains('=')))
+    {
+        return None;
+    }
+    // LABEL LOG MAX-LINES MAX-BYTES, then `--` and the command.
+    let rest = &words[at + 1..];
+    let log = rest.get(1)?.clone();
+    let lines = rest.get(2)?.parse().ok()?;
+    let bytes = rest.get(3)?.parse().ok()?;
+    if rest.get(4).map(String::as_str) != Some("--") {
+        return None;
+    }
+    Some((log, Budget { lines, bytes }))
+}
+
+/// The tier a `scripts/test-floor.sh TIER FLOOR` command counts, and the
+/// floor it holds it to.
+fn floor_check(words: &[String]) -> Option<(String, u64)> {
+    let is_the_floor_script = |w: &&String| {
+        w.rsplit('/').next() == Some("test-floor.sh") && w.split('/').any(|part| part == "scripts")
+    };
+    let at = words.iter().position(|w| is_the_floor_script(&w))?;
+    if !words[..at]
+        .iter()
+        .all(|w| w == "env" || w == "bash" || w == "sh")
+    {
+        return None;
+    }
+    let rest = &words[at + 1..];
+    Some((rest.first()?.clone(), rest.get(1)?.parse().ok()?))
+}
+
+/// Every command `chores.yml` runs, tokenised with the same grammar the
+/// workflow is read with.
+///
+/// `cmds:` entries that are `- task: other` are mappings rather than
+/// strings and carry no command of their own; they are skipped, and the
+/// task they name is walked in its own right.
+fn chores_commands(text: &str) -> Vec<Vec<String>> {
+    let documents = Yaml::load_from_str(text)
+        .unwrap_or_else(|e| panic!("chores.yml does not parse as YAML: {e}"));
+    let root = documents
+        .first()
+        .unwrap_or_else(|| panic!("chores.yml is empty"));
+    let tasks = field(root, "tasks")
+        .unwrap_or_else(|| panic!("chores.yml has no `tasks:` mapping"))
+        .as_mapping()
+        .unwrap_or_else(|| panic!("chores.yml's `tasks:` is not a mapping"));
+
+    let mut scripts = Vec::new();
+    for (_, task) in tasks.iter() {
+        let Some(cmds) = field(task, "cmds") else {
+            continue;
+        };
+        if let Some(text) = cmds.as_str() {
+            scripts.push(text.to_string());
+        } else if let Some(sequence) = cmds.as_sequence() {
+            for entry in sequence {
+                if let Some(text) = entry.as_str() {
+                    scripts.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    scripts
+        .iter()
+        .flat_map(|script| command_lines(script))
+        .flat_map(|line| shell_commands(&line))
+        .map(|(words, _)| words)
+        .collect()
+}
+
+/// The gating jobs of a workflow, whole -- name included.
+///
+/// [`collect_steps`] flattens jobs away and [`gating_job_named`] wants a
+/// name; the budget assertions need to ask a question PER JOB ("is this
+/// tier counted in the job that ran it?") about jobs whose names are
+/// matrix expressions.
+fn gating_jobs(workflow: &str) -> Vec<Job> {
+    let wf = parse_workflow(workflow);
+    if !runs_on_pull_request(&wf) {
+        return Vec::new();
+    }
+    let carries_a_non_gating_key =
+        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
+    wf.jobs
+        .into_iter()
+        .filter(|job| !carries_a_non_gating_key(&job.keys))
+        .map(|mut job| {
+            job.steps
+                .retain(|step| !carries_a_non_gating_key(&step.keys));
+            job
+        })
+        .collect()
+}
+
+/// Every `cargo test` the pull-request gate runs is wrapped by
+/// `scripts/tier.sh`.
+///
+/// The wrapper is what makes the run quiet, what keeps the whole run in
+/// `tmp/logs/`, and what turns "it printed too much" into a red build. A
+/// `cargo test` added beside the wrapped ones inherits none of that and
+/// nothing else would notice: it passes, it is loud, and loud is not a
+/// failure anybody is paged for.
+#[test]
+fn every_cargo_test_the_gate_runs_is_under_an_output_budget() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+
+    let mut unbudgeted = Vec::new();
+    let mut budgeted = 0usize;
+    for job in gating_jobs(&workflow) {
+        for words in job_commands(&job) {
+            if cargo_test_arguments(&words).is_none() {
+                continue;
+            }
+            if tier_invocation(&words).is_some() {
+                budgeted += 1;
+            } else {
+                unbudgeted.push(format!("{}: {}", job.name, words.join(" ")));
+            }
+        }
+    }
+
+    assert!(
+        unbudgeted.is_empty(),
+        "{} runs a `cargo test` that is not wrapped by `scripts/tier.sh`, so \
+         its output is unbounded and its full run reaches the job log rather \
+         than `tmp/logs/`:\n  {}\n\
+         Wrap it: `bash scripts/tier.sh LABEL LOG MAX-LINES MAX-BYTES -- cargo \
+         test ...`, with the numbers MEASURED from a run and recorded in the \
+         table at the top of chores.yml.",
+        path.display(),
+        unbudgeted.join("\n  ")
+    );
+    assert!(
+        budgeted > 0,
+        "{} runs no budgeted `cargo test` at all. Either the gate has stopped \
+         testing this crate, or this guard has stopped being able to see that \
+         it does -- and the second is the one that fails silently.",
+        path.display()
+    );
+}
+
+/// No budget is zero, in either file.
+///
+/// `output-budget.sh` reads `0` as "no budget", so a tier given one is
+/// wrapped, logged, quiet -- and unbounded. That is the shape that looks
+/// like compliance from a distance, which is exactly why it gets a number
+/// of its own rather than being left to a reader.
+#[test]
+fn every_output_budget_is_a_number_that_can_fail_a_run() {
+    for path in [ci_yml(), chores_yml()] {
+        let text = read_or_panic(&path);
+        let commands: Vec<Vec<String>> = if path.ends_with("chores.yml") {
+            chores_commands(&text)
+        } else {
+            gating_jobs(&text).iter().flat_map(job_commands).collect()
+        };
+
+        let mut tiers = 0usize;
+        for words in &commands {
+            let Some((log, budget)) = tier_invocation(words) else {
+                continue;
+            };
+            tiers += 1;
+            assert!(
+                budget.lines > 0 && budget.bytes > 0,
+                "the `{log}` tier in {} carries the budget {budget:?}. \
+                 output-budget.sh reads 0 as \"no budget\", so this tier is \
+                 quiet and unbounded -- it can grow without limit and nothing \
+                 turns red.",
+                path.display()
+            );
+        }
+        assert!(
+            tiers > 0,
+            "{} runs no tier through `scripts/tier.sh`. If the tiers moved, \
+             this guard moved with them and now checks nothing.",
+            path.display()
+        );
+    }
+}
+
+/// `chores.yml` and `ci.yml` carry the SAME budget and the SAME floor for
+/// every tier they share, and the workflow runs no tier the chores file
+/// does not.
+///
+/// The numbers are written twice because the workflow cannot read
+/// `chores.yml` without installing `chore` on ubuntu, macOS and Windows to
+/// learn two integers. Written twice and trusted, they drift -- and the
+/// direction that hurts is the quiet one: a budget raised in `ci.yml` to
+/// get a push through leaves `chore test` failing on a tree the gate
+/// accepts, and a floor lowered in one file is a floor lowered.
+///
+/// It also refuses a tier the workflow runs and `chore test` cannot: that
+/// is the tier nobody can reproduce locally before pushing.
+#[test]
+fn the_workflow_and_the_chores_file_agree_on_every_budget_and_floor() {
+    let workflow_path = ci_yml();
+    let chores_path = chores_yml();
+    let workflow_commands: Vec<Vec<String>> = gating_jobs(&read_or_panic(&workflow_path))
+        .iter()
+        .flat_map(job_commands)
+        .collect();
+    let chores = chores_commands(&read_or_panic(&chores_path));
+
+    let budgets = |commands: &[Vec<String>]| -> BTreeMap<String, Budget> {
+        commands.iter().filter_map(|w| tier_invocation(w)).collect()
+    };
+    let floors = |commands: &[Vec<String>]| -> BTreeMap<String, u64> {
+        commands.iter().filter_map(|w| floor_check(w)).collect()
+    };
+
+    let (workflow_budgets, chores_budgets) = (budgets(&workflow_commands), budgets(&chores));
+    let (workflow_floors, chores_floors) = (floors(&workflow_commands), floors(&chores));
+
+    for (tier, budget) in &workflow_budgets {
+        let Some(theirs) = chores_budgets.get(tier) else {
+            panic!(
+                "{} runs the `{tier}` tier and {} does not, so `chore test` \
+                 cannot reproduce what the gate runs. Every tier belongs in \
+                 both files.",
+                workflow_path.display(),
+                chores_path.display()
+            );
+        };
+        assert_eq!(
+            budget,
+            theirs,
+            "the `{tier}` tier is budgeted {budget:?} in {} and {theirs:?} in \
+             {}. One of the two was changed on its own; a budget that differs \
+             between the two is a tier that fits in one place and not the \
+             other, which is a gate that only fails after the push.",
+            workflow_path.display(),
+            chores_path.display()
+        );
+    }
+
+    for (tier, floor) in &workflow_floors {
+        let Some(theirs) = chores_floors.get(tier) else {
+            panic!(
+                "{} holds the `{tier}` tier to a floor of {floor} and {} holds \
+                 it to none. The floor is what notices a tier that ran \
+                 nothing (#99); it belongs in both files.",
+                workflow_path.display(),
+                chores_path.display()
+            );
+        };
+        assert_eq!(
+            floor,
+            theirs,
+            "the `{tier}` tier's executed-test floor is {floor} in {} and \
+             {theirs} in {}. A floor only ever goes up, and it goes up in both \
+             files at once.",
+            workflow_path.display(),
+            chores_path.display()
+        );
+    }
+}
+
+/// A wrapped test tier is still COUNTED, in the job that ran it.
+///
+/// The floors were inline in the workflow before the wrapper existed, and
+/// moving a run behind `scripts/tier.sh` is exactly the edit that could
+/// drop one: the step gets shorter, the suite still passes, and the thing
+/// that notices `0 passed; 0 failed` is gone. `cargo test` exits 0 on a
+/// selection that matches nothing, so without the floor the quietest
+/// possible tier -- the one that ran no test at all -- is also the one that
+/// fits its budget best.
+#[test]
+fn every_budgeted_test_tier_still_counts_what_ran() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+
+    let mut checked = 0usize;
+    for job in gating_jobs(&workflow) {
+        let commands = job_commands(&job);
+        let counted: BTreeSet<String> = commands
+            .iter()
+            .filter_map(|w| floor_check(w))
+            .map(|(tier, _)| tier)
+            .collect();
+        for words in &commands {
+            if cargo_test_arguments(words).is_none() {
+                continue;
+            }
+            let Some((tier, _)) = tier_invocation(words) else {
+                continue; // the unbudgeted case has its own assertion
+            };
+            assert!(
+                counted.contains(&tier),
+                "the `{}` job in {} runs the `{tier}` test tier under a budget \
+                 and never counts it. `cargo test` exits 0 having run nothing, \
+                 so this job would report green on an empty selection -- and \
+                 an empty run is the one that fits its output budget best. Add \
+                 `bash scripts/test-floor.sh {tier} N` after it, with N \
+                 MEASURED and roughly a tenth below what ran.",
+                job.name,
+                path.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "{} runs no budgeted test tier, so this guard checked nothing.",
+        path.display()
+    );
+}
+
+/// The readers behind the four budget assertions, checked against the
+/// shapes they have to tell apart.
+///
+/// Each case is a NEAR MISS of a real invocation rather than an obvious
+/// wrong answer: the failure this whole section exists for is a tier that
+/// still looks like a tier while measuring nothing.
+mod output_budget_guard {
+    use super::{cargo_test_arguments, floor_check, tier_invocation, without_the_tier_wrapper};
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_wrapped_cargo_test_is_still_a_cargo_test() {
+        let w = words(
+            "bash scripts/tier.sh label debug 380 26000 -- cargo test --locked --all-targets",
+        );
+        assert_eq!(
+            cargo_test_arguments(&w),
+            Some(vec!["--locked", "--all-targets"]),
+            "the wrapper hid the run from every guard in this file, which \
+             would leave them reporting that the workflow has no debug run"
+        );
+    }
+
+    #[test]
+    fn an_unwrapped_cargo_test_is_unchanged() {
+        let w = words("cargo test --locked --release");
+        assert_eq!(without_the_tier_wrapper(&w), &w[..]);
+    }
+
+    #[test]
+    fn a_wrapper_this_file_does_not_know_is_not_unwrapped() {
+        // The strict direction: an unrecognised wrapper means the run does
+        // not count, which fails loudly, rather than being waved through.
+        let w = words("sudo scripts/tier.sh label debug 1 1 -- cargo test --locked");
+        assert_eq!(without_the_tier_wrapper(&w), &w[..]);
+        assert_eq!(cargo_test_arguments(&w), None);
+    }
+
+    #[test]
+    fn a_merely_echoed_tier_invocation_is_not_one() {
+        let w = words("echo scripts/tier.sh label debug 380 26000 -- cargo test");
+        assert_eq!(tier_invocation(&w), None);
+        assert_eq!(cargo_test_arguments(&w), None);
+    }
+
+    #[test]
+    fn a_script_that_merely_ends_in_tier_sh_is_not_the_tier_script() {
+        // `vendor/other-tier.sh` ends in the right three characters and is
+        // not this repository's wrapper.
+        let w = words("bash vendor/my-tier.sh label debug 380 26000 -- cargo test");
+        assert_eq!(tier_invocation(&w), None);
+    }
+
+    #[test]
+    fn a_tier_invocation_yields_its_log_and_both_numbers() {
+        let w = words("bash scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test");
+        let (log, budget) = tier_invocation(&w).expect("a well-formed tier invocation");
+        assert_eq!(log, "qemu");
+        assert_eq!((budget.lines, budget.bytes), (130, 9000));
+    }
+
+    #[test]
+    fn a_tier_invocation_with_no_separator_is_not_vouched_for() {
+        // `tier.sh` itself exits 2 on this, and a reader that accepted it
+        // would report a budget on a command that never ran.
+        assert_eq!(
+            tier_invocation(&words("bash scripts/tier.sh l log 10 20")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_budget_that_is_not_a_number_is_not_a_budget() {
+        assert_eq!(
+            tier_invocation(&words("bash scripts/tier.sh l log many lots -- cargo test")),
+            None,
+            "a non-numeric budget must not be read as a budget: it would be \
+             passed to output-budget.sh, which reads it as 0 -- no budget at \
+             all -- while this file reported one"
+        );
+    }
+
+    #[test]
+    fn an_environment_prefix_does_not_hide_a_tier() {
+        let w = words("EXPECT_OVERFLOW_CHECKS=1 bash scripts/tier.sh l debug 380 26000 -- cargo test --locked");
+        assert!(tier_invocation(&w).is_some());
+        assert_eq!(cargo_test_arguments(&w), Some(vec!["--locked"]));
+    }
+
+    #[test]
+    fn a_floor_check_yields_its_tier_and_its_number() {
+        assert_eq!(
+            floor_check(&words("bash scripts/test-floor.sh debug 210")),
+            Some(("debug".to_string(), 210))
+        );
+        assert_eq!(
+            floor_check(&words("echo scripts/test-floor.sh debug 210")),
+            None
+        );
+        assert_eq!(
+            floor_check(&words("bash scripts/test-floor.sh debug")),
+            None
         );
     }
 }
