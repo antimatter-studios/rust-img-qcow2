@@ -38,6 +38,31 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The `bash` that can actually run a shell script.
+///
+/// # `bash` ON PATH IS NOT BASH ON A WINDOWS RUNNER
+///
+/// `C:\Windows\System32\bash.exe` is the WSL launcher, it ships with the
+/// operating system, and `System32` comes early in `PATH` -- so
+/// `Command::new("bash")` finds it before Git Bash. With no WSL
+/// distribution installed it prints nothing useful and exits 1, which is
+/// how every test in this file failed on `windows-latest` while the same
+/// scripts ran perfectly in the workflow: an Actions step that says
+/// `shell: bash` is handed Git Bash by name and never consults `PATH`.
+///
+/// So this asks for Git Bash by name on Windows and falls back to `PATH`
+/// elsewhere -- and, if that file is not there, still falls back to `PATH`
+/// rather than deciding the host cannot run the suite.
+fn bash() -> PathBuf {
+    if cfg!(windows) {
+        let git_bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
+        if git_bash.is_file() {
+            return git_bash;
+        }
+    }
+    PathBuf::from("bash")
+}
+
 /// Run `scripts/output-budget.sh` from the repository root.
 ///
 /// FROM THE ROOT, WITH RELATIVE PATHS, because this suite runs on
@@ -46,7 +71,7 @@ fn repo() -> PathBuf {
 /// path plus a working directory is the one spelling that means the same
 /// thing on all three runners.
 fn run_budget(arguments: &[&str], verbose: bool) -> Output {
-    let mut command = Command::new("bash");
+    let mut command = Command::new(bash());
     command
         .current_dir(repo())
         .arg("scripts/output-budget.sh")
@@ -56,10 +81,11 @@ fn run_budget(arguments: &[&str], verbose: bool) -> Output {
     }
     command.output().unwrap_or_else(|e| {
         panic!(
-            "could not run `bash scripts/output-budget.sh`: {e}. Every test \
+            "could not run `{} scripts/output-budget.sh`: {e}. Every test \
              tier in this repository runs through that script, so a host \
              without `bash` cannot run this suite -- which is why this is a \
-             failure and not a skip. On Windows, Git Bash provides it."
+             failure and not a skip. On Windows, Git Bash provides it.",
+            bash().display()
         )
     })
 }

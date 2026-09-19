@@ -37,30 +37,31 @@ chore_min_version: 0.6.0
 #   Each tier carries an OUTPUT BUDGET -- a line count and a byte count that
 #   fail the run (exit 65) when the tier prints more than it is allowed to,
 #   told apart from a failing suite by its status. The budgets below are
-#   MEASURED, on this arm64 Linux host, and confirmed against the verdict
-#   lines of the CI run recorded in the pull request that introduced them:
+#   MEASURED -- the numbers below are the verdict lines of CI run
+#   35437091960, which is the largest of the three matrix legs in each case;
+#   an arm64 Linux host measures within one line of them:
 #
 #     tier     measured        budget         headroom, and why
-#     debug      304 / 19,385    420 / 28,000  ~38% / ~44%: 248 executed
+#     debug      304 / 19,554    420 / 28,000  ~38% / ~43%: 248 executed
 #                                              tests at one line each, so
 #                                              this is "about a hundred more
 #                                              tests before anyone has to
 #                                              think about it". The job has a
 #                                              separate build step, so no
 #                                              `Compiling` lines land here
-#     release    305 / 19,447    420 / 28,000  the same selection in the
+#     release    307 / 19,760    420 / 28,000  the same selection in the
 #                                              other profile, and the same
 #                                              headroom. The job has no
 #                                              separate build step, so a
 #                                              cold cache puts ~75
 #                                              `Compiling` lines in here too
-#     qemu        32 /  1,799    130 /  9,000  25 tests at 33 lines, plus the
+#     qemu        36 /  2,133    130 /  9,000  25 tests at 36 lines, plus the
 #                                              ~75 `Compiling` lines a cold
 #                                              cache puts in this tier: the
 #                                              job has no build step, and the
 #                                              feature gate means this target
 #                                              is built nowhere else
-#     lib32       59 /  3,700    200 / 14,000  the 42 library tests plus the
+#     lib32       53 /  3,779    200 / 14,000  the 42 library tests, plus the
 #                                              i686 build's own `Compiling`
 #                                              lines, which land in this tier
 #                                              because the job has no build
