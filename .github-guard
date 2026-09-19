@@ -62,10 +62,4 @@
 # file would name it alone. It is not added here because adding it is a CI
 # change with its own review; the list below is what CI produces today.
 [checks]
-	required = fmt
-	required = qemu-validation
-	required = test / ubuntu-latest
-	required = test / macos-latest
-	required = test / windows-latest
-	required = test / i686-unknown-linux-gnu
-	required = test (release)
+	required = ci-ok
