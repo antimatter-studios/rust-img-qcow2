@@ -50,7 +50,7 @@ flate2 = "1"
 ruzstd = "0.8"
 # Block-device trait surface. Local path dep until both crates are
 # published; flip to a published version on the first crates.io release.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.12" }
 
 [dev-dependencies]
 # YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml

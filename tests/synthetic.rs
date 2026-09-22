@@ -1722,6 +1722,22 @@ impl fs_core::BlockDevice for CountingWrites {
     fn is_writable(&self) -> bool {
         fs_core::BlockDevice::is_writable(&self.inner)
     }
+    /// FORWARDED, BECAUSE THE DEFAULTS ARE INHERITED SILENTLY. `set_len`
+    /// and `can_grow` are defaulted on the trait, so a wrapper that
+    /// leaves them alone answers `Err(ReadOnly)` / `false` on behalf of
+    /// a `FileDevice` that would have grown -- and it compiles. That
+    /// would fail every allocating write here at the grow, never
+    /// reaching the metadata this test counts.
+    ///
+    /// A grow is not a write: `set_len` moves no bytes through
+    /// `write_at`, so `written` is untouched and the byte budget below
+    /// still measures what it says it does.
+    fn set_len(&self, new_len: u64) -> fs_core::Result<()> {
+        fs_core::BlockDevice::set_len(&self.inner, new_len)
+    }
+    fn can_grow(&self) -> bool {
+        fs_core::BlockDevice::can_grow(&self.inner)
+    }
 }
 
 /// #44: AN ALLOCATING WRITE CARRIES THE METADATA IT CHANGES, NOT WHOLE
@@ -1876,4 +1892,275 @@ fn a_freed_cluster_behind_the_allocation_cursor_is_reused() {
     assert!(buf[16..].iter().all(|&b| b == 0xCC));
 
     let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// An allocation asks the device for the room before it writes (#113)
+// ---------------------------------------------------------------------------
+
+/// Records every `set_len`, and every `write_at` that was outside the
+/// device when it was issued, before forwarding both.
+///
+/// The second list is what makes this more than a call counter: the
+/// contract is not "`set_len` was called" but "no write ever ran off the
+/// end", and only the device can say whether a given write was inside it
+/// at the moment it arrived.
+struct RecordsGrowth {
+    inner: fs_core::FileDevice,
+    set_lens: std::sync::Mutex<Vec<u64>>,
+    writes_past_the_end: std::sync::Mutex<Vec<(u64, usize, u64)>>,
+}
+
+impl RecordsGrowth {
+    fn on(path: &std::path::Path) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: fs_core::FileDevice::open_rw(path).unwrap(),
+            set_lens: std::sync::Mutex::new(Vec::new()),
+            writes_past_the_end: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+    fn grows(&self) -> Vec<u64> {
+        self.set_lens.lock().unwrap().clone()
+    }
+}
+
+impl fs_core::BlockRead for RecordsGrowth {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        fs_core::BlockRead::size_bytes(&self.inner)
+    }
+}
+
+impl fs_core::BlockDevice for RecordsGrowth {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        let size = fs_core::BlockRead::size_bytes(&self.inner);
+        if offset + buf.len() as u64 > size {
+            self.writes_past_the_end
+                .lock()
+                .unwrap()
+                .push((offset, buf.len(), size));
+        }
+        fs_core::BlockDevice::write_at(&self.inner, offset, buf)
+    }
+    fn flush(&self) -> fs_core::Result<()> {
+        fs_core::BlockDevice::flush(&self.inner)
+    }
+    fn is_writable(&self) -> bool {
+        fs_core::BlockDevice::is_writable(&self.inner)
+    }
+    fn set_len(&self, new_len: u64) -> fs_core::Result<()> {
+        self.set_lens.lock().unwrap().push(new_len);
+        fs_core::BlockDevice::set_len(&self.inner, new_len)
+    }
+    fn can_grow(&self) -> bool {
+        fs_core::BlockDevice::can_grow(&self.inner)
+    }
+}
+
+/// The standard fixture cut back so it ends exactly on its last used
+/// cluster, which is the shape that makes an allocation grow.
+///
+/// `build_image` lays out clusters 0..=6 and then leaves the file 16
+/// clusters long, so the allocator's next cluster -- 7, the first the
+/// refcount block marks free -- already fits and nothing has to move.
+/// Truncating to 7 clusters puts the free space past the end of the
+/// file, which is where every image a writer has been filling ends up.
+fn build_image_ending_on_its_last_cluster(path: &std::path::Path) -> u64 {
+    build_image(path);
+    let end = 7 * CLUSTER_SIZE;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(end)
+        .unwrap();
+    end
+}
+
+/// THE ROOM ASKED FOR IS A WHOLE CLUSTER, NOT THE BYTES THE CALLER WROTE.
+///
+/// Four bytes at offset 200 of an unallocated virtual cluster allocate a
+/// host cluster, and the reader then writes all 4096 of it: the caller's
+/// four spliced into the zeros a reader sees there today. Growing to the
+/// end of the caller's payload would leave the rest of the cluster off
+/// the end of the device and the write refused -- so the length is the
+/// cluster's end, and this pins the difference rather than merely that
+/// `set_len` was called.
+///
+/// The refusal this replaces was
+/// `OutOfBounds { offset: 20480, len: 4096, size: 20480 }`: a free entry
+/// in a *present* refcount block naming the cluster the image ends on.
+#[test]
+fn an_allocation_asks_for_a_whole_cluster_not_the_bytes_the_caller_wrote() {
+    let path = tmp_path("growth_is_by_the_cluster");
+    let before = build_image_ending_on_its_last_cluster(&path);
+
+    let dev = RecordsGrowth::on(&path);
+    {
+        let r = Qcow2Reader::open_rw_on_device(dev.clone()).unwrap();
+        // Virt cluster 1 is unallocated, so this reallocates; the L2
+        // table already exists, so it is the only allocation.
+        r.write_at(CLUSTER_SIZE + 200, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .unwrap();
+        r.flush().unwrap();
+    }
+
+    assert_eq!(
+        dev.grows(),
+        vec![before + CLUSTER_SIZE],
+        "one allocation must ask once, for the whole cluster it hands out"
+    );
+    assert!(
+        dev.writes_past_the_end.lock().unwrap().is_empty(),
+        "a write still landed outside the device: {:?}",
+        dev.writes_past_the_end.lock().unwrap()
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        before + CLUSTER_SIZE,
+        "the file must end exactly where the grow asked"
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut cluster = vec![0u8; CLUSTER_SIZE as usize];
+    r.read_at(CLUSTER_SIZE, &mut cluster).unwrap();
+    assert_eq!(&cluster[200..204], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert!(
+        cluster[204..].iter().all(|&b| b == 0),
+        "the rest of the freshly allocated cluster is not zero"
+    );
+
+    // Writing again inside the cluster just allocated needs no more room.
+    {
+        let r = Qcow2Reader::open_rw_on_device(dev.clone()).unwrap();
+        r.write_at(CLUSTER_SIZE + 300, &[0x77; 4]).unwrap();
+        r.flush().unwrap();
+    }
+    assert_eq!(
+        dev.grows().len(),
+        1,
+        "an in-place write asked the device to grow"
+    );
+}
+
+/// A FRESH REFCOUNT BLOCK NEEDS THE ROOM TOO, AND IT IS THE FURTHER OF
+/// THE TWO CLUSTERS THAT PASS 2 PRODUCES.
+///
+/// With every present refcount block full and a free table slot, the
+/// allocator writes a brand-new refcount block at the start of that
+/// slot's range and hands the caller the cluster after it. Both are past
+/// the end of a small image — the refusal this replaces was
+/// `OutOfBounds { offset: 8388608, len: 4096, size: 65536 }`, the
+/// refcount block itself — so one grow to the end of the caller's
+/// cluster has to cover both.
+#[test]
+fn a_fresh_refcount_block_and_the_cluster_after_it_are_both_made_room_for() {
+    let path = tmp_path("growth_for_a_new_refcount_block");
+    build_image(&path);
+    {
+        // Block 0 governs every host cluster this image can reach: mark
+        // them all in use, and leave table slot 1 absent. That is the
+        // only shape in which pass 2 runs.
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(
+            &[0u8, 1].repeat(CLUSTER_SIZE as usize / 2),
+            REFCOUNT_BLOCK_OFFSET,
+        )
+        .unwrap();
+    }
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let dev = RecordsGrowth::on(&path);
+    {
+        let r = Qcow2Reader::open_rw_on_device(dev.clone()).unwrap();
+        r.write_at(CLUSTER_SIZE, &vec![0x11; CLUSTER_SIZE as usize])
+            .unwrap();
+        r.flush().unwrap();
+    }
+
+    let grows = dev.grows();
+    assert_eq!(
+        grows.len(),
+        1,
+        "pass 2 produces two adjacent clusters and must ask for both at once, \
+         got {grows:?}"
+    );
+    let entries_per_block = CLUSTER_SIZE * 8 / 16;
+    // slot 1's range starts here; the block takes the first cluster of it
+    // and the caller gets the second.
+    let new_block_off = entries_per_block * CLUSTER_SIZE;
+    assert_eq!(
+        grows[0],
+        new_block_off + 2 * CLUSTER_SIZE,
+        "the grow must reach past the caller's cluster, not stop at the \
+         refcount block"
+    );
+    assert!(grows[0] > before);
+    assert!(
+        dev.writes_past_the_end.lock().unwrap().is_empty(),
+        "a write still landed outside the device: {:?}",
+        dev.writes_past_the_end.lock().unwrap()
+    );
+
+    let r = Qcow2Reader::open(&path).unwrap();
+    let mut buf = vec![0u8; CLUSTER_SIZE as usize];
+    r.read_at(CLUSTER_SIZE, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0x11));
+}
+
+/// A device that will not grow gets a refusal, not a half-written image.
+///
+/// `can_grow` is `false` and `set_len` refuses -- a block device node, a
+/// fixed-length slice -- and the grow is asked for before the refcount
+/// entry is claimed and before any cluster is written, so the file must
+/// come back byte-identical. That is a stronger statement than "it still
+/// opens".
+#[test]
+fn an_allocation_onto_a_device_that_cannot_grow_leaves_the_image_untouched() {
+    struct NeverGrows(fs_core::FileDevice);
+    impl fs_core::BlockRead for NeverGrows {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            self.0.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            fs_core::BlockRead::size_bytes(&self.0)
+        }
+    }
+    impl fs_core::BlockDevice for NeverGrows {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+            fs_core::BlockDevice::write_at(&self.0, offset, buf)
+        }
+        fn flush(&self) -> fs_core::Result<()> {
+            fs_core::BlockDevice::flush(&self.0)
+        }
+        fn is_writable(&self) -> bool {
+            true
+        }
+        // `set_len` and `can_grow` are left to the trait defaults on
+        // purpose: `Err(ReadOnly)` and `false` are exactly what a
+        // fixed-length writable device answers.
+    }
+
+    let path = tmp_path("growth_refused");
+    build_image_ending_on_its_last_cluster(&path);
+    let before = std::fs::read(&path).unwrap();
+    {
+        let dev = std::sync::Arc::new(NeverGrows(fs_core::FileDevice::open_rw(&path).unwrap()));
+        let r = Qcow2Reader::open_rw_on_device(dev).unwrap();
+        let err = r
+            .write_at(CLUSTER_SIZE + 200, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .expect_err("a device that cannot grow cannot take a new cluster");
+        assert!(
+            matches!(err, qcow2::Error::ReadOnly),
+            "a refused grow must surface as the device's refusal, got {err:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "an allocation that could not get its room still changed the image"
+    );
+    Qcow2Reader::open(&path).expect("the image must still open");
 }

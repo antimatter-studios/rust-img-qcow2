@@ -315,16 +315,6 @@ pub struct Qcow2Reader {
     /// True when the image was opened read-write. Read-only images reject
     /// every `write_at` call up front.
     writable: bool,
-    /// How far the image reaches, in bytes.
-    ///
-    /// Seeded from `dev.size_bytes()` and raised by [`Qcow2Reader::dev_write`]
-    /// whenever a write lands past it. `fs_core::FileDevice` records its
-    /// length when the file is opened and never re-stats, so the device's
-    /// own answer goes stale the moment the allocator hands out a cluster
-    /// beyond the current tail — and every bound checked against it would
-    /// then reject a cluster this reader had just written. This is the
-    /// same number, kept honest.
-    image_len: Mutex<u64>,
     /// The refcount table, read on the first allocation and kept (#44).
     ///
     /// Every allocation used to read it whole. Only this reader writes it
@@ -543,7 +533,6 @@ impl Qcow2Reader {
             None
         };
 
-        let image_len = dev.size_bytes();
         Ok(Self {
             dev,
             header,
@@ -552,7 +541,6 @@ impl Qcow2Reader {
             decompress_cache: Mutex::new(None),
             backing,
             writable,
-            image_len: Mutex::new(image_len),
             refcount_table: Mutex::new(None),
             alloc_cursor: Mutex::new(0),
             write_lock: Mutex::new(()),
@@ -647,23 +635,54 @@ impl Qcow2Reader {
     }
 
     fn dev_write(&self, off: u64, buf: &[u8]) -> Result<()> {
-        self.dev
-            .write_at(off, buf)
-            .map_err(fs_core_to_qcow2_error)?;
-        // A write past the tail extends the file, so the image is now
-        // longer than the device reported at open. Record it here rather
-        // than at the allocator, because every path that grows the image
-        // goes through this one function.
-        let end = off.saturating_add(buf.len() as u64);
-        let mut len = self.image_len.lock().unwrap();
-        if end > *len {
-            *len = end;
-        }
-        Ok(())
+        self.dev.write_at(off, buf).map_err(fs_core_to_qcow2_error)
     }
 
     fn dev_flush(&self) -> Result<()> {
         self.dev.flush().map_err(fs_core_to_qcow2_error)
+    }
+
+    /// Make the device long enough that a cluster at `host_off` fits.
+    ///
+    /// # WHY THIS EXISTS AT ALL
+    ///
+    /// `write_at` used to extend a `FileDevice` implicitly, and that is
+    /// how this format allocated: write the new cluster past the old end,
+    /// then point an L2 entry at it. `am-fs-core` withdrew that (#75), and
+    /// correctly -- the file grew while `size_bytes()` went on reporting
+    /// the length taken at open, so a caching device could hold bytes no
+    /// bounded read could reach (rust-fs-core#70). `set_len` is the
+    /// replacement: growth that says so, and moves the reported length
+    /// with it.
+    ///
+    /// # WHY IT IS NOT IN `dev_write`
+    ///
+    /// `dev_write` is also the in-place path and the metadata path. A
+    /// `set_len` there would extend the image on an ordinary overwrite and
+    /// on any stray offset, which dissolves the bounds check rather than
+    /// satisfying it -- the defect rust-fs-core#70 was about, reached from
+    /// the other side. Growth belongs where an address is *chosen*, and
+    /// [`Qcow2Reader::allocate_cluster`] is the only place that chooses
+    /// one.
+    ///
+    /// # IT ONLY EVER GROWS
+    ///
+    /// `BlockDevice::set_len` *sets*: a smaller `new_len` truncates,
+    /// exactly as [`std::fs::File::set_len`] does. Nothing here wants
+    /// that, so the current length is read first and a device already long
+    /// enough is left alone -- which is also what keeps a writable but
+    /// fixed-length device (a block device node, a pre-sized image) usable
+    /// for every allocation that fits inside it.
+    fn dev_room_for_cluster(&self, host_off: u64) -> Result<()> {
+        let end = host_off
+            .checked_add(self.header.cluster_size)
+            .ok_or(Error::Corrupt(
+                "allocated cluster runs past the address space",
+            ))?;
+        if self.dev.size_bytes() >= end {
+            return Ok(());
+        }
+        self.dev.set_len(end).map_err(fs_core_to_qcow2_error)
     }
 
     /// Write to the image. Every cluster state is handled by the same
@@ -1047,6 +1066,21 @@ impl Qcow2Reader {
 
                     let host_off = host_cluster_idx * cluster_size;
 
+                    // MAKE ROOM BEFORE THE ENTRY IS CLAIMED (#113). The
+                    // caller writes a whole cluster at `host_off` the
+                    // moment this returns, and `write_at` refuses anything
+                    // ending past the device. A free entry in a present
+                    // refcount block can name the cluster the image ends
+                    // on -- the refusal this replaces was
+                    // `OutOfBounds { offset: 20480, len: 4096, size: 20480 }`,
+                    // exactly that case.
+                    //
+                    // Before the refcount entry rather than after, so a
+                    // device that will not grow leaves the entry free
+                    // instead of marking a cluster nothing can be written
+                    // into.
+                    self.dev_room_for_cluster(host_off)?;
+
                     // Only the two bytes that changed go back to the
                     // device, not the whole block (#44).
                     self.dev_write(block_off + off as u64, &1u16.to_be_bytes())?;
@@ -1091,6 +1125,16 @@ impl Qcow2Reader {
         let new_block_off = new_block_cluster * cluster_size;
         let caller_cluster_idx = new_block_cluster + 1;
         let caller_off = caller_cluster_idx * cluster_size;
+
+        // MAKE ROOM FOR BOTH CLUSTERS THIS PASS PRODUCES (#113). Two are
+        // written: the new refcount block at `new_block_off`, below, and
+        // the caller's at `caller_off` once this returns. `caller_off` is
+        // the higher of the two and they are adjacent, so one grow to the
+        // end of it covers both. The refusal this replaces was
+        // `OutOfBounds { offset: 8388608, len: 4096, size: 65536 }` -- the
+        // refcount block itself, a slot's range past the end of a small
+        // image.
+        self.dev_room_for_cluster(caller_off)?;
 
         // Step 1: zero-init the new refcount block on disk, then mark
         // its first two entries (self + caller) as refcount=1.
@@ -1455,9 +1499,27 @@ impl Qcow2Reader {
         }
     }
 
-    /// How far the image reaches. See [`Qcow2Reader::image_len`].
+    /// How far the image reaches, in bytes. The device's own answer.
+    ///
+    /// # THIS USED TO BE A SHADOW COPY, AND IT NO LONGER CAN BE ONE
+    ///
+    /// It was a `Mutex<u64>`, seeded from `size_bytes()` at open and
+    /// raised by `dev_write` whenever a write landed past it, because
+    /// `fs_core::FileDevice` recorded its length when the file was opened
+    /// and never re-stated — so the device's own answer went stale the
+    /// moment an allocating write extended the file behind its back, and
+    /// every bound checked against it rejected a cluster this reader had
+    /// just written.
+    ///
+    /// Nothing extends the file behind the device's back any more.
+    /// `am-fs-core` 0.2.12 refuses a write ending past `size_bytes()`
+    /// (rust-fs-core#70), and [`Qcow2Reader::dev_room_for_cluster`] asks
+    /// for the room with `set_len`, which moves the reported length with
+    /// the file as one operation. The device is now the only thing that
+    /// knows its length, and a second copy of a number with one owner is
+    /// the disagreement #70 was about rather than a guard against it.
     fn image_len(&self) -> u64 {
-        *self.image_len.lock().unwrap()
+        self.dev.size_bytes()
     }
 
     /// A host cluster offset taken out of a table entry, checked before
