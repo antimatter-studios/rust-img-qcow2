@@ -28,8 +28,10 @@ chore_min_version: 0.6.0
 #
 #   A test task prints a VERDICT: one line per tier, a final count, and the
 #   path of the log holding everything else. A failure prints the TAIL of
-#   that log. `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole
-#   run as it happens.
+#   that log. `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams
+#   the whole run as it happens. A failure prints one line naming the status
+#   and the log rather than a tail; `OUTPUT_BUDGET_FAIL_TAIL=40 chore test`
+#   asks for the tail back.
 #
 #   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
 #   in full. What changed is where it is read from.
@@ -86,11 +88,15 @@ chore_min_version: 0.6.0
 #   against 9.5M of output, with command output the largest single
 #   contributor a repository controls.
 #
-#   WHERE THE SCRIPT CAME FROM. scripts/output-budget.sh is a vendored copy
-#   of fs-linux-test-harness's, at v0.1.0; the header of that file says why a
-#   copy rather than the sibling the filesystem crates read it from, and
-#   tests/output_budget.rs holds the copy to the behaviour rather than to the
-#   bytes.
+#   WHERE THE SCRIPT COMES FROM. There is no scripts/output-budget.sh in this
+#   repository and there must not be one. The canonical wrapper is
+#   rust-fs-core's, and scripts/tier.sh resolves it at RUNTIME -- from the
+#   sibling ../rust-fs-core, or from wherever cargo unpacked am-fs-core, or
+#   from FS_CORE_ROOT when that is set. It is verified by the API string it
+#   prints for --version, not by a checksum: a digest pinned in every
+#   consuming repository is a lockstep update for a change none of them made.
+#   A copy that cannot be found or does not answer is a LOUD failure with no
+#   fallback, and tests/output_budget.rs is what proves that.
 vars:
   TRIPLE: aarch64-apple-darwin
   # `[package].name` is am-img-qcow2; `[lib].name` is qcow2, so cargo writes
