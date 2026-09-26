@@ -7,6 +7,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # WHERE THE OUTPUT BUDGET WRAPPER COMES FROM.
+  #
+  # scripts/tier.sh runs every tier through rust-fs-core's canonical
+  # scripts/output-budget.sh, resolved at runtime; this repository no longer
+  # carries a copy of it. FS_CORE_ROOT names the checkout it is read from --
+  # see the `rust-fs-core-budget` step in the first job for why that is a
+  # SECOND checkout of core rather than the one the crate compiles against.
+  #
+  # RELATIVE, DELIBERATELY. ${{ github.workspace }} on windows-latest is
+  # `D:\a\...`, the tiers run under Git Bash, and a path with backslashes in
+  # it is one Git Bash can neither test nor copy. tier.sh resolves a relative
+  # value against its own repository root, so this means the same directory on
+  # all three runners.
+  FS_CORE_ROOT: ../rust-fs-core-budget
 
 jobs:
   test:
@@ -33,6 +47,30 @@ jobs:
           repository: antimatter-studios/rust-fs-core
           ref: v0.2.10
           path: rust-fs-core
+      # A SECOND CHECKOUT OF CORE, FOR THE TOOLING SCRIPT AND NOTHING ELSE.
+      #
+      # scripts/tier.sh needs rust-fs-core's scripts/output-budget.sh, which
+      # first ships in v0.2.11 and gained its quiet-failure verdict in
+      # v0.2.13. The checkout above CANNOT simply be raised to it:
+      # `../rust-fs-core` is also this crate's am-fs-core path dependency, and
+      # that is pinned to v0.2.10 deliberately -- rust-fs-core#75 made a write
+      # past the end of a FileDevice a refusal, and appending past the end is
+      # how this format allocates a cluster. Measured on this branch, three
+      # tests in tests/synthetic.rs fail against v0.2.13 and none against
+      # v0.2.10. AGENTS.md carries the rest of that reasoning.
+      #
+      # A compiled dependency and a build-tooling script are two different
+      # things that happened to share a directory, so they are fetched
+      # separately here. Only `scripts/` is taken. When the am-fs-core pin can
+      # move past v0.2.10 -- rust-fs-core#147/#129, the `set_len` replacement
+      # -- this step and FS_CORE_ROOT both go away and the single checkout
+      # serves both purposes again.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.13
+          path: rust-fs-core-budget
+          sparse-checkout: scripts
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -111,6 +149,14 @@ jobs:
           repository: antimatter-studios/rust-fs-core
           ref: v0.2.10
           path: rust-fs-core
+      # The tooling-only checkout of core; see the first `test` job for why
+      # this is separate from the pinned dependency above.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.13
+          path: rust-fs-core-budget
+          sparse-checkout: scripts
       - name: install a 32-bit C toolchain
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
       - uses: dtolnay/rust-toolchain@stable
@@ -214,6 +260,14 @@ jobs:
           repository: antimatter-studios/rust-fs-core
           ref: v0.2.10
           path: rust-fs-core
+      # The tooling-only checkout of core; see the first `test` job for why
+      # this is separate from the pinned dependency above.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.13
+          path: rust-fs-core-budget
+          sparse-checkout: scripts
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -290,6 +344,14 @@ jobs:
           repository: antimatter-studios/rust-fs-core
           ref: v0.2.10
           path: rust-fs-core
+      # The tooling-only checkout of core; see the first `test` job for why
+      # this is separate from the pinned dependency above.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.13
+          path: rust-fs-core-budget
+          sparse-checkout: scripts
       - name: install qemu-utils
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
       - uses: dtolnay/rust-toolchain@stable

@@ -191,6 +191,22 @@ Do **not** bump the pin, and do **not** "fix" it by reverting #75 — that
 reintroduces #70. Tracked as rust-fs-core#147/#129; the agreed replacement is
 `BlockDevice::set_len` plus `can_grow()`.
 
+A second consequence arrived with the output budget. `scripts/tier.sh` reads
+rust-fs-core's canonical `scripts/output-budget.sh` at runtime — this
+repository no longer carries a copy — and that script first ships in core
+`v0.2.11`. A `../rust-fs-core` pinned to `v0.2.10` therefore does not have it,
+and every tier refuses to run, loudly, rather than falling back to anything.
+Point `FS_CORE_ROOT` at a checkout that does:
+
+```sh
+FS_CORE_ROOT=../rust-fs-core-budget chore test
+```
+
+`ci.yml` does exactly this, with a second `sparse-checkout: scripts` clone of
+core at `v0.2.13`. A compiled dependency and a build-tooling script are two
+different things that happened to share a directory; when the pin can move,
+the second checkout and the variable both go away.
+
 One practical consequence: `pre-commit.d/rust-clippy.sh` runs clippy without
 `--locked`, so a `../rust-fs-core` checkout that is semver-ahead of the pin
 rewrites your unstaged `Cargo.lock`, and `rust-deps-pinned.sh` then blocks the
