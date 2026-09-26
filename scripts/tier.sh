@@ -107,15 +107,20 @@ insist_canonical() {
 }
 
 if [ -n "${FS_CORE_ROOT:-}" ]; then
-    # A RELATIVE FS_CORE_ROOT IS RELATIVE TO THIS REPOSITORY, not to whatever
-    # directory the caller happened to be in, so `bash scripts/tier.sh` means
-    # the same thing from anywhere -- which is already true of the sibling
-    # path below, because that is built from this script's own location.
-    case "$FS_CORE_ROOT" in
-        /*) ;;
-        *) FS_CORE_ROOT="$REPO/$FS_CORE_ROOT" ;;
-    esac
+    # A RELATIVE FS_CORE_ROOT IS ALSO TRIED AGAINST THIS REPOSITORY'S ROOT, so
+    # `bash scripts/tier.sh` means the same thing from any directory -- which
+    # is already true of the sibling path below, because that is built from
+    # this script's own location.
+    #
+    # IT IS DECIDED BY LOOKING, NOT BY THE SHAPE OF THE STRING. The obvious
+    # spelling is `case "$FS_CORE_ROOT" in /*) ...`, and it is wrong on
+    # windows-latest: measured on run 36234427291, ci.yml's
+    # `../rust-fs-core-budget` reached Git Bash as
+    # `D:/a/.../rust-img-qcow2/../rust-fs-core-budget`, already absolute and
+    # starting with a drive letter rather than a slash, so the repository root
+    # was prepended to a path that already had one and every tier refused.
     SOURCE="$FS_CORE_ROOT/$SCRIPT_REL"
+    [ -f "$SOURCE" ] || [ ! -f "$REPO/$SOURCE" ] || SOURCE="$REPO/$SOURCE"
     insist_canonical "$SOURCE"
 elif [ -f "$SIBLING_ROOT/$SCRIPT_REL" ]; then
     SOURCE="$SIBLING_ROOT/$SCRIPT_REL"

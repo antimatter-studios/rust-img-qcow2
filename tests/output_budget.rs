@@ -389,6 +389,38 @@ fn the_resolver_refuses_a_core_that_is_not_there() {
 }
 
 #[test]
+fn an_absolute_override_is_used_as_given_and_not_glued_onto_the_repository_root() {
+    // THE BUG THIS EXISTS FOR, measured on windows-latest in run 36234427291.
+    // tier.sh used to decide whether FS_CORE_ROOT was absolute by testing it
+    // against `/*`, which is true of a POSIX path and false of
+    // `D:/a/.../rust-img-qcow2`. ci.yml's `../rust-fs-core-budget` reaches Git
+    // Bash already absolutised with a drive letter, the repository root was
+    // glued onto the front of a path that already had one, and every tier on
+    // that runner refused to start -- while the other five legs were green.
+    //
+    // It is checked through the refusal message because that is the one place
+    // the resolved path is visible, and an absent directory is the cheapest
+    // way to get one printed.
+    let relative = scratch("absolute-absent");
+    let absolute = repo().join(&relative);
+    let root = absolute.to_string_lossy().to_string();
+
+    let output = run_tier(
+        &["abs", "resolver-abs", "100", "9000", "--", "echo", "hi"],
+        Some(&root),
+        false,
+    );
+
+    let printed = stdout_and_stderr(&output);
+    let expected = format!("tier.sh: {root}/scripts/output-budget.sh does not exist.");
+    assert!(
+        printed.lines().any(|line| line == expected),
+        "the resolver did not look in FS_CORE_ROOT as it was given. Expected \
+         to be told about\n  {expected}\nand got\n{printed}"
+    );
+}
+
+#[test]
 fn the_resolver_refuses_a_core_whose_version_string_is_wrong() {
     // A PRESENT-BUT-WRONG COPY IS THE INTERESTING CASE. An absent one is
     // obvious; a file at the right path that answers `--version` with
