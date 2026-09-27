@@ -313,6 +313,11 @@ jobs:
         # nothing runs is a guard that reports protection it is not providing.
         working-directory: rust-img-qcow2
         run: scripts/agents-core-check.sh
+      - name: no tracked file names a consuming application
+        # AGENTS.md: each of these is a standalone project. Run directly, like
+        # the two checks above, because CI here does not install chore (#122).
+        working-directory: rust-img-qcow2
+        run: tests/scripts/test-no-consumer-names.sh
 
   # Cross-validates our reader/writer against `qemu-img`. qemu-img is
   # invoked as a subprocess only — never linked, never bundled. The
