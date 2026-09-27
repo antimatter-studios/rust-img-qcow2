@@ -32,8 +32,6 @@ never does.
   `-D warnings` now — rustdoc's default is to warn and carry on, which is how
   this reached eight.
 
-### Fixed
-
 - **Allocating a cluster asks the device for room instead of writing past its
   end.** `write_at` used to extend a `FileDevice` implicitly, and that is how
   this format allocated: append the cluster, then record where it went.
@@ -56,6 +54,41 @@ never does.
   offset, dissolving the bounds check rust-fs-core#70 exists to provide.
 
 ### Changed
+
+- **`tests/changelog.rs`: the changelog's shape, checked rather than
+  remembered.** *(#120)* Ported from `rust-img-vhdx`, where it was written for
+  rust-img-vhdx#63 — a required public field added to a `pub struct` after a
+  release, with the pending release on course to be a patch. Six assertions:
+
+  - `[package].version` equals the newest `## [x.y.z]` section;
+  - a released section carrying a breaking note bumped the **minor**, this
+    family's rule for a `0.x` crate;
+  - each `## [...]` section uses a `### Heading` at most once;
+  - every released section has a `[x.y.z]: <url>` definition;
+  - the marker scan reads a break however it is spelled, and does not match
+    near-misses;
+  - the version parser reads a heading or skips it, never guesses.
+
+  It found two defects here on its first run, both fixed in this change:
+  `[Unreleased]` carried `### Fixed` twice — one per PR that added a section
+  instead of adding to the one already there — and there was no `[0.4.5]` link
+  definition, with `[Unreleased]` still comparing `v0.4.4...HEAD`, so that
+  heading rendered as literal brackets.
+
+  The sibling that first had this reached **seven** `### Fixed` headings in one
+  section, and a review bot reported it five times before anyone acted
+  (rust-img-vmdk#71).
+
+  One assertion was **removed** in the port rather than carried over. The
+  original demanded the changelog contain a real breaking marker, so that a
+  scan matching nothing could not pass vacuously. That is wrong for a crate
+  whose released history has broken nothing: this one has only added public
+  methods since v0.4.5, and the port failed on that *control* rather than on
+  the rule — which is the same "a check that cannot fail" defect the control
+  existed to prevent, arrived at from the other side. Proving the scan works
+  belongs in a test of the scan, which is what
+  `a_break_is_recognised_however_it_is_spelled` does.
+
 
 - **`fuzz/Cargo.toml` follows this crate's `am-fs-core` pin, and a test says
   so.** *(#118)* The fuzz crate is a separate package with its own
@@ -218,7 +251,8 @@ never does.
 
 - `am-fs-core` and `am-partitions` dependencies move to 0.2.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.1...v0.4.2
