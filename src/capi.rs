@@ -1,7 +1,7 @@
 //! C ABI for the qcow2 reader.
 //!
 //! Single entry point: [`qcow2_open`] returns a generic
-//! [`FsCoreDevice`][fs_core::ffi::FsCoreDevice] handle so the rest of the
+//! [`fs_core::ffi::FsCoreDevice`] handle so the rest of the
 //! work (partition probe, FS sniff, mount) goes through the same handle
 //! type every sister crate expects. There is intentionally no
 //! qcow2-specific handle type at the C level — once the file is opened

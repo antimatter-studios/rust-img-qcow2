@@ -9,6 +9,31 @@ never does.
 
 ### Fixed
 
+- **The public API docs build, and CI runs rustdoc.** `RUSTDOCFLAGS="-D
+  warnings" cargo doc --no-deps` failed with eight errors and `ci.yml` had no
+  `cargo doc` step at all, so nothing had ever seen them (#105). Three shapes:
+
+  - links to **private** items from public documentation — `ClusterMap`,
+    `ClusterSeed`, `MAX_BACKING_DEPTH`, `Qcow2Reader::plan_write`. A public doc
+    cannot link to a private item, so those stop being links;
+  - links that resolve to **nothing** — `[read_at]` and `[virtual_size()]`.
+    Both items are public, so these are now `Qcow2Reader::read_at` and
+    `Qcow2Reader::virtual_size` rather than being unlinked: the parentheses
+    were the whole problem in the second;
+  - a **redundant explicit link target** in `src/capi.rs`, where the target
+    was what the shortcut already resolved to.
+
+  Fixing those surfaced seven more that had been behind them: `qcow2_tool`'s
+  usage block writes `<file>`, `<offset>` and `<len>`, which rustdoc reads as
+  unclosed HTML tags. It is a `text` fence now.
+
+  A link that goes nowhere is worse than no link, because it reads as a promise
+  that something is documented elsewhere. The `fmt` job runs rustdoc with
+  `-D warnings` now — rustdoc's default is to warn and carry on, which is how
+  this reached eight.
+
+### Fixed
+
 - **Allocating a cluster asks the device for room instead of writing past its
   end.** `write_at` used to extend a `FileDevice` implicitly, and that is how
   this format allocated: append the cluster, then record where it went.
