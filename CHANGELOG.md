@@ -7,6 +7,52 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Allocating a cluster asks the device for room instead of writing past its
+  end.** `write_at` used to extend a `FileDevice` implicitly, and that is how
+  this format allocated: append the cluster, then record where it went.
+  `am-fs-core` withdrew that in its #75 — correctly, because the file grew
+  while `size_bytes()` went on reporting the length taken at open, so a
+  caching device could hold bytes no bounded read could reach
+  (rust-fs-core#70). Three tests in `tests/synthetic.rs` failed against any
+  core past `v0.2.10`, each one a write landing exactly at the device's end.
+
+  `Qcow2Reader::dev_grow_for_cluster` is the replacement, called at both of
+  `allocate_cluster`'s return paths — pass 1 hands out a free cluster from an
+  existing refcount block, pass 2 creates a new block and hands out the
+  cluster after it, and one call there covers the block in front of it. It
+  **only ever grows**: `set_len` *sets*, so a smaller length would truncate,
+  and a device already long enough is left alone — which keeps a writable but
+  fixed-length device working for every allocation that fits inside it.
+
+  It is deliberately **not** in `dev_write`: that funnel is also the in-place
+  and metadata path, and growing there would extend the image on any stray
+  offset, dissolving the bounds check rust-fs-core#70 exists to provide.
+
+### Changed
+
+- **`am-fs-core` moves to v0.2.13, and CI checks core out once instead of
+  five times.** The dependency was held at `v0.2.10` by the refusal above
+  while `scripts/tier.sh` needed `v0.2.13` for the output-budget wrapper, so
+  every job cloned core twice at two refs — four times in `ci.yml` plus
+  `release.yml` and `fuzz.yml`. The higher pin satisfies both bounds, so
+  `FS_CORE_ROOT` points at the sibling the crate compiles against and the
+  tooling-only clones are gone.
+
+- **`Qcow2Reader` as a `BlockDevice` states that it does not grow.** It
+  answered `can_grow() == false` by inheriting the trait default; now it says
+  so. The guest-visible length there is the header's `size` field, and
+  changing that is resizing the virtual disk rather than letting the host file
+  get longer — a defaulted method left unmentioned reads exactly like one
+  nobody considered.
+
+- **`CountingWrites` in the tests forwards `set_len` and `can_grow`.** Both
+  are defaulted on `BlockDevice`, to `Err(ReadOnly)` and `false`, so a
+  passthrough wrapper that omits them looks writable and refuses to grow.
+  Every allocating test through it failed with a bare `ReadOnly` once the
+  allocator started asking for room.
+
 ### Added
 
 - **The header and mapping parsers are fuzzed, on two tiers.** Every field

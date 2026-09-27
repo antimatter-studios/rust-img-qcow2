@@ -646,14 +646,52 @@ impl Qcow2Reader {
         self.dev.read_at(off, buf).map_err(fs_core_to_qcow2_error)
     }
 
+    /// Make room for a cluster at `host_off` before anything writes into it.
+    ///
+    /// `write_at` used to extend a `FileDevice` implicitly, and that is how
+    /// this format allocated: write the new cluster past the old end, then
+    /// record where it went. `am-fs-core` withdrew that in its #75, and
+    /// correctly — the file grew while `size_bytes()` went on reporting the
+    /// length taken at open, so a caching device could hold bytes no bounded
+    /// read could reach (rust-fs-core#70). `set_len` is the replacement:
+    /// growth that says so, and moves the reported length with it.
+    ///
+    /// # IT ONLY EVER GROWS
+    ///
+    /// `BlockDevice::set_len` *sets*: a smaller `new_len` truncates, exactly
+    /// as `std::fs::File::set_len` does. Nothing here wants that — an
+    /// allocation appends — so the current length is read first and a device
+    /// already long enough is left alone. That also keeps a writable but
+    /// fixed-length device (a block-device node, a pre-sized image) working
+    /// for every allocation that fits inside it, instead of failing on a
+    /// `set_len` it never needed.
+    ///
+    /// # WHY NOT IN `dev_write`
+    ///
+    /// Because `dev_write` is also the in-place and metadata path. Growing
+    /// there would extend the file on any stray offset, which dissolves the
+    /// bounds check rust-fs-core#70 exists to provide. Only the allocator
+    /// knows a cluster is *supposed* to be new.
+    fn dev_grow_for_cluster(&self, host_off: u64) -> Result<()> {
+        let end = host_off.saturating_add(self.header.cluster_size);
+        if self.dev.size_bytes() >= end {
+            return Ok(());
+        }
+        self.dev.set_len(end).map_err(fs_core_to_qcow2_error)
+    }
+
     fn dev_write(&self, off: u64, buf: &[u8]) -> Result<()> {
         self.dev
             .write_at(off, buf)
             .map_err(fs_core_to_qcow2_error)?;
-        // A write past the tail extends the file, so the image is now
-        // longer than the device reported at open. Record it here rather
-        // than at the allocator, because every path that grows the image
-        // goes through this one function.
+        // The image may be longer than the device reported at open, because
+        // the allocator grew it with `dev_grow_for_cluster`. Recording the
+        // end here keeps one place that knows how far the image reaches,
+        // whichever path wrote last.
+        //
+        // This used to say a write past the tail extends the file. It does
+        // not any more — `write_at` refuses that (rust-fs-core#75) — and the
+        // growth is explicit in the allocator now.
         let end = off.saturating_add(buf.len() as u64);
         let mut len = self.image_len.lock().unwrap();
         if end > *len {
@@ -1047,6 +1085,12 @@ impl Qcow2Reader {
 
                     let host_off = host_cluster_idx * cluster_size;
 
+                    // ROOM FIRST. This cluster is free in the refcount block
+                    // but may still be past the device's end — a refcount
+                    // block governs a whole range, and the image only reaches
+                    // as far as it has been grown.
+                    self.dev_grow_for_cluster(host_off)?;
+
                     // Only the two bytes that changed go back to the
                     // device, not the whole block (#44).
                     self.dev_write(block_off + off as u64, &1u16.to_be_bytes())?;
@@ -1094,6 +1138,12 @@ impl Qcow2Reader {
 
         // Step 1: zero-init the new refcount block on disk, then mark
         // its first two entries (self + caller) as refcount=1.
+        // ROOM FOR BOTH, IN ONE CALL. The new refcount block lands at
+        // `new_block_off` and the cluster handed back at
+        // `caller_off = new_block_off + cluster_size`, so growing for the
+        // caller's cluster covers the block in front of it too.
+        self.dev_grow_for_cluster(caller_off)?;
+
         let mut new_block_bytes = vec![0u8; cluster_size as usize];
         new_block_bytes[0..2].copy_from_slice(&1u16.to_be_bytes());
         new_block_bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
@@ -1839,6 +1889,22 @@ impl fs_core::BlockDevice for Qcow2Reader {
 
     fn is_writable(&self) -> bool {
         Qcow2Reader::is_writable(self)
+    }
+
+    /// A QCOW2 IMAGE PRESENTED AS A DEVICE DOES NOT GROW, AND THAT IS A
+    /// DECISION RATHER THAN AN OMISSION.
+    ///
+    /// The guest-visible length here is the header's `size` field: it is what
+    /// the image declares to whatever is layered inside it. Growing that is
+    /// resizing the virtual disk — a header rewrite with its own rules — not
+    /// the same operation as letting the *host* file get longer, which is what
+    /// `dev_grow_for_cluster` does when the allocator needs a new cluster.
+    ///
+    /// So this stays `false`, and `set_len` keeps the trait's refusal. It is
+    /// stated here because a defaulted method left unmentioned reads exactly
+    /// like one nobody considered.
+    fn can_grow(&self) -> bool {
+        false
     }
 }
 

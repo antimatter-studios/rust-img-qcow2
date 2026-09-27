@@ -171,49 +171,58 @@ bit gets read as part of an address.
 rather than skipping it (#50). A suite that silently selects nothing is
 indistinguishable from a suite that passes.
 
-## The pin you cannot bump, and why
+## The pin that could not be bumped, and how it was
 
-This crate depends on `am-fs-core` and is **pinned to `v0.2.10`**, one release
-behind, and that is deliberate.
+This crate depends on `am-fs-core` at **`v0.2.13`**. It sat at `v0.2.10` for a
+while, deliberately, and the reasoning is kept because a spent caution that
+reads as a live one is how a repository ends up several releases behind without
+anyone deciding to be.
 
 `4e19fc9` (rust-fs-core#75) made a write past the end of a `FileDevice` a
 refusal rather than an implicit extension. It was right to — `size_bytes()`
 reported the construction-time length while the file grew underneath it, so
 `CachingDevice` could serve bytes no cached read could reach (#70). But writing
-past the end was **the only way this format allocates**: append a block, cluster
-or grain, then record where it went.
+past the end was **the only way this format allocated**: append a cluster, then
+record where it went. Measured against core `main` at the time: vhd 7 failures,
+qcow2 3, vhdx 1, vmdk 1; zero against `v0.2.10`.
 
-Measured against core `main`: vhd 7 failures, qcow2 3, vhdx 1, vmdk 1; zero
-against `v0.2.10`. Every one is a write landing exactly at the device's current
-end.
+The replacement is `BlockDevice::set_len` plus `can_grow()`, released in
+`v0.2.12`, and #113 adopted it here. `Qcow2Reader::dev_grow_for_cluster` asks
+the device for room before the allocator hands a cluster out, at both of
+`allocate_cluster`'s return paths. It only ever grows — `set_len` *sets*, and a
+smaller length would truncate — so a writable but fixed-length device keeps
+working for every allocation that fits inside it.
 
-Do **not** bump the pin, and do **not** "fix" it by reverting #75 — that
-reintroduces #70. Tracked as rust-fs-core#147/#129; the agreed replacement is
-`BlockDevice::set_len` plus `can_grow()`.
+**It is not in `dev_write`, on purpose.** That funnel is also the in-place and
+metadata path, and growing there would extend the file on any stray offset,
+which dissolves the bounds check #70 exists to provide. Only the allocator knows
+a cluster is supposed to be new.
 
-A second consequence arrived with the output budget. `scripts/tier.sh` reads
-rust-fs-core's canonical `scripts/output-budget.sh` at runtime — this
-repository no longer carries a copy — and that script first ships in core
-`v0.2.11`. A `../rust-fs-core` pinned to `v0.2.10` therefore does not have it,
-and every tier refuses to run, loudly, rather than falling back to anything.
-Point `FS_CORE_ROOT` at a checkout that does:
+Two things went with it:
 
-```sh
-FS_CORE_ROOT=../rust-fs-core-budget chore test
-```
+- **The second checkout of core is gone (#114).** `scripts/tier.sh` reads
+  rust-fs-core's `scripts/output-budget.sh` at runtime — this repository does
+  not carry a copy — and that needed `v0.2.13`, while the dependency was held at
+  `v0.2.10`. Two lower bounds meant two clones of the same repository at two
+  refs. The higher pin satisfies both, so `FS_CORE_ROOT` points at
+  `../rust-fs-core` and there is one checkout again.
+- **A wrapper device has to forward growth.** `set_len` and `can_grow` are
+  *defaulted* on `BlockDevice`, to `Err(ReadOnly)` and `false`. A passthrough
+  that omits them looks writable and refuses to grow, and every allocating test
+  through it fails with a bare `ReadOnly` — which is what `CountingWrites` in
+  `tests/synthetic.rs` did until it forwarded both.
 
-`ci.yml` does exactly this, with a second `sparse-checkout: scripts` clone of
-core at `v0.2.13`. A compiled dependency and a build-tooling script are two
-different things that happened to share a directory; when the pin can move,
-the second checkout and the variable both go away.
+`Qcow2Reader`'s own `BlockDevice` impl still answers `can_grow() == false`, and
+that is a decision rather than an omission: the guest-visible length there is
+the header's `size` field, and changing it is resizing the virtual disk, not
+letting the host file get longer.
 
-One practical consequence: `pre-commit.d/rust-clippy.sh` runs clippy without
-`--locked`, so a `../rust-fs-core` checkout that is semver-ahead of the pin
-rewrites your unstaged `Cargo.lock`, and `rust-deps-pinned.sh` then blocks the
-commit over a file the commit never contained. That is a livelock
-(agent-skills#64). Work from a throwaway worktree with `../rust-fs-core` at
-`v0.2.10` rather than reaching for `--no-verify`, which disables every guard at
-once.
+One practical note that survives all of this: `pre-commit.d/rust-clippy.sh`
+runs clippy without `--locked`, so a `../rust-fs-core` checkout that is
+semver-ahead of the pin rewrites your unstaged `Cargo.lock` and
+`rust-deps-pinned.sh` then blocks the commit over a file the commit never
+contained (agent-skills#64). The answer is to move the pin or restore the lock,
+not `--no-verify`, which disables every guard at once.
 
 ## What gates a merge
 
