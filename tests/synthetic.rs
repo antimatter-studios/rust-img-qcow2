@@ -1722,6 +1722,20 @@ impl fs_core::BlockDevice for CountingWrites {
     fn is_writable(&self) -> bool {
         fs_core::BlockDevice::is_writable(&self.inner)
     }
+    // A WRAPPER THAT DOES NOT FORWARD GROWTH CANNOT ALLOCATE THROUGH.
+    //
+    // `set_len` and `can_grow` are DEFAULTED on `BlockDevice` — to
+    // `Err(ReadOnly)` and `false` — so a wrapper that omits them looks
+    // writable and refuses to grow. That is the right default for a device
+    // that genuinely cannot, and exactly wrong for a passthrough: every
+    // allocating test through this wrapper failed with a bare `ReadOnly`
+    // once the allocator started asking for room.
+    fn set_len(&self, new_len: u64) -> fs_core::Result<()> {
+        fs_core::BlockDevice::set_len(&self.inner, new_len)
+    }
+    fn can_grow(&self) -> bool {
+        fs_core::BlockDevice::can_grow(&self.inner)
+    }
 }
 
 /// #44: AN ALLOCATING WRITE CARRIES THE METADATA IT CHANGES, NOT WHOLE
