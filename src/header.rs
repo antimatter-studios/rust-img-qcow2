@@ -38,7 +38,7 @@ pub const QCOW2_MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
 /// constant here be caught rather than agreed with: moving
 /// `CLUSTER_BITS` by one byte fails 52 tests, `L1_TABLE_OFFSET` 35.
 /// Rewriting the fixtures against this table would take both to zero.
-/// [`tests::offsets_match_the_published_specification`] is the same
+/// `tests::offsets_match_the_published_specification` is the same
 /// intent written down once, so it survives a later tidy-up.
 pub mod offsets {
     pub const MAGIC: usize = 0;

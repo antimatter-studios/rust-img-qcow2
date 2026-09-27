@@ -1,9 +1,15 @@
 //! Command-line introspection tool for QCOW2 images.
 //!
-//! Usage:
-//!   qcow2_tool info <file>
-//!   qcow2_tool read <file> <offset> <len>      (hex dump to stdout)
-//!   qcow2_tool dump <file> <offset> <len>      (raw bytes to stdout)
+//! Usage — fenced as `text` because `<file>` and `<offset>` are placeholders,
+//! and rustdoc reads a bare angle bracket in a doc comment as an HTML tag:
+//! `-D warnings` then fails the build on seven unclosed `file`, `offset` and
+//! `len` tags.
+//!
+//! ```text
+//! qcow2_tool info <file>
+//! qcow2_tool read <file> <offset> <len>      (hex dump to stdout)
+//! qcow2_tool dump <file> <offset> <len>      (raw bytes to stdout)
+//! ```
 //!
 //! Numbers accept hex (`0x...`) or decimal.
 

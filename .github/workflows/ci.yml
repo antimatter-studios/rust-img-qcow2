@@ -272,6 +272,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: rust-img-qcow2
+      # `cargo doc` RESOLVES THE PATH DEPENDENCY, so this job needs core even
+      # though `cargo fmt` does not. It is the cheapest job that can host a
+      # rustdoc run, and rustdoc is cheap.
+      - uses: actions/checkout@v4
+        with:
+          repository: antimatter-studios/rust-fs-core
+          ref: v0.2.13
+          path: rust-fs-core
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -279,6 +287,22 @@ jobs:
       - name: fmt --check
         working-directory: rust-img-qcow2
         run: cargo fmt --check
+      # THE PUBLIC DOCS BUILD, AND BROKEN LINKS ARE ERRORS.
+      #
+      # Nothing in CI had ever run rustdoc, so eight broken links accumulated
+      # in the public API docs (#105): links to private items, links with
+      # parentheses that resolve to nothing, and CLI usage text whose `<file>`
+      # placeholders rustdoc reads as unclosed HTML tags. A link that goes
+      # nowhere is worse than no link — it reads as a promise that something
+      # is documented elsewhere.
+      #
+      # `-D warnings` because rustdoc's default is to warn and carry on, which
+      # is how this got to eight.
+      - name: cargo doc (public docs build, broken links are errors)
+        working-directory: rust-img-qcow2
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
       - name: the one required check stands for every job
         working-directory: rust-img-qcow2
         run: scripts/ci-gate.sh

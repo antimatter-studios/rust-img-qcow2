@@ -198,7 +198,7 @@ enum WritePlan {
 }
 
 /// Public-facing status of a virtual cluster. Coarser than the
-/// internal [`ClusterMap`] (which carries host offsets and compressed-
+/// internal `ClusterMap` (which carries host offsets and compressed-
 /// span sizes): the consumer of `extents()` only needs to know whether
 /// to read, zero-fill, or defer to a backing reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +388,7 @@ fn span_inside_the_image(
 impl Qcow2Reader {
     /// Open `path` read-only and parse the header + L1 table. If the image
     /// references a backing file, the parent is opened recursively (capped at
-    /// [`MAX_BACKING_DEPTH`]).
+    /// `MAX_BACKING_DEPTH`).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
         let dev = FileDevice::open(p).map_err(fs_core_to_qcow2_error)?;
@@ -591,7 +591,7 @@ impl Qcow2Reader {
 
     /// Public-facing status of the cluster containing byte `virt`.
     /// Walks L1/L2 only — does not read cluster data. Use this to
-    /// decide whether a consumer needs to invoke [`read_at`] (for
+    /// decide whether a consumer needs to invoke [`Qcow2Reader::read_at`] (for
     /// [`ClusterStatus::Allocated`]) or can skip-fill with zeros
     /// (for [`ClusterStatus::Zero`] / [`ClusterStatus::Unallocated`]
     /// when no backing is present).
@@ -616,7 +616,7 @@ impl Qcow2Reader {
 
     /// Iterate the virtual disk as a sequence of contiguous extents,
     /// merging adjacent clusters of the same status. The iterator
-    /// stops at [`virtual_size()`]. Each yielded extent is
+    /// stops at [`Qcow2Reader::virtual_size`]. Each yielded extent is
     /// cluster-aligned (except possibly the last, which is clamped
     /// to virtual_size).
     ///
@@ -705,7 +705,7 @@ impl Qcow2Reader {
     }
 
     /// Write to the image. Every cluster state is handled by the same
-    /// two-case shape, decided by [`Qcow2Reader::plan_write`]:
+    /// two-case shape, decided by `Qcow2Reader::plan_write`:
     ///
     /// - **Allocated, uncompressed, single-ref**: direct write to the
     ///   existing host cluster. Nothing is allocated.
@@ -717,7 +717,7 @@ impl Qcow2Reader {
     ///   unallocated, an L2 table is allocated first.
     ///
     /// The seed is the only step that differs between those cases; see
-    /// [`ClusterSeed`] for what each state has to be seeded with and why
+    /// `ClusterSeed` for what each state has to be seeded with and why
     /// zero-flagged and unallocated clusters are not the same case.
     ///
     /// Crash-safety ordering: refcount → data → metadata, with
