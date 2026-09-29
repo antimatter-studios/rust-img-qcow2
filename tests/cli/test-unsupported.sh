@@ -17,7 +17,6 @@ not_implemented() {
 
 not_implemented "resize" img.qcow2 disk.qcow2 resize 16M
 not_implemented "set" img.qcow2 disk.qcow2 set backing base.qcow2
-not_implemented "write" img.qcow2 disk.qcow2 write --offset 0 </dev/null
 not_implemented "create" img.qcow2 new.qcow2 create 8M
 same "no refused verb changed the image" disk.qcow2 before.qcow2
 check "the refused create made no file" test ! -e new.qcow2

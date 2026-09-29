@@ -18,10 +18,6 @@ exclude = ["fuzz"]
 name = "qcow2"
 crate-type = ["staticlib", "rlib"]
 
-[[bin]]
-name = "qcow2_tool"
-path = "src/bin/qcow2_tool.rs"
-
 # THE COMMAND-LINE TOOL: one multi-call binary, named for the repository.
 # It dispatches on argv[0], so the release step installs it once as
 # `rust-img-qcow2` and links `img.qcow2` to it (cargo refuses a dot in a
@@ -155,3 +151,11 @@ panic = "unwind"
 # of anything else put here.
 [patch.crates-io]
 am-fs-core = { path = "../rust-fs-core" }
+
+# The command-line tool's own write refusals, run against the built binary.
+# It needs the `rust-img-qcow2` target, which needs `cli`; the debug and
+# release tiers pass `--features cli`, so they build and run it.
+[[test]]
+name = "cli_write"
+path = "tests/cli_write.rs"
+required-features = ["cli"]
