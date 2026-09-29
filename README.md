@@ -65,6 +65,7 @@ src/
   capi.rs      C ABI
   bin/
     qcow2_tool.rs   CLI: info, read, dump
+  cli/              img.qcow2 / rust-img-qcow2, behind the `cli` feature
 tests/
   synthetic.rs      hand-build minimal qcow2 in test, round-trip via API
 ```
@@ -75,6 +76,31 @@ tests/
 qcow2_tool info  <file>            # header + geometry
 qcow2_tool read  <file> <off> <len>  # read len bytes at virtual offset off
 ```
+
+## Command line
+
+`img.qcow2 <image> <verb>` reports and reads a QCOW2 image without a
+hypervisor. It is one multi-call binary, `rust-img-qcow2`, with `img.qcow2` a
+link to it; `rust-img-qcow2 img ...` is the same program under the one name
+nothing else on `PATH` can shadow, and `rust-img-qcow2 doctor` says whether
+the `img.qcow2` on `PATH` is this one. Build it with the `cli` feature (the
+library alone gains no dependency from it):
+
+```sh
+chore cli:install                         # or: cargo build --release --features cli
+img.qcow2 disk.qcow2 info                 # JSON; --text for people
+img.qcow2 disk.qcow2 read -o disk.raw     # the whole virtual disk, as a raw image
+img.qcow2 disk.qcow2 read --offset 0 --length 512 | xxd
+```
+
+Metadata is JSON by default, led by the keys every `img.<fmt>` tool shares
+(`format`, `virtual_size`, `block_size`, `backing`, `dirty`) with the
+format's own under `qcow2`. A failure is `{"error": "...", "code": N}` on
+stderr, `N` being the exit status: 1 failed, 2 wrong command line, 3 not
+implemented. `create`, `resize` and `set` exist and answer `not
+implemented`: the library has no creator and no resize.
+
+`chore test:cli` tests the tool as installed, against `qemu-img`.
 
 ## Spec
 
