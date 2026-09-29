@@ -156,6 +156,12 @@ never does.
   attached to the GitHub release for its tag, checked first against the
   crates.io checksum, and verifiable with `gh attestation verify` (see the
   README, "Verifying a release").
+- Releases attach the command-line tool as a tarball per platform
+  (`darwin-arm64`, `linux-x86_64`), laid out as an install prefix
+  (`bin/rust-img-qcow2`, `bin/img.qcow2` linked to it, man pages and
+  completions under `share/`, `share/rust-img-qcow2/CAVEATS`, `LICENSE`) and
+  attested with build provenance like the `.crate`. CI builds the tarball and
+  checks its layout on every pull request.
 - **The header and mapping parsers are fuzzed, on two tiers.** Every field
   a qcow2 image controls is an offset or a shift used in arithmetic —
   `cluster_bits`, `l1_size`, `l1_table_offset`, `refcount_table_offset` —
