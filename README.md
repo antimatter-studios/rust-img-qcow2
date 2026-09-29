@@ -63,24 +63,15 @@ src/
   header.rs    on-disk header parser (v2 + v3)
   reader.rs    L1/L2 lookup, refcount, decompress, read_at/write_at/flush
   capi.rs      C ABI
-  bin/
-    qcow2_tool.rs   CLI: info, read, dump
   cli/              img.qcow2 / rust-img-qcow2, behind the `cli` feature
 tests/
   synthetic.rs      hand-build minimal qcow2 in test, round-trip via API
 ```
 
-## CLI
-
-```
-qcow2_tool info  <file>            # header + geometry
-qcow2_tool read  <file> <off> <len>  # read len bytes at virtual offset off
-```
-
 ## Command line
 
-`img.qcow2 <image> <verb>` reports and reads a QCOW2 image without a
-hypervisor. It is one multi-call binary, `rust-img-qcow2`, with `img.qcow2` a
+`img.qcow2 <image> <verb>` reports, reads and writes a QCOW2 image without
+a hypervisor. It is one multi-call binary, `rust-img-qcow2`, with `img.qcow2` a
 link to it; `rust-img-qcow2 img ...` is the same program under the one name
 nothing else on `PATH` can shadow, and `rust-img-qcow2 doctor` says whether
 the `img.qcow2` on `PATH` is this one. Build it with the `cli` feature (the
@@ -91,6 +82,7 @@ chore cli:install                         # or: cargo build --release --features
 img.qcow2 disk.qcow2 info                 # JSON; --text for people
 img.qcow2 disk.qcow2 read -o disk.raw     # the whole virtual disk, as a raw image
 img.qcow2 disk.qcow2 read --offset 0 --length 512 | xxd
+img.qcow2 disk.qcow2 write --offset 0 < mbr.bin
 ```
 
 Metadata is JSON by default, led by the keys every `img.<fmt>` tool shares

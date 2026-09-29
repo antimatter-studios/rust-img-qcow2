@@ -141,8 +141,10 @@ never does.
   reports the image as JSON (`--text` for people), and `read [--offset N]
   [--length N] [-o FILE]` streams the guest's raw bytes, backing chain
   resolved and compressed clusters inflated, the whole virtual disk when no
-  range is given. `create` (no creator in the library), `resize` and `set`
-  answer `not implemented` (exit 3). `rust-img-qcow2 doctor` checks that the
+  range is given. `write --offset N` writes stdin into the guest, refusing
+  input that would run past the end before writing any of it; an image
+  flagged dirty or corrupt answers `not implemented`. `create` (no creator
+  in the library), `resize` and `set` answer `not implemented` (exit 3). `rust-img-qcow2 doctor` checks that the
   `img.qcow2` on `PATH` is this one. `chore test:cli` tests the installed tool
   against `qemu-img`, and CI runs it on every pull request.
 
@@ -167,6 +169,14 @@ never does.
   installed. It also asserts that a backed image opened on a *device* is
   refused for the backing chain rather than silently returning the holes
   as zeros (#107).
+
+### Removed
+
+- **`qcow2_tool` is removed; `img.qcow2` replaces it** *(BREAKING for `cargo
+  install --bin qcow2_tool`)*. `info` is `img.qcow2 <image> info`; `dump
+  <file> <offset> <len>` is `img.qcow2 <image> read --offset N --length N`;
+  the hex-dump `read` is that piped through `xxd`. It was never in a release
+  tarball or formula.
 
 ## [0.4.5] — 2026-09-06
 
