@@ -135,6 +135,10 @@ never does.
 
 ### Added
 
+- Releases carry a build-provenance attestation: the published `.crate` is
+  attached to the GitHub release for its tag, checked first against the
+  crates.io checksum, and verifiable with `gh attestation verify` (see the
+  README, "Verifying a release").
 - **The header and mapping parsers are fuzzed, on two tiers.** Every field
   a qcow2 image controls is an offset or a shift used in arithmetic —
   `cluster_bits`, `l1_size`, `l1_table_offset`, `refcount_table_offset` —
