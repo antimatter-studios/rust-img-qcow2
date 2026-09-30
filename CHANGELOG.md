@@ -7,6 +7,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-30
+
 ### Fixed
 
 - **The public API docs build, and CI runs rustdoc.** `RUSTDOCFLAGS="-D
@@ -286,7 +288,8 @@ never does.
 
 - `am-fs-core` and `am-partitions` dependencies move to 0.2.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.2...v0.4.3
