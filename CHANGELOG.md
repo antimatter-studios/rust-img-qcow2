@@ -7,6 +7,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-30
+
 ### Fixed
 
 - **The public API docs build, and CI runs rustdoc.** `RUSTDOCFLAGS="-D
