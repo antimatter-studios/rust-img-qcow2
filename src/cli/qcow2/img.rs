@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf};
 
 use clap::{value_parser, Arg, ArgMatches, Command as Cmd};
 
-use crate::common::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{CliError, Json, Outcome, Tool};
 use qcow2::Qcow2Reader;
 
 pub const TOOL: Tool = Tool {
     name: "img.qcow2",
     verb: "img",
     section: 1,
-    usage_exit: crate::common::output::EXIT_USAGE,
+    usage_exit: fs_core::cli::output::EXIT_USAGE,
     about: "Report, read and write a QCOW2 disk image without a hypervisor",
     command,
     run,
@@ -62,7 +62,7 @@ fn command() -> Cmd {
                 .value_parser(value_parser!(OsString))
                 .required(true),
         )
-        .args(crate::common::format_args().map(|a| a.global(true)))
+        .args(fs_core::cli::format_args().map(|a| a.global(true)))
         .subcommand_required(true)
         .subcommand(key_command(
             "info",
