@@ -323,16 +323,28 @@ jobs:
         # nothing runs is a guard that reports protection it is not providing.
         working-directory: rust-img-qcow2
         run: scripts/agents-core-check.sh
-      - name: no tracked file names a consuming application
-        # AGENTS.md: each of these is a standalone project. Run directly, like
-        # the two checks above, because CI here does not install chore (#122).
+      # EVERY tests/scripts GUARD, BY GLOB (#135). They were named one step
+      # each, so a guard added to that directory never ran until someone also
+      # added a step here -- test-write-jobs-pinned.sh went green on its first
+      # pull request without having run. Every guard runs even after one fails,
+      # and the floor makes a glob that matched nothing a failure, not a pass.
+      # tests/ci_profile.rs holds this loop and its floor in place.
+      - name: script tests (tests/scripts/*.sh, by glob)
         working-directory: rust-img-qcow2
-        run: tests/scripts/test-no-consumer-names.sh
-      - name: a job holding a write token runs only pinned actions
-        # Named here because nothing runs tests/scripts by glob in this
-        # workflow: a guard only in that directory would never run.
-        working-directory: rust-img-qcow2
-        run: bash tests/scripts/test-write-jobs-pinned.sh
+        shell: bash
+        run: |
+          set -uo pipefail
+          ran=0; failed=0
+          for t in tests/scripts/*.sh; do
+            [ -f "$t" ] || continue
+            echo "== $t"
+            bash "$t" || failed=$((failed + 1))
+            ran=$((ran + 1))
+          done
+          floor=3
+          echo "ran $ran script tests, $failed failed (floor $floor)"
+          [ "$failed" -eq 0 ] || exit 1
+          [ "$ran" -ge "$floor" ] || { echo "::error::ran $ran script tests, floor is $floor"; exit 1; }
 
   # Cross-validates our reader/writer against `qemu-img`. qemu-img is
   # invoked as a subprocess only — never linked, never bundled. The
