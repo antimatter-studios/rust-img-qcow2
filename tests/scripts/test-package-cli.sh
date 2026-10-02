@@ -98,7 +98,11 @@ if [ -f "$tarball" ]; then
     unpacked="$sandbox/unpacked"
     mkdir -p "$unpacked"
     tar -xzf "$tarball" -C "$unpacked"
-    members="$(cd "$unpacked" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort | tr '\n' ' ')"
+    # LC_ALL=C because `want` below is written in byte order, LICENSE before
+    # bin/. A bare `sort` collates by the caller's locale, and en_GB/en_US
+    # put LICENSE after bin/, so the check failed on a correct tarball
+    # everywhere but a C-locale CI runner (#137).
+    members="$(cd "$unpacked" && find . \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')"
     want="LICENSE bin/img.qcow2 bin/rust-img-qcow2 share/bash-completion/completions/img.qcow2 share/bash-completion/completions/rust-img-qcow2 share/fish/vendor_completions.d/img.qcow2.fish share/fish/vendor_completions.d/rust-img-qcow2.fish share/man/man1/img.qcow2-read.1 share/man/man1/img.qcow2.1 share/man/man1/rust-img-qcow2.1 share/rust-img-qcow2/CAVEATS share/zsh/site-functions/_img.qcow2 share/zsh/site-functions/_rust-img-qcow2 "
     [ "$members" = "$want" ] && ok || fail "the tarball holds exactly the prefix layout, got: $members"
     [ -L "$unpacked/bin/img.qcow2" ] && [ "$(readlink "$unpacked/bin/img.qcow2")" = rust-img-qcow2 ] && ok ||
