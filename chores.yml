@@ -231,7 +231,7 @@ tasks:
     # workflow with no such run, and the reason is the same one.
     cmds:
       - 'EXPECT_OVERFLOW_CHECKS=1 bash scripts/tier.sh "test (debug)" debug 420 28000 -- cargo test --locked --all-targets --features cli'
-      - 'bash scripts/test-floor.sh debug 225'
+      - 'bash scripts/core.sh test-floor debug 225'
 
   test:release:
     desc: 'The suite in the profile that ships: no debug_assert!, arithmetic wraps, lto = true'
@@ -242,7 +242,7 @@ tasks:
     # `test-release` job, and #98.
     cmds:
       - 'bash scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli'
-      - 'bash scripts/test-floor.sh release 225'
+      - 'bash scripts/core.sh test-floor release 225'
 
   test:qemu:
     desc: 'The qemu-img cross-validation: another implementation reads what we wrote'
@@ -258,7 +258,7 @@ tasks:
     # 0 (#50).
     cmds:
       - 'bash scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
-      - 'bash scripts/test-floor.sh qemu 23'
+      - 'bash scripts/core.sh test-floor qemu 23'
 
   test:lib32:
     desc: 'The library unit tests on a 32-bit target, where `as usize` narrows'
@@ -273,7 +273,7 @@ tasks:
     # than skipping.
     cmds:
       - 'bash scripts/tier.sh "test (32-bit lib)" lib32 200 14000 -- cargo test --locked --lib --target i686-unknown-linux-gnu'
-      - 'bash scripts/test-floor.sh lib32 38'
+      - 'bash scripts/core.sh test-floor lib32 38'
 
   cli:install:
     desc: 'Build the command-line tool (release, --features cli) and stage it as an install prefix: tmp/cli/bin/rust-img-qcow2, and img.qcow2 a relative symlink to it'
@@ -299,7 +299,7 @@ tasks:
     # 95% of the count. The `cli` job in ci.yml carries the same numbers.
     cmds:
       - 'bash scripts/tier.sh "test (cli)" cli 35 1300 -- bash scripts/test-cli.sh'
-      - 'bash scripts/test-floor.sh cli 404'
+      - 'bash scripts/core.sh test-floor cli 404'
 
   package:cli:
     desc: 'Build the tool and package it as this machine''s release tarball in tmp/package, checking its layout (what release.yml attaches)'
@@ -371,7 +371,7 @@ tasks:
     # room for a warning block without hiding a flood. No floor: it is one
     # check, not a suite.
     cmds:
-      - 'bash scripts/tier.sh semver semver 40 4000 -- scripts/semver-check.sh'
+      - 'bash scripts/tier.sh semver semver 40 4000 -- bash scripts/core.sh semver-check'
 
   check:ci-gate:
     desc: The one required check stands for every job in ci.yml
