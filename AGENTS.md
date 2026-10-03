@@ -194,7 +194,7 @@ indistinguishable from a suite that passes.
 
 ## The pin that could not be bumped, and how it was
 
-This crate depends on `am-fs-core` at **`v0.2.14`**. It sat at `v0.2.10` for a
+This crate depends on `am-fs-core` at **`v0.2.23`**. It sat at `v0.2.10` for a
 while, deliberately, and the reasoning is kept because a spent caution that
 reads as a live one is how a repository ends up several releases behind without
 anyone deciding to be.
