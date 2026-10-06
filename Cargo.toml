@@ -82,7 +82,7 @@ flate2 = "1"
 ruzstd = "0.8"
 # Block-device trait surface. Local path dep until both crates are
 # published; flip to a published version on the first crates.io release.
-rust-fs-core = { path = "../rust-fs-core", version = "0.3.2" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.7" }
 # The command-line tool's argument parser, behind the `cli` feature (see the
 # `rust-img-qcow2` target above). No derive: the builder API keeps the tool's
 # command a function the man pages and completions can be made from.
