@@ -5,6 +5,8 @@ Notable changes to `am-img-qcow2`, newest first. This is a `0.x` crate, so the
 never does.
 
 
+## [Unreleased]
+
 ## [0.5.2] — 2026-10-06
 
 ### Renamed
@@ -323,7 +325,8 @@ never does.
 
 - `am-fs-core` and `am-partitions` dependencies move to 0.2.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.4...v0.4.5
