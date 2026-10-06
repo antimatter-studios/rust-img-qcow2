@@ -221,12 +221,12 @@ a cluster is supposed to be new.
 
 Two things went with it:
 
-- **The second checkout of core is gone (#114).** `scripts/tier.sh` reads
+- **The second checkout of core is gone (#114).** The tier runner reads
   rust-fs-core's `scripts/output-budget.sh` at runtime — this repository does
   not carry a copy — and that needed `v0.2.13`, while the dependency was held at
   `v0.2.10`. Two lower bounds meant two clones of the same repository at two
-  refs. The higher pin satisfies both, so `FS_CORE_ROOT` points at
-  `../rust-fs-core` and there is one checkout again.
+  refs. The higher pin satisfies both, so there is one checkout again, and
+  since rust-fs-core 0.3.2 the family's scripts run from it in place.
 - **A wrapper device has to forward growth.** `set_len` and `can_grow` are
   *defaulted* on `BlockDevice`, to `Err(ReadOnly)` and `false`. A passthrough
   that omits them looks writable and refuses to grow, and every allocating test

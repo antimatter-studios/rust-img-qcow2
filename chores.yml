@@ -92,15 +92,12 @@ chore_min_version: 0.6.0
 #   against 9.5M of output, with command output the largest single
 #   contributor a repository controls.
 #
-#   WHERE THE SCRIPT COMES FROM. There is no scripts/output-budget.sh in this
-#   repository and there must not be one. The canonical wrapper is
-#   rust-fs-core's, and scripts/tier.sh resolves it at RUNTIME -- from the
-#   sibling ../rust-fs-core, or from wherever cargo unpacked rust-fs-core, or
-#   from FS_CORE_ROOT when that is set. It is verified by the API string it
-#   prints for --version, not by a checksum: a digest pinned in every
-#   consuming repository is a lockstep update for a change none of them made.
-#   A copy that cannot be found or does not answer is a LOUD failure with no
-#   fallback, and tests/output_budget.rs is what proves that.
+#   WHERE THE SCRIPT COMES FROM. The wrapper the budgets are enforced by is
+#   rust-fs-core's scripts/output-budget.sh, run through its scripts/tier.sh
+#   IN PLACE from the ../rust-fs-core checkout at the pinned version, and
+#   THERE IS NO COPY OF EITHER HERE. A committed copy is a copy that drifts,
+#   which is the whole of antimatter-studios/rust-fs-core#153 and #212;
+#   rust-fs-core's family-check refuses one.
 vars:
   TRIPLE: aarch64-apple-darwin
   # `[package].name` is rust-img-qcow2; `[lib].name` is qcow2, so cargo writes
@@ -230,8 +227,8 @@ tasks:
     # Do not add `--release` here; tests/ci_profile.rs refuses a
     # workflow with no such run, and the reason is the same one.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 bash scripts/tier.sh "test (debug)" debug 420 28000 -- cargo test --locked --all-targets --features cli'
-      - 'bash scripts/core.sh test-floor debug 225'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh "test (debug)" debug 420 28000 -- cargo test --locked --all-targets --features cli'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh debug 225'
 
   test:release:
     desc: 'The suite in the profile that ships: no debug_assert!, arithmetic wraps, lto = true'
@@ -241,8 +238,8 @@ tasks:
     # reason. See the long note in .github/workflows/ci.yml on the
     # `test-release` job, and #98.
     cmds:
-      - 'bash scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli'
-      - 'bash scripts/core.sh test-floor release 225'
+      - 'bash ../rust-fs-core/scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh release 225'
 
   test:qemu:
     desc: 'The qemu-img cross-validation: another implementation reads what we wrote'
@@ -257,8 +254,8 @@ tasks:
     # `cargo test --test qemu_validation` alone matches nothing and exits
     # 0 (#50).
     cmds:
-      - 'bash scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
-      - 'bash scripts/core.sh test-floor qemu 23'
+      - 'bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh qemu 23'
 
   test:lib32:
     desc: 'The library unit tests on a 32-bit target, where `as usize` narrows'
@@ -272,8 +269,8 @@ tasks:
     # toolchain (gcc-multilib on Debian). It fails naming them rather
     # than skipping.
     cmds:
-      - 'bash scripts/tier.sh "test (32-bit lib)" lib32 200 14000 -- cargo test --locked --lib --target i686-unknown-linux-gnu'
-      - 'bash scripts/core.sh test-floor lib32 38'
+      - 'bash ../rust-fs-core/scripts/tier.sh "test (32-bit lib)" lib32 200 14000 -- cargo test --locked --lib --target i686-unknown-linux-gnu'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh lib32 38'
 
   cli:install:
     desc: 'Build the command-line tool (release, --features cli) and stage it as an install prefix: tmp/cli/bin/rust-img-qcow2, and img.qcow2 a relative symlink to it'
@@ -298,8 +295,8 @@ tasks:
     # runner's longer paths in the doctor and PATH lines; the floor is about
     # 95% of the count. The `cli` job in ci.yml carries the same numbers.
     cmds:
-      - 'bash scripts/tier.sh "test (cli)" cli 35 1300 -- bash scripts/test-cli.sh'
-      - 'bash scripts/core.sh test-floor cli 404'
+      - 'bash ../rust-fs-core/scripts/tier.sh "test (cli)" cli 35 1300 -- bash scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh cli 404'
 
   package:cli:
     desc: 'Build the tool and package it as this machine''s release tarball in tmp/package, checking its layout (what release.yml attaches)'
@@ -314,7 +311,7 @@ tasks:
         esac
         version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
         mkdir -p tmp/package && cd tmp/package
-        bash ../../scripts/core.sh package-cli "$version" "$label" ../../target/release
+        bash ../../../rust-fs-core/scripts/package-cli.sh "$version" "$label" ../../target/release
 
   clean:
     desc: Remove this crate's cargo output
@@ -348,7 +345,7 @@ tasks:
   lint:
     desc: Formatting and clippy, exactly as CI runs them
     cmds:
-      - scripts/agents-core-check.sh
+      - bash ../rust-fs-core/scripts/agents-core-check.sh
       - tests/scripts/test-no-consumer-names.sh
       - cargo fmt --check
       - cargo clippy --locked --all-targets --features cli -- -D warnings
@@ -367,7 +364,7 @@ tasks:
     # room for a warning block without hiding a flood. No floor: it is one
     # check, not a suite.
     cmds:
-      - 'bash scripts/tier.sh semver semver 40 4000 -- bash scripts/core.sh semver-check'
+      - 'bash ../rust-fs-core/scripts/tier.sh semver semver 40 4000 -- bash ../rust-fs-core/scripts/semver-check.sh'
 
   check:ci-gate:
     desc: The one required check stands for every job in ci.yml
@@ -380,4 +377,4 @@ tasks:
     # floor the gate itself enforces -- so the suite could satisfy its floor
     # partly by checking its own CI config.
     cmds:
-      - bash scripts/core.sh ci-gate
+      - bash ../rust-fs-core/scripts/ci-gate.sh
