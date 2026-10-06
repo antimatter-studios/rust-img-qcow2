@@ -16,13 +16,13 @@ chore_min_version: 0.6.0
 #
 # `artifact` PRINTS A DIRECTORY, NOT A FILE. That is the one place this
 # differs from rust-blk-probe, whose single binary lets its `artifact` name
-# a file: this crate produces libqcow2.a AND the headers beside it, so
+# a file: this crate produces libimg_qcow2.a AND the headers beside it, so
 # there is no single path to name.
 #
-# WHY fs_core.h IS COPIED TOO. include/qcow2.h opens with
+# WHY fs_core.h IS COPIED TOO. include/img_qcow2.h opens with
 # `#include "fs_core.h"` — this crate's C ABI hands out FsCoreDevice handles —
-# so a consumer given only qcow2.h cannot compile. The path below is the same
-# one Cargo.toml resolves am-fs-core from, and NOTHING CHECKS THAT THE TWO
+# so a consumer given only img_qcow2.h cannot compile. The path below is the same
+# one Cargo.toml resolves rust-fs-core from, and NOTHING CHECKS THAT THE TWO
 # AGREE.
 # QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
 #
@@ -95,7 +95,7 @@ chore_min_version: 0.6.0
 #   WHERE THE SCRIPT COMES FROM. There is no scripts/output-budget.sh in this
 #   repository and there must not be one. The canonical wrapper is
 #   rust-fs-core's, and scripts/tier.sh resolves it at RUNTIME -- from the
-#   sibling ../rust-fs-core, or from wherever cargo unpacked am-fs-core, or
+#   sibling ../rust-fs-core, or from wherever cargo unpacked rust-fs-core, or
 #   from FS_CORE_ROOT when that is set. It is verified by the API string it
 #   prints for --version, not by a checksum: a digest pinned in every
 #   consuming repository is a lockstep update for a change none of them made.
@@ -103,9 +103,9 @@ chore_min_version: 0.6.0
 #   fallback, and tests/output_budget.rs is what proves that.
 vars:
   TRIPLE: aarch64-apple-darwin
-  # `[package].name` is am-img-qcow2; `[lib].name` is qcow2, so cargo writes
-  # libqcow2.a. The header mirrors the lib name, not the package name.
-  LIBNAME: qcow2
+  # `[package].name` is rust-img-qcow2; `[lib].name` is qcow2, so cargo writes
+  # libimg_qcow2.a. The header mirrors the lib name, not the package name.
+  LIBNAME: img_qcow2
 
 tasks:
   staticlib:
@@ -336,7 +336,7 @@ tasks:
     #
     # IT PRINTS A DIRECTORY, NOT A FILE, and that is the one place this differs
     # from rust-blk-probe's `artifact`. That crate produces a single binary, so
-    # it can name a file. This one produces libqcow2.a AND the headers beside
+    # it can name a file. This one produces libimg_qcow2.a AND the headers beside
     # it, so there is no single path to name — A CONSUMER COPIES THE CONTENTS of
     # what this prints. A consumer that treats it as a file path will silently
     # copy the wrong thing.

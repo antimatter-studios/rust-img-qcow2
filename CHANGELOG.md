@@ -1,9 +1,18 @@
 # Changelog
 
-Notable changes to `am-img-qcow2`, newest first. This is a `0.x` crate, so the
+Notable changes to `rust-img-qcow2` (published as `am-img-qcow2` until its last version), newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
+
+## [0.6.0] — 2026-10-06
+
+### Changed
+
+- **Published as `rust-img-qcow2`, the repository's name.** The crate was `am-img-qcow2`
+  until its last version, which stays on crates.io pointing here. A
+  dependent changes one line in `Cargo.toml`; the import moves from `qcow2` to `img_qcow2`, and the C symbols are unchanged.
+- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
 
 ## [Unreleased]
 
@@ -325,7 +334,8 @@ never does.
 
 - `am-fs-core` and `am-partitions` dependencies move to 0.2.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...v0.5.0

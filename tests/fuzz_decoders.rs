@@ -87,7 +87,7 @@ fn targets() -> Vec<Target> {
             corpus: "header",
             name: "header",
             run: |b| {
-                if let Ok(header) = qcow2::Header::parse(b) {
+                if let Ok(header) = img_qcow2::Header::parse(b) {
                     let _ = header.check_supported();
                     let _ = header.check_writable();
                     let _ = header.l2_entries();
@@ -288,7 +288,7 @@ fn the_corpus_reads_back_what_qemu_img_wrote() {
         // omitted the data underneath. Asserted here so that if it ever
         // starts succeeding, something says so.
         if name.starts_with("backed") {
-            let refused = qcow2::Qcow2Reader::open_on_device(dev)
+            let refused = img_qcow2::Qcow2Reader::open_on_device(dev)
                 .err()
                 .unwrap_or_else(|| {
                     panic!(
@@ -304,7 +304,7 @@ fn the_corpus_reads_back_what_qemu_img_wrote() {
             continue;
         }
 
-        let reader = qcow2::Qcow2Reader::open_on_device(dev)
+        let reader = img_qcow2::Qcow2Reader::open_on_device(dev)
             .unwrap_or_else(|e| panic!("{name}: an image qemu-img wrote would not open: {e}"));
 
         let mut buf = vec![0u8; RUN];
@@ -445,7 +445,7 @@ fn the_gate_covers_every_explorer_target() {
 // The fuzz crate is for THIS crate, which means the same core (qcow2#118)
 // ---------------------------------------------------------------------------
 
-/// `fuzz/Cargo.toml` AND `Cargo.toml` NAME ONE VERSION OF `am-fs-core`.
+/// `fuzz/Cargo.toml` AND `Cargo.toml` NAME ONE VERSION OF `rust-fs-core`.
 ///
 /// The fuzz crate is a separate package with its own manifest and lockfile, so
 /// nothing about bumping the parent's dependency points at the child's. Across
@@ -475,14 +475,14 @@ fn the_fuzz_crate_requires_the_same_core_as_this_one() {
             .and_then(toml::Value::as_table)
             .unwrap_or_else(|| panic!("{what} has no [dependencies]"));
         let entry = dependencies
-            .get("am-fs-core")
-            .unwrap_or_else(|| panic!("{what} does not depend on am-fs-core"));
+            .get("rust-fs-core")
+            .unwrap_or_else(|| panic!("{what} does not depend on rust-fs-core"));
         entry
             .get("version")
             .and_then(toml::Value::as_str)
             .unwrap_or_else(|| {
                 panic!(
-                    "{what}'s am-fs-core entry has no `version` field. A bare \
+                    "{what}'s rust-fs-core entry has no `version` field. A bare \
                      `path` dependency passes every check in this file while \
                      saying nothing about which core it is for."
                 )
@@ -496,7 +496,7 @@ fn the_fuzz_crate_requires_the_same_core_as_this_one() {
 
     assert_eq!(
         fuzz, parent,
-        "fuzz/Cargo.toml requires am-fs-core {fuzz:?} and Cargo.toml requires \
+        "fuzz/Cargo.toml requires rust-fs-core {fuzz:?} and Cargo.toml requires \
          {parent:?}. Caret matching hides this until core's minor moves, and \
          then it fails inside a nightly cron rather than in a pull request. \
          Move both together, and refresh fuzz/Cargo.lock."

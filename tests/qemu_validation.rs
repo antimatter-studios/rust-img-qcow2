@@ -16,7 +16,7 @@
 mod common;
 
 use common::*;
-use qcow2::Qcow2Reader;
+use img_qcow2::Qcow2Reader;
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
@@ -149,13 +149,13 @@ fn our_reader_returns_zeros_for_empty_qemu_image() {
 /// rather than emitting one extent per cluster or stopping short.
 #[test]
 fn extents_iter_handles_freshly_created_all_unallocated_image() {
-    use qcow2::ClusterStatus;
+    use img_qcow2::ClusterStatus;
 
     let p = tmp_path("freshly_created");
     qemu_create(&p, "1M");
 
     let r = Qcow2Reader::open(&p).unwrap();
-    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
+    let extents: Vec<_> = r.extents().collect::<img_qcow2::Result<Vec<_>>>().unwrap();
 
     // Brand-new qcow2 has no allocated clusters at all — the iterator
     // collapses the whole virtual disk into one Unallocated extent.
@@ -496,7 +496,7 @@ fn a_backing_name_running_past_the_first_cluster_is_refused_by_the_validator_and
     );
 
     match Qcow2Reader::open(&child) {
-        Err(qcow2::Error::Corrupt(_)) => {}
+        Err(img_qcow2::Error::Corrupt(_)) => {}
         Err(other) => panic!("expected Corrupt, got {other:?}"),
         Ok(r) => panic!(
             "expected a refusal; opened it with has_backing() = {}",
@@ -576,7 +576,7 @@ fn an_unaligned_l2_entry_is_refused_by_the_validator_and_by_us() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?} with buf starting {:02x?}",
         &buf[..8]
     );
@@ -634,7 +634,7 @@ fn the_zero_flag_on_a_v2_image_is_refused_by_the_validator_and_by_us() {
                 "compat={compat}: the validator was expected to refuse bit 0 on a v2 L2 entry"
             );
             assert!(
-                matches!(ours, Err(qcow2::Error::Corrupt(_))),
+                matches!(ours, Err(img_qcow2::Error::Corrupt(_))),
                 "compat={compat}: expected a refusal, got {ours:?} with buf starting {:02x?}",
                 &buf[..8]
             );
@@ -787,7 +787,7 @@ fn an_unaligned_table_offset_is_refused_by_the_validator_and_by_us() {
         );
 
         match Qcow2Reader::open(&qcow) {
-            Err(qcow2::Error::Corrupt(msg)) => assert!(
+            Err(img_qcow2::Error::Corrupt(msg)) => assert!(
                 msg.contains("cluster-aligned"),
                 "{field}: the refusal must name the alignment, got {msg:?}"
             ),
@@ -862,7 +862,7 @@ fn a_flagged_image_still_reads_and_no_longer_takes_writes() {
 
         // Writing is not.
         match Qcow2Reader::open_rw(&qcow) {
-            Err(qcow2::Error::Unsupported(m)) => assert!(
+            Err(img_qcow2::Error::Unsupported(m)) => assert!(
                 m.contains(label),
                 "{label}: the refusal must name the flag, got {m:?}"
             ),
@@ -943,7 +943,7 @@ fn the_backing_chain_is_keyed_and_bounded_like_the_validator_does_it() {
             "precondition: the validator must refuse it"
         );
         match Qcow2Reader::open(&p) {
-            Err(qcow2::Error::Corrupt(m)) => {
+            Err(img_qcow2::Error::Corrupt(m)) => {
                 assert!(m.contains("first cluster"), "got {m:?}")
             }
             Err(other) => panic!("expected Corrupt, got {other:?}"),

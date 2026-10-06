@@ -28,7 +28,7 @@ fn write_from_file(image: &Path, offset: &str, input: &Path) -> Output {
 }
 
 fn virtual_size(image: &Path) -> u64 {
-    qcow2::Qcow2Reader::open(image).unwrap().virtual_size()
+    img_qcow2::Qcow2Reader::open(image).unwrap().virtual_size()
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn write_refuses_an_input_past_the_virtual_disk_by_its_length() {
         "{}",
         String::from_utf8_lossy(&wrote.stderr)
     );
-    let r = qcow2::Qcow2Reader::open(&image).unwrap();
+    let r = img_qcow2::Qcow2Reader::open(&image).unwrap();
     let mut back = [0u8; 4];
     r.read_at(512, &mut back).unwrap();
     assert_eq!(&back, b"fits");

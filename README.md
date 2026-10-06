@@ -1,19 +1,5 @@
 # qcow2
 
-> **Renamed to [`rust-img-qcow2`](https://crates.io/crates/rust-img-qcow2).**
-> `am-img-qcow2` 0.5.2 is the last version published under this name. New versions
-> are published only as `rust-img-qcow2`, starting at 0.6.0. To move, change one line
-> in `Cargo.toml`:
->
-> ```toml
-> # before
-> am-img-qcow2 = "0.5"
-> # after
-> rust-img-qcow2 = "0.6"
-> ```
->
-> The import changes too: `use qcow2::...` becomes `use img_qcow2::...`.
-
 Pure-Rust reader and writer for the QCOW2 disk-image format. Spec-derived;
 no GPL code is copied or linked. Exposes a Rust API and a C ABI suitable
 for FFI from C/C++/Go/Swift.
@@ -129,8 +115,8 @@ repository, not uploaded from someone's machine. To check the crates.io
 download of version `X.Y.Z`:
 
 ```sh
-curl -sSfLo am-img-qcow2-X.Y.Z.crate https://static.crates.io/crates/am-img-qcow2/am-img-qcow2-X.Y.Z.crate
-gh attestation verify am-img-qcow2-X.Y.Z.crate \
+curl -sSfLo rust-img-qcow2-X.Y.Z.crate https://static.crates.io/crates/rust-img-qcow2/rust-img-qcow2-X.Y.Z.crate
+gh attestation verify rust-img-qcow2-X.Y.Z.crate \
   --repo antimatter-studios/rust-img-qcow2 \
   --signer-workflow antimatter-studios/rust-img-qcow2/.github/workflows/release.yml
 ```
@@ -140,13 +126,13 @@ checksum crates.io records for that version, so the file on the release
 page and the crates.io download are the same bytes.
 
 The command-line tool is attached to the same release as a tarball per
-platform, `am-img-qcow2-X.Y.Z-darwin-arm64.tar.gz` and
-`am-img-qcow2-X.Y.Z-linux-x86_64.tar.gz`. They are packaged and attested by
+platform, `rust-img-qcow2-X.Y.Z-darwin-arm64.tar.gz` and
+`rust-img-qcow2-X.Y.Z-linux-x86_64.tar.gz`. They are packaged and attested by
 rust-fs-core's shared `release-cli.yml` workflow, which this repository's
 `release.yml` calls, so that is the workflow their attestations name:
 
 ```sh
-gh attestation verify am-img-qcow2-X.Y.Z-darwin-arm64.tar.gz \
+gh attestation verify rust-img-qcow2-X.Y.Z-darwin-arm64.tar.gz \
   --repo antimatter-studios/rust-img-qcow2 \
   --signer-workflow antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml
 ```

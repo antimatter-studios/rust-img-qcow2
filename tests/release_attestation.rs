@@ -327,12 +327,12 @@ fn read(rel: &str) -> String {
 }
 
 /// The rust-fs-core tag this crate is built against: `v` and the version
-/// Cargo.toml requires of am-fs-core.
+/// Cargo.toml requires of rust-fs-core.
 fn core_ref() -> String {
     let manifest: toml::Table = read("Cargo.toml").parse().expect("Cargo.toml parses");
-    let version = manifest["dependencies"]["am-fs-core"]["version"]
+    let version = manifest["dependencies"]["rust-fs-core"]["version"]
         .as_str()
-        .expect("Cargo.toml pins am-fs-core by version");
+        .expect("Cargo.toml pins rust-fs-core by version");
     format!("v{version}")
 }
 
@@ -426,7 +426,7 @@ fn release_cli_gaps(yaml: &str, core_ref: &str, toolchain: &str) -> Vec<String> 
         };
         if with("core-ref") != core_ref {
             gaps.push(format!(
-                "job {name} passes core-ref {:?}, not Cargo.toml's am-fs-core {core_ref:?}",
+                "job {name} passes core-ref {:?}, not Cargo.toml's rust-fs-core {core_ref:?}",
                 with("core-ref")
             ));
         }

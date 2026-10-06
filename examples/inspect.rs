@@ -3,8 +3,8 @@
 //!
 //!     cargo run --example inspect -- /path/to/disk.qcow2
 
-use partitions::{probe, sniff, FsKind};
-use qcow2::Qcow2Reader;
+use disk_partitions::{probe, sniff, FsKind};
+use img_qcow2::Qcow2Reader;
 
 fn main() {
     let path = match std::env::args().nth(1) {

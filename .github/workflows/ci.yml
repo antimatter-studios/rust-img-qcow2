@@ -12,7 +12,7 @@ env:
   # scripts/tier.sh runs every tier through rust-fs-core's canonical
   # scripts/output-budget.sh, resolved at runtime; this repository no longer
   # carries a copy of it. FS_CORE_ROOT names the checkout it is read from,
-  # which is now the SAME one the crate compiles against: the am-fs-core pin
+  # which is now the SAME one the crate compiles against: the rust-fs-core pin
   # reached v0.2.13, so the tooling's lower bound is met by the dependency's
   # and the second checkout this used to need is gone (#114).
   #
@@ -47,13 +47,13 @@ jobs:
       # needs; a second checkout here would let a path dependency on a
       # second sibling pass CI while breaking every consumer who
       # provisioned from that sentence. rust-partitions used to be
-      # checked out below and is not any more -- am-partitions comes
+      # checked out below and is not any more -- rust-disk-partitions comes
       # from the registry. See #69, and
       # tests/siblings_the_contract_promises.rs.
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -134,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - name: install a 32-bit C toolchain
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-multilib
@@ -237,7 +237,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -288,7 +288,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -368,7 +368,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - name: install qemu-utils
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
@@ -452,7 +452,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - name: install qemu-utils, jq and man
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils jq man-db
@@ -536,7 +536,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: antimatter-studios/rust-fs-core
-          ref: v0.2.23
+          ref: v0.3.0
           path: rust-fs-core
       - uses: dtolnay/rust-toolchain@stable
         with:

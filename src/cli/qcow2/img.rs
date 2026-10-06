@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use clap::{value_parser, Arg, ArgMatches, Command as Cmd};
 
 use fs_core::cli::{CliError, Json, Outcome, Tool};
-use qcow2::Qcow2Reader;
+use img_qcow2::Qcow2Reader;
 
 pub const TOOL: Tool = Tool {
     name: "img.qcow2",
@@ -204,7 +204,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     }
 }
 
-fn qcow2_error(image: &Path, e: qcow2::Error) -> CliError {
+fn qcow2_error(image: &Path, e: img_qcow2::Error) -> CliError {
     CliError::failed(format!("{}: {e}", image.display()))
 }
 
@@ -435,9 +435,9 @@ fn is_same_file(_input: &std::fs::File, _image: &Path) -> bool {
 /// A write the library refuses by what the image is (flagged dirty or
 /// corrupt, a refcount width it does not write) is a verb it cannot do yet;
 /// anything else failed.
-fn write_error(image: &Path, e: qcow2::Error) -> CliError {
+fn write_error(image: &Path, e: img_qcow2::Error) -> CliError {
     match e {
-        qcow2::Error::Unsupported(why) => {
+        img_qcow2::Error::Unsupported(why) => {
             CliError::not_implemented(format!("write: {}: {why}", image.display()))
         }
         other => qcow2_error(image, other),

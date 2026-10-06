@@ -72,7 +72,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # directory is the ONLY place looked in: an override that silently falls
 # through to something else is not an override, and the tests that prove this
 # resolver refuses a missing or wrong core depend on there being no second
-# chance. ci.yml sets it, because this crate's am-fs-core is pinned to a
+# chance. ci.yml sets it, because this crate's rust-fs-core is pinned to a
 # release older than the one that carries the wrapper -- see the comment
 # beside the checkout there.
 #
@@ -127,7 +127,7 @@ elif [ -f "$SIBLING_ROOT/$SCRIPT_REL" ]; then
     insist_canonical "$SOURCE"
 else
     # THE REGISTRY COPY, for a checkout with no sibling beside it. Cargo has
-    # already resolved am-fs-core, so it is the thing that knows where the
+    # already resolved rust-fs-core, so it is the thing that knows where the
     # package was unpacked; nothing here guesses at CARGO_HOME's layout.
     # This branch is not reached on windows-latest -- the sibling above wins
     # there -- which is why it may depend on python3 for the JSON.
@@ -146,9 +146,9 @@ try:
 except Exception:
     sys.exit(0)
 print(next((p["manifest_path"].rsplit("/", 1)[0]
-            for p in packages if p["name"] == "am-fs-core"), ""))
+            for p in packages if p["name"] == "rust-fs-core"), ""))
 ' || true)"
-    [ -n "$CORE_DIR" ] || die "cargo could not say where am-fs-core is."
+    [ -n "$CORE_DIR" ] || die "cargo could not say where rust-fs-core is."
     SOURCE="$CORE_DIR/$SCRIPT_REL"
     insist_canonical "$SOURCE"
 fi

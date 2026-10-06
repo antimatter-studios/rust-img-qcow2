@@ -650,7 +650,7 @@ impl Qcow2Reader {
     ///
     /// `write_at` used to extend a `FileDevice` implicitly, and that is how
     /// this format allocated: write the new cluster past the old end, then
-    /// record where it went. `am-fs-core` withdrew that in its #75, and
+    /// record where it went. `rust-fs-core` withdrew that in its #75, and
     /// correctly — the file grew while `size_bytes()` went on reporting the
     /// length taken at open, so a caching device could hold bytes no bounded
     /// read could reach (rust-fs-core#70). `set_len` is the replacement:
