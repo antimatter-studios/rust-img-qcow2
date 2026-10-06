@@ -57,12 +57,14 @@ chore_min_version: 0.6.0
 #                                              separate build step, so a
 #                                              cold cache puts ~75
 #                                              `Compiling` lines in here too
-#     qemu        36 /  2,133    130 /  9,000  25 tests at 36 lines, plus the
-#                                              ~75 `Compiling` lines a cold
-#                                              cache puts in this tier: the
-#                                              job has no build step, and the
-#                                              feature gate means this target
-#                                              is built nowhere else
+#     qemu        36 /  2,133    180 /  9,000  25 tests at 36 lines, plus the
+#                                              `Compiling` lines a cold cache
+#                                              puts in this tier: the job has
+#                                              no build step, and the feature
+#                                              gate means this target is
+#                                              built nowhere else. A cold
+#                                              build measured 142 lines (run
+#                                              37545310076, rust-fs-core 0.3.7)
 #     lib32       53 /  3,779    200 / 14,000  the 42 library tests, plus the
 #                                              i686 build's own `Compiling`
 #                                              lines, which land in this tier
@@ -254,7 +256,7 @@ tasks:
     # `cargo test --test qemu_validation` alone matches nothing and exits
     # 0 (#50).
     cmds:
-      - 'bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
+      - 'bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 180 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
       - 'bash ../rust-fs-core/scripts/test-floor.sh qemu 23'
 
   test:lib32:

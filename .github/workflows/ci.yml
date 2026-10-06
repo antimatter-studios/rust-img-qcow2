@@ -393,7 +393,7 @@ jobs:
         # qemu-validation --test qemu_validation`.
         shell: bash
         run: |
-          bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation
+          bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 180 9000 -- cargo test --locked --features qemu-validation --test qemu_validation
           bash ../rust-fs-core/scripts/test-floor.sh qemu 23
       - name: keep the tier log
         if: always()
