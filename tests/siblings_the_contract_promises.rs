@@ -5,7 +5,7 @@
 //! > OUTPUT DIRECTORY.
 //!
 //! A consumer reads that, provisions the siblings `chores.yml` names, and
-//! runs `chore staticlib`. It was false for as long as `am-partitions` was
+//! runs `chore staticlib`. It was false for as long as `rust-disk-partitions` was
 //! a path dev-dependency: cargo builds the resolve graph for EVERY command,
 //! dev-dependencies included, so `cargo build --release` needed
 //! `../rust-partitions` on disk exactly as `cargo test` does. Measured on
@@ -36,7 +36,7 @@
 //! resolves by path. That is why `[patch.crates-io]` exists in
 //! `Cargo.toml`, and the thing that catches it is CI building the `inspect`
 //! example (`cargo build --locked --all-targets`) in a checkout holding
-//! only `../rust-fs-core`. Two copies of `am-fs-core` give
+//! only `../rust-fs-core`. Two copies of `rust-fs-core` give
 //! `the trait `BlockRead` is not implemented for `Qcow2Reader``, not a
 //! manifest that looks any different from a correct one.
 
@@ -492,7 +492,7 @@ fn the_one_sibling_this_crate_does_need_is_read_and_allowed() {
     let needs = siblings_the_manifest_resolves(&manifest());
     assert!(
         needs.contains("rust-fs-core"),
-        "am-fs-core is a path dependency on ../rust-fs-core; a reader that \
+        "rust-fs-core is a path dependency on ../rust-fs-core; a reader that \
          does not see it sees nothing, and the check above would pass over \
          an empty set. Read {needs:?}"
     );
@@ -510,10 +510,10 @@ fn the_one_sibling_this_crate_does_need_is_read_and_allowed() {
 fn a_path_dev_dependency_is_a_prerequisite_exactly_as_a_normal_one_is() {
     let manifest = r#"
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 
 [dev-dependencies]
-am-partitions = { path = "../rust-partitions", version = "0.4" }
+rust-disk-partitions = { path = "../rust-partitions", version = "0.4" }
 "#;
     let needs = siblings_the_manifest_resolves(manifest);
     assert!(needs.contains("rust-partitions"), "read {needs:?}");
@@ -535,13 +535,13 @@ am-partitions = { path = "../rust-partitions", version = "0.4" }
 fn a_registry_dependency_is_not_a_prerequisite() {
     let manifest = r#"
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 
 [dev-dependencies]
-am-partitions = "0.4"
+rust-disk-partitions = "0.4"
 
 [patch.crates-io]
-am-fs-core = { path = "../rust-fs-core" }
+rust-fs-core = { path = "../rust-fs-core" }
 "#;
     let needs = siblings_the_manifest_resolves(manifest);
     assert_eq!(
@@ -613,10 +613,10 @@ fn a_path_spelled_any_way_cargo_accepts_is_still_a_prerequisite() {
 
     let manifest = r#"
 [dependencies]
-am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
+rust-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 
 [dev-dependencies]
-am-partitions = { path = "./../rust-partitions", version = "0.4" }
+rust-disk-partitions = { path = "./../rust-partitions", version = "0.4" }
 "#;
     let needs = siblings_the_manifest_resolves(manifest);
     assert!(

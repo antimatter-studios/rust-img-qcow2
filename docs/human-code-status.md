@@ -57,7 +57,7 @@ against already-allocated, single-reference, uncompressed clusters, with
 allocation returning `FS_CORE_CUSTOM`. The code allocates, maintains refcounts,
 and copies up from the backing chain.
 
-`include/qcow2.h` now states what actually happens, and what is still refused
+`include/img_qcow2.h` now states what actually happens, and what is still refused
 (snapshots, `refcount_order != 4`, full refcount blocks) — plus the one thing no
 document said: a write to a **compressed** cluster allocates an uncompressed one
 in its place rather than re-compressing.

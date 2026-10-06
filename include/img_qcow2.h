@@ -1,9 +1,9 @@
 /*
- * am-img-qcow2 C ABI — opens a QCOW2 image and returns a generic
+ * rust-img-qcow2 C ABI — opens a QCOW2 image and returns a generic
  * FsCoreDevice handle. Once opened, all further interaction goes
  * through fs_core.h's device API.
  *
- * Link with libqcow2.a and include this header alongside fs_core.h.
+ * Link with libimg_qcow2.a and include this header alongside fs_core.h.
  *
  * `chore staticlib` builds that library and copies both headers beside
  * it; `chore artifact` prints the absolute path of the directory

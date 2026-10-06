@@ -2,7 +2,7 @@
 //! binary.
 //!
 //! Installed as `rust-img-qcow2` and linked as `img.qcow2`. The dispatch and the
-//! output contract every tool shares are `fs_core::cli` (am-fs-core's `cli`
+//! output contract every tool shares are `fs_core::cli` (rust-fs-core's `cli`
 //! feature); `qcow2` is the tool itself.
 
 mod qcow2;

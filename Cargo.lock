@@ -9,40 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "am-fs-core"
-version = "0.2.23"
-dependencies = [
- "clap",
- "clap_complete",
- "clap_mangen",
-]
-
-[[package]]
-name = "am-img-qcow2"
-version = "0.5.2"
-dependencies = [
- "am-fs-core",
- "am-partitions",
- "clap",
- "flate2",
- "ruzstd",
- "saphyr",
- "serde_json",
- "toml",
- "zstd",
-]
-
-[[package]]
-name = "am-partitions"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b1f219a8793d475dfcbc5807f5279acea5cf12f018db2f7975c5aabcf03876"
-dependencies = [
- "am-fs-core",
- "crc32fast",
-]
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -339,6 +305,40 @@ name = "roff"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
+name = "rust-disk-partitions"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdf1739304fdc21698bbc793262baa0480c2ad85adaaf4457f31bb9563d41c0d"
+dependencies = [
+ "crc32fast",
+ "rust-fs-core",
+]
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+]
+
+[[package]]
+name = "rust-img-qcow2"
+version = "0.6.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "rust-disk-partitions",
+ "rust-fs-core",
+ "ruzstd",
+ "saphyr",
+ "serde_json",
+ "toml",
+ "zstd",
+]
 
 [[package]]
 name = "rustversion"

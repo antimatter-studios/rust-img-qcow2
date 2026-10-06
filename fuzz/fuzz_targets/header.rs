@@ -7,7 +7,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(header) = qcow2::Header::parse(data) {
+    if let Ok(header) = img_qcow2::Header::parse(data) {
         let _ = header.check_supported();
         let _ = header.check_writable();
         let _ = header.l2_entries();

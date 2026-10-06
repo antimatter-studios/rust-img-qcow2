@@ -224,7 +224,7 @@ pub fn build_zstd_compressed_image(path: &Path, pattern: u8) {
 /// The one compressed-cluster builder.
 ///
 /// Offsets are still written as literals rather than through
-/// `qcow2::header::offsets` — deliberately, so this fixture is an
+/// `img_qcow2::header::offsets` — deliberately, so this fixture is an
 /// independent statement of the layout and can disagree with the
 /// parser. See that module's docs.
 pub fn build_compressed_image_with(path: &Path, pattern: u8, compressor: Compressor) {

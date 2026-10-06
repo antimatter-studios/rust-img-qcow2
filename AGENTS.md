@@ -153,7 +153,7 @@ it**. Do not silence output to fit, and do not route around `tier.sh`.
 <!-- END SHARED BLOCK: agent-core v2 -->
 ## What this is
 
-Pure-Rust QCOW2 reader and writer over `am-fs-core`, linked into the app as a
+Pure-Rust QCOW2 reader and writer over `rust-fs-core`, linked into the app as a
 staticlib.
 
 ## Running tests
@@ -194,7 +194,7 @@ indistinguishable from a suite that passes.
 
 ## The pin that could not be bumped, and how it was
 
-This crate depends on `am-fs-core` at **`v0.2.23`**. It sat at `v0.2.10` for a
+This crate depends on `rust-fs-core` at **`v0.2.23`**. It sat at `v0.2.10` for a
 while, deliberately, and the reasoning is kept because a spent caution that
 reads as a live one is how a repository ends up several releases behind without
 anyone deciding to be.

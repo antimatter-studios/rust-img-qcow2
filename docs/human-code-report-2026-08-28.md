@@ -1,4 +1,4 @@
-# Human-code report — am-img-qcow2
+# Human-code report — rust-img-qcow2
 
 **Date:** 2026-08-28
 **Scope:** full crate (`src/`, `tests/`, `examples/`, `include/`) — v0.4.2, 4,020 lines
@@ -101,7 +101,7 @@ has to discard the doc entirely and re-derive the behaviour from the bytes.
 
 #### H3 — the public `write_at` contract contradicts the implementation *and itself*, and the same stale text is duplicated into the C header
 
-- **Files:** `src/reader.rs:405-432` (rustdoc), `src/reader.rs:452-457` (inline comment), `src/capi.rs:30-34`, `include/qcow2.h:26-40`
+- **Files:** `src/reader.rs:405-432` (rustdoc), `src/reader.rs:452-457` (inline comment), `src/capi.rs:30-34`, `include/img_qcow2.h:26-40`
 - **Category:** Comments that lie / stale published API docs
 - **Severity:** High — this is the documentation a downstream FFI consumer reads before deciding what the writer can be trusted with
 - **Test coverage:** n/a (documentation)
@@ -116,7 +116,7 @@ Three concrete contradictions:
    `nb_snapshots > 0`". The inline comment 70 lines below (452-457) explicitly
    says that check "is gone" and explains why. The doc and the comment
    describing the doc's removal live in the same function.
-3. `capi.rs:30-34` and `include/qcow2.h:35-40` both still say writes succeed
+3. `capi.rs:30-34` and `include/img_qcow2.h:35-40` both still say writes succeed
    "only against already-allocated, single-reference, uncompressed clusters" —
    i.e. the Phase A contract — while the crate now allocates, grows refcount
    blocks, rewrites compressed clusters and does snapshot CoW. The README (which
@@ -310,7 +310,7 @@ would name it once.
 
 #### M10 — module docs list supported features as unsupported
 
-- **Files:** `src/lib.rs:3-6`, `src/reader.rs:3-12`, `include/qcow2.h:26-31`
+- **Files:** `src/lib.rs:3-6`, `src/reader.rs:3-12`, `include/img_qcow2.h:26-31`
 - **Category:** Comments that lie
 - **Test coverage:** n/a
 

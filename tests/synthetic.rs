@@ -26,7 +26,7 @@
 mod common;
 
 use common::*;
-use qcow2::Qcow2Reader;
+use img_qcow2::Qcow2Reader;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -132,7 +132,7 @@ fn read_past_end_errors() {
     let r = Qcow2Reader::open(&path).unwrap();
     let mut buf = vec![0u8; 16];
     match r.read_at(VIRT_SIZE - 8, &mut buf) {
-        Err(qcow2::Error::OutOfBounds { offset, len, size }) => {
+        Err(img_qcow2::Error::OutOfBounds { offset, len, size }) => {
             assert_eq!(offset, VIRT_SIZE - 8, "the refusal names the wrong offset");
             assert_eq!(len, 16, "the refusal names the wrong length");
             assert_eq!(size, VIRT_SIZE, "the refusal names the wrong image size");
@@ -215,7 +215,7 @@ fn backing_too_deep_for_self_reference() {
     build_child_with_backing(&path, &rel, &[]);
 
     match Qcow2Reader::open(&path) {
-        Err(qcow2::Error::BackingTooDeep) => {}
+        Err(img_qcow2::Error::BackingTooDeep) => {}
         Err(e) => panic!("expected BackingTooDeep, got {e:?}"),
         Ok(_) => panic!("expected BackingTooDeep, opened successfully"),
     }
@@ -312,7 +312,7 @@ fn write_to_unallocated_cluster_of_backed_image_copies_up_from_parent() {
     let r = Qcow2Reader::open(&child).unwrap();
     assert_eq!(
         r.cluster_status_at(0).unwrap(),
-        qcow2::ClusterStatus::Allocated,
+        img_qcow2::ClusterStatus::Allocated,
         "the write must have allocated the cluster in the child"
     );
 
@@ -636,7 +636,7 @@ fn write_to_ro_image_errors_with_read_only() {
     let r = Qcow2Reader::open(&path).unwrap();
     assert!(!r.is_writable());
     match r.write_at(64, &[0x11; 4]) {
-        Err(qcow2::Error::ReadOnly) => {}
+        Err(img_qcow2::Error::ReadOnly) => {}
         other => panic!("expected ReadOnly, got {other:?}"),
     }
 
@@ -651,7 +651,7 @@ fn write_past_end_errors_with_out_of_bounds() {
     let r = Qcow2Reader::open_rw(&path).unwrap();
     // VIRT_SIZE = 16384; write at the very end + 1.
     match r.write_at(VIRT_SIZE - 8, &[0x11u8; 16]) {
-        Err(qcow2::Error::OutOfBounds { .. }) => {}
+        Err(img_qcow2::Error::OutOfBounds { .. }) => {}
         other => panic!("expected OutOfBounds, got {other:?}"),
     }
 
@@ -904,7 +904,7 @@ fn zstd_compressed_cluster_round_trip() {
 
 #[test]
 fn cluster_status_classifies_each_virtual_cluster() {
-    use qcow2::ClusterStatus;
+    use img_qcow2::ClusterStatus;
     let path = tmp_path("cluster_status");
     build_image(&path);
     let r = Qcow2Reader::open(&path).unwrap();
@@ -941,12 +941,12 @@ fn cluster_status_rejects_out_of_bounds_offset() {
 
 #[test]
 fn extents_iter_yields_run_length_encoded_status_runs() {
-    use qcow2::ClusterStatus;
+    use img_qcow2::ClusterStatus;
     let path = tmp_path("extents");
     build_image(&path);
     let r = Qcow2Reader::open(&path).unwrap();
 
-    let extents: Vec<_> = r.extents().collect::<qcow2::Result<Vec<_>>>().unwrap();
+    let extents: Vec<_> = r.extents().collect::<img_qcow2::Result<Vec<_>>>().unwrap();
 
     // Expected, from the layout comment at the top of the file:
     //   virt 0 = Allocated, virt 1 = Unallocated,
@@ -997,7 +997,7 @@ fn open_rejects_encrypted_image() {
     build_image(&p);
     patch_be(&p, 32, 1, 4); // crypt_method = AES at header offset 32
     match Qcow2Reader::open(&p).err() {
-        Some(qcow2::Error::Unsupported(m)) => assert!(m.contains("encryption")),
+        Some(img_qcow2::Error::Unsupported(m)) => assert!(m.contains("encryption")),
         other => panic!("expected Unsupported(encryption), got {other:?}"),
     }
     let _ = std::fs::remove_file(&p);
@@ -1012,7 +1012,7 @@ fn open_rejects_external_data_file_image() {
     // incompatible_features at header offset 72; bit 2 = DATA_FILE.
     patch_be(&p, 72, 1 << 2, 8);
     match Qcow2Reader::open(&p).err() {
-        Some(qcow2::Error::Unsupported(m)) => assert_eq!(m, "external data file"),
+        Some(img_qcow2::Error::Unsupported(m)) => assert_eq!(m, "external data file"),
         other => panic!("expected Unsupported(external data file), got {other:?}"),
     }
     let _ = std::fs::remove_file(&p);
@@ -1289,7 +1289,7 @@ fn an_unaligned_l2_entry_is_refused_rather_than_followed() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?} with buf starting {:02x?}",
         &buf[..8]
     );
@@ -1309,7 +1309,7 @@ fn an_l2_entry_with_reserved_bits_set_is_refused() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1328,7 +1328,7 @@ fn an_l2_entry_past_the_end_of_the_image_is_refused() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1347,7 +1347,7 @@ fn an_unaligned_l1_entry_is_refused_rather_than_followed() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?} with buf starting {:02x?}",
         &buf[..8]
     );
@@ -1367,7 +1367,7 @@ fn an_l1_entry_with_reserved_bits_set_is_refused() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1505,7 +1505,7 @@ fn a_compressed_descriptor_pointing_past_the_image_is_refused() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "a compressed cluster outside the image must be refused, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1532,7 +1532,7 @@ fn a_compressed_payload_running_off_the_end_is_refused() {
     let mut buf = vec![0u8; 512];
     let err = r.read_at(0, &mut buf).unwrap_err();
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "a compressed payload ending past the image must be refused, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1628,7 +1628,7 @@ fn writing_over_an_out_of_range_compressed_cluster_is_refused_before_any_release
         .write_at(0, &[0xAB; 512])
         .expect_err("the write must be refused rather than releasing a cluster it invented");
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal, got {err:?}"
     );
 
@@ -1685,7 +1685,7 @@ fn the_status_of_an_out_of_range_compressed_cluster_is_refused_without_reading_i
         .cluster_status_at(0)
         .expect_err("a compressed descriptor outside the image must not report Allocated");
     assert!(
-        matches!(err, qcow2::Error::Corrupt(_)),
+        matches!(err, img_qcow2::Error::Corrupt(_)),
         "expected a refusal from the L1/L2 walk, got {err:?}"
     );
     let _ = std::fs::remove_file(&path);
