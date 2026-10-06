@@ -51,12 +51,14 @@ chore_min_version: 0.6.0
 #                                              think about it". The job has a
 #                                              separate build step, so no
 #                                              `Compiling` lines land here
-#     release    307 / 19,760    420 / 28,000  the same selection in the
+#     release    307 / 19,760    560 / 28,000  the same selection in the
 #                                              other profile, and the same
 #                                              headroom. The job has no
 #                                              separate build step, so a
-#                                              cold cache puts ~75
-#                                              `Compiling` lines in here too
+#                                              cold cache puts its
+#                                              `Compiling` lines in here too:
+#                                              462 lines measured cold (run
+#                                              37546136903, rust-fs-core 0.3.7)
 #     qemu        36 /  2,133    180 /  9,000  25 tests at 36 lines, plus the
 #                                              `Compiling` lines a cold cache
 #                                              puts in this tier: the job has
@@ -240,7 +242,7 @@ tasks:
     # reason. See the long note in .github/workflows/ci.yml on the
     # `test-release` job, and #98.
     cmds:
-      - 'bash ../rust-fs-core/scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli'
+      - 'bash ../rust-fs-core/scripts/tier.sh "test (release)" release 560 28000 -- cargo test --locked --release --all-targets --features cli'
       - 'bash ../rust-fs-core/scripts/test-floor.sh release 225'
 
   test:qemu:

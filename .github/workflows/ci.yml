@@ -249,7 +249,7 @@ jobs:
         # guards added eighteen tests.
         shell: bash
         run: |
-          bash ../rust-fs-core/scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli
+          bash ../rust-fs-core/scripts/tier.sh "test (release)" release 560 28000 -- cargo test --locked --release --all-targets --features cli
           bash ../rust-fs-core/scripts/test-floor.sh release 225
       - name: keep the tier log
         if: always()
