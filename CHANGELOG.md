@@ -7,6 +7,16 @@ never does.
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-10-06
+
+### Renamed
+
+- **The last version published as `am-img-qcow2`.** The crate is renamed to
+  `rust-img-qcow2`, the repository's name; every later version is published under
+  that name only, starting at 0.6.0. The description and the README say where
+  the crate went. The import changes too: `use qcow2::...` becomes `use img_qcow2::...`.
+
+
 ### Changed
 
 - **The release tarballs are packaged, attested and attached by
@@ -315,7 +325,8 @@ never does.
 
 - `am-fs-core` and `am-partitions` dependencies move to 0.2.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/antimatter-studios/rust-img-qcow2/compare/v0.4.4...v0.4.5

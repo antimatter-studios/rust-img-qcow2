@@ -1,5 +1,19 @@
 # qcow2
 
+> **Renamed to [`rust-img-qcow2`](https://crates.io/crates/rust-img-qcow2).**
+> `am-img-qcow2` 0.5.2 is the last version published under this name. New versions
+> are published only as `rust-img-qcow2`, starting at 0.6.0. To move, change one line
+> in `Cargo.toml`:
+>
+> ```toml
+> # before
+> am-img-qcow2 = "0.5"
+> # after
+> rust-img-qcow2 = "0.6"
+> ```
+>
+> The import changes too: `use qcow2::...` becomes `use img_qcow2::...`.
+
 Pure-Rust reader and writer for the QCOW2 disk-image format. Spec-derived;
 no GPL code is copied or linked. Exposes a Rust API and a C ABI suitable
 for FFI from C/C++/Go/Swift.

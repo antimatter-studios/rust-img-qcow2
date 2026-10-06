@@ -1,9 +1,9 @@
 [package]
 name = "am-img-qcow2"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust QCOW2 reader. Exposes a Rust API and a C ABI suitable for FFI from C/C++/Go/Swift."
+description = "Renamed to rust-img-qcow2: this crate receives no further versions. Depend on rust-img-qcow2 instead; the import becomes use img_qcow2."
 repository = "https://github.com/antimatter-studios/rust-img-qcow2"
 
 # The fuzz crate is its own package, on its own toolchain, and is not
