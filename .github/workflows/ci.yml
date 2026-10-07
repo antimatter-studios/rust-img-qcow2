@@ -130,6 +130,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-img-qcow2
+      - name: lib build (32-bit)
+        working-directory: rust-img-qcow2
+        # Outside the budget, so the i686 build's `Compiling` lines land here
+        # and not in the tier below (#154).
+        run: cargo test --locked --lib --target i686-unknown-linux-gnu --no-run
       - name: lib tests (32-bit)
         working-directory: rust-img-qcow2
         # ITS OWN TIER, ITS OWN BUDGET AND ITS OWN FLOOR, BECAUSE THIS
@@ -230,6 +235,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-img-qcow2
+      - name: build --release
+        working-directory: rust-img-qcow2
+        # OUTSIDE THE BUDGET, so a cold cache's `Downloaded` and `Compiling`
+        # lines land here and not in the tier below (#154). `--no-run` builds
+        # exactly what the budgeted run executes, so that run compiles
+        # nothing. `every_budgeted_cargo_test_is_built_before_its_budget_starts`
+        # in tests/ci_profile.rs keeps this step here.
+        run: cargo test --locked --release --all-targets --features cli --no-run
       - name: test --release
         working-directory: rust-img-qcow2
         # ITS OWN TIER, NOT THE MATRIX'S, BECAUSE THIS IS A DIFFERENT RUN
@@ -249,7 +262,7 @@ jobs:
         # guards added eighteen tests.
         shell: bash
         run: |
-          bash ../rust-fs-core/scripts/tier.sh "test (release)" release 560 28000 -- cargo test --locked --release --all-targets --features cli
+          bash ../rust-fs-core/scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli
           bash ../rust-fs-core/scripts/test-floor.sh release 225
       - name: keep the tier log
         if: always()
@@ -364,6 +377,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-img-qcow2
+      - name: build the qemu cross-validation tests
+        working-directory: rust-img-qcow2
+        # Outside the budget, so a cold cache's `Compiling` lines land here
+        # and not in the tier below (#154). The feature gate means this
+        # target is built nowhere else in the workflow.
+        run: cargo test --locked --features qemu-validation --test qemu_validation --no-run
       - name: qemu cross-validation tests
         working-directory: rust-img-qcow2
         # THE MOST EXPOSED SELECTION IN THE FILE, so it has the loudest
@@ -393,7 +412,7 @@ jobs:
         # qemu-validation --test qemu_validation`.
         shell: bash
         run: |
-          bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 180 9000 -- cargo test --locked --features qemu-validation --test qemu_validation
+          bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation
           bash ../rust-fs-core/scripts/test-floor.sh qemu 23
       - name: keep the tier log
         if: always()

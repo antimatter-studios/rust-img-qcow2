@@ -51,27 +51,26 @@ chore_min_version: 0.6.0
 #                                              think about it". The job has a
 #                                              separate build step, so no
 #                                              `Compiling` lines land here
-#     release    307 / 19,760    560 / 28,000  the same selection in the
+#     release    307 / 19,760    420 / 28,000  the same selection in the
 #                                              other profile, and the same
-#                                              headroom. The job has no
-#                                              separate build step, so a
-#                                              cold cache puts its
-#                                              `Compiling` lines in here too:
-#                                              462 lines measured cold (run
-#                                              37546136903, rust-fs-core 0.3.7)
-#     qemu        36 /  2,133    180 /  9,000  25 tests at 36 lines, plus the
-#                                              `Compiling` lines a cold cache
-#                                              puts in this tier: the job has
-#                                              no build step, and the feature
-#                                              gate means this target is
-#                                              built nowhere else. A cold
-#                                              build measured 142 lines (run
-#                                              37545310076, rust-fs-core 0.3.7)
-#     lib32       53 /  3,779    200 / 14,000  the 42 library tests, plus the
-#                                              i686 build's own `Compiling`
-#                                              lines, which land in this tier
-#                                              because the job has no build
-#                                              step of its own
+#                                              headroom. A build step before
+#                                              the tier (`--no-run`) takes
+#                                              the compile out of it, so a
+#                                              cold cache no longer counts
+#                                              here (#154). 560 for a day as
+#                                              a stopgap, after 462 lines
+#                                              cold on run 37546136903
+#     qemu        36 /  2,133    130 /  9,000  25 tests at 36 lines, with a
+#                                              build step before the tier
+#                                              since #154; 180 for a day as a
+#                                              stopgap after a cold build
+#                                              measured 142 lines in it (run
+#                                              37545310076)
+#     lib32       53 /  3,779    200 / 14,000  the 42 library tests, and a
+#                                              build step before the tier
+#                                              since #154. The measurement
+#                                              predates it and includes the
+#                                              i686 build's `Compiling` lines
 #     cli         26 /    870     35 /  1,300  the installed tool: one line
 #                                              per test file and its verdict,
 #                                              and doctor's report. Paths are
@@ -242,7 +241,8 @@ tasks:
     # reason. See the long note in .github/workflows/ci.yml on the
     # `test-release` job, and #98.
     cmds:
-      - 'bash ../rust-fs-core/scripts/tier.sh "test (release)" release 560 28000 -- cargo test --locked --release --all-targets --features cli'
+      - 'cargo test --locked --release --all-targets --features cli --no-run'
+      - 'bash ../rust-fs-core/scripts/tier.sh "test (release)" release 420 28000 -- cargo test --locked --release --all-targets --features cli'
       - 'bash ../rust-fs-core/scripts/test-floor.sh release 225'
 
   test:qemu:
@@ -258,7 +258,8 @@ tasks:
     # `cargo test --test qemu_validation` alone matches nothing and exits
     # 0 (#50).
     cmds:
-      - 'bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 180 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
+      - 'cargo test --locked --features qemu-validation --test qemu_validation --no-run'
+      - 'bash ../rust-fs-core/scripts/tier.sh qemu-validation qemu 130 9000 -- cargo test --locked --features qemu-validation --test qemu_validation'
       - 'bash ../rust-fs-core/scripts/test-floor.sh qemu 23'
 
   test:lib32:
@@ -273,6 +274,7 @@ tasks:
     # toolchain (gcc-multilib on Debian). It fails naming them rather
     # than skipping.
     cmds:
+      - 'cargo test --locked --lib --target i686-unknown-linux-gnu --no-run'
       - 'bash ../rust-fs-core/scripts/tier.sh "test (32-bit lib)" lib32 200 14000 -- cargo test --locked --lib --target i686-unknown-linux-gnu'
       - 'bash ../rust-fs-core/scripts/test-floor.sh lib32 38'
 
