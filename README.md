@@ -6,31 +6,16 @@ for FFI from C/C++/Go/Swift.
 
 ## Status
 
-Read path: complete for the common case (zlib + zstd clusters, backing
-chains, sparse / zero clusters). Write path: full set landed — allocation,
-refcount-block growth, compressed-cluster rewrite, snapshot copy-on-write.
-
-### Read
-
-- [x] Header parse (v2 and v3)
-- [x] L1 / L2 cluster lookup, uncompressed clusters
-- [x] Sparse / all-zero clusters (v3 zero flag honoured)
-- [x] zlib-compressed clusters
-- [x] zstd-compressed clusters (header `compression_type = 1`)
-- [x] Backing-file chain (parent path resolution + fall-through reads)
-
-### Write
-
-- [x] Write into already-allocated clusters
-- [x] Sparse-grow (allocate cluster + L2 entry + refcount, crash-safe
-      ordering)
-- [x] Compressed-cluster rewrite (decompress → modify → reallocate →
-      update L2)
-- [x] `decrement_refcount` on cluster replacement (no leak after rewrite)
-- [x] Refcount-block growth — allocates a fresh refcount block when every
-      existing one is full
-- [x] Snapshot copy-on-write — writes to clusters whose host refcount > 1
-      clone the cluster before mutating, leaving the snapshot's view intact
+Reads version 2 and 3 images: uncompressed, zlib and zstd clusters, sparse
+and zero clusters, and backing chains. Writes allocate clusters, grow the
+refcount table, rewrite compressed clusters, copy up from a backing file, and
+copy a cluster an internal snapshot shares before changing it. Encryption,
+external data files and extended L2 entries are refused by name, and so is a
+write to an image flagged corrupt or dirty. Every shape is checked against
+`qemu-img`. **[docs/features.md](docs/features.md) is the full list**: every
+feature, its state (supported, partial, refused, not supported or upcoming),
+the release it shipped in, its tracking issue and the test that checks it.
+Every pull request that changes behaviour updates it.
 
 ## API surface
 
