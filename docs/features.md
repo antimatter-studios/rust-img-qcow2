@@ -69,3 +69,4 @@ States:
 | `img.qcow2` `info`/`get`, `read`, `write` (`--features cli`) | Supported | 0.5.0 | | `cli_write.rs`, `tests/cli/test-info.sh`, `tests/cli/test-read.sh`, `tests/cli/test-write.sh` |
 | `img.qcow2` `create`, `resize`, `set` | Not supported (`not implemented`, exit 3) | 0.5.0 | | `tests/cli/test-unsupported.sh` |
 | `rust-img-qcow2 doctor`, man pages, shell completions | Supported | 0.5.0 | | `tests/cli/test-names.sh`, `tests/cli/test-docs.sh` |
+| Building the tool from a checkout or a release tag with no other repository beside it, on Linux and Windows | Supported | 0.6.1 (#160) | | the `standalone` CI job |
