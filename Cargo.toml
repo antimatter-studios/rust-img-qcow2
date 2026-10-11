@@ -80,9 +80,17 @@ flate2 = "1"
 # Pure-Rust zstd decoder. Only used when an image declares
 # compression_type = 1 (zstd) in its v3 header. MIT-licensed, no_std-able.
 ruzstd = "0.8"
-# Block-device trait surface. Local path dep until both crates are
-# published; flip to a published version on the first crates.io release.
-rust-fs-core = { path = "../rust-fs-core", version = "0.3.8" }
+# Block-device trait surface.
+#
+# THE PUBLISHED CRATE, NOT THE SIBLING (#160). A `path` here made every
+# build from a checkout -- a release tag included -- need a rust-fs-core
+# checkout beside it, and on Windows, where no release tarball exists, a
+# checkout is the only way to get the tool. The path also won over the
+# version, so which core a tag was built against was whatever the sibling
+# held. Cargo.lock now names the one this repository was tested with. To
+# build against an unreleased core, override it locally with
+# `[patch.crates-io]` in an uncommitted .cargo/config.toml; see AGENTS.md.
+rust-fs-core = { version = "0.3.8" }
 # The command-line tool's argument parser, behind the `cli` feature (see the
 # `rust-img-qcow2` target above). No derive: the builder API keeps the tool's
 # command a function the man pages and completions can be made from.
@@ -150,26 +158,6 @@ panic = "unwind"  # required for catch_unwind at the C-ABI boundary
 [profile.dev]
 opt-level = 1
 panic = "unwind"
-
-# WHY A PATCH RATHER THAN A SECOND PATH DEPENDENCY.
-#
-# rust-disk-partitions comes from the registry (above), and its own rust-fs-core
-# comes from the registry too. A registry rust-fs-core and this crate's
-# ../rust-fs-core are DIFFERENT PACKAGES to cargo even at the same
-# version, so without this the graph carries two of them and the
-# `inspect` example stops compiling:
-#
-#     the trait `BlockRead` is not implemented for `Qcow2Reader`
-#     note: there are multiple different versions of crate `fs_core`
-#
-# This unifies them onto the copy this crate already builds against. It
-# needs no directory the contract does not already name, and cargo
-# strips `[patch]` when packaging, so nothing reaches a consumer of the
-# published crate. Adding a path here is adding a sibling prerequisite:
-# ../rust-fs-core is declared in chores.yml, and the guard requires that
-# of anything else put here.
-[patch.crates-io]
-rust-fs-core = { path = "../rust-fs-core" }
 
 # The command-line tool's own write refusals, run against the built binary.
 # It needs the `rust-img-qcow2` target, which needs `cli`; the debug and

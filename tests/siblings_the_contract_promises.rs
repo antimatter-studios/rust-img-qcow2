@@ -33,12 +33,12 @@
 //! ## What this does NOT catch
 //!
 //! A registry dependency that pulls a SECOND copy of a crate this one
-//! resolves by path. That is why `[patch.crates-io]` exists in
-//! `Cargo.toml`, and the thing that catches it is CI building the `inspect`
-//! example (`cargo build --locked --all-targets`) in a checkout holding
-//! only `../rust-fs-core`. Two copies of `rust-fs-core` give
+//! resolves by path. Two copies of `rust-fs-core` give
 //! `the trait `BlockRead` is not implemented for `Qcow2Reader``, not a
-//! manifest that looks any different from a correct one.
+//! manifest that looks any different from a correct one. `[patch.crates-io]`
+//! in `Cargo.toml` once unified them. Since #160 this crate takes
+//! `rust-fs-core` from the registry too, so there is one copy and no patch,
+//! and the `standalone` CI job builds the tool with no sibling at all.
 
 use std::collections::BTreeSet;
 
@@ -485,16 +485,20 @@ fn the_manifest_needs_no_sibling_the_contract_does_not_declare() {
     );
 }
 
-/// The acceptance half, on the real files: the legal path dependency this
-/// crate has always had must still be read, and read as legal.
+/// The acceptance half, on the real files. Since #160 the manifest needs no
+/// sibling at all: rust-fs-core comes from crates.io, so a checkout builds
+/// on its own. That the reader sees a path when one is there is proven on
+/// the synthetic manifests below, so an empty set here is a finding, not a
+/// blind reader.
 #[test]
-fn the_one_sibling_this_crate_does_need_is_read_and_allowed() {
+fn the_manifest_needs_no_sibling_and_the_contract_still_names_core() {
     let needs = siblings_the_manifest_resolves(&manifest());
     assert!(
-        needs.contains("rust-fs-core"),
-        "rust-fs-core is a path dependency on ../rust-fs-core; a reader that \
-         does not see it sees nothing, and the check above would pass over \
-         an empty set. Read {needs:?}"
+        needs.is_empty(),
+        "Cargo.toml resolves {needs:?} through a path. A checkout must build \
+         with nothing beside it (#160): take the crate from crates.io, and \
+         override it locally with [patch.crates-io] in an uncommitted \
+         .cargo/config.toml"
     );
     assert!(
         siblings_the_contract_declares(&chores()).contains("rust-fs-core"),
