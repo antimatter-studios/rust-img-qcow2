@@ -389,6 +389,11 @@ jobs:
         # nothing runs is a guard that reports protection it is not providing.
         working-directory: rust-img-qcow2
         run: bash ../rust-fs-core/scripts/agents-core-check.sh
+      - name: unreleased changelog entries are fragments
+        working-directory: rust-img-qcow2
+        # agent-core v6: a pull request adds changelog.d/<branch>.md rather
+        # than editing CHANGELOG.md. Run directly, like the check above.
+        run: bash ../rust-fs-core/scripts/changelog-check.sh
       # EVERY tests/scripts GUARD, BY GLOB (#135). They were named one step
       # each, so a guard added to that directory never ran until someone also
       # added a step here -- test-write-jobs-pinned.sh went green on its first
