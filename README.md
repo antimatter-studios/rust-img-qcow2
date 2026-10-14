@@ -1,8 +1,10 @@
-# qcow2
+# rust-img-qcow2
 
 Pure-Rust reader and writer for the QCOW2 disk-image format. Spec-derived;
 no GPL code is copied or linked. Exposes a Rust API and a C ABI suitable
 for FFI from C/C++/Go/Swift.
+
+Published on crates.io as `rust-img-qcow2`; the library name is `img_qcow2`.
 
 ## Status
 
@@ -20,7 +22,7 @@ Every pull request that changes behaviour updates it.
 ## API surface
 
 ```rust
-use qcow2::Qcow2Reader;
+use img_qcow2::Qcow2Reader;
 
 // Read-only
 let r = Qcow2Reader::open("disk.qcow2")?;

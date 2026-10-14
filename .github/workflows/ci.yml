@@ -268,7 +268,7 @@ jobs:
   # optimisation are properties of the profile, not of the platform, and
   # three of these would buy the same evidence three times on a crate
   # whose cross-platform risk the debug matrix already covers. The
-  # siblings rust-img-vhdx, rust-img-vmdk and rust-partitions all made
+  # siblings rust-img-vhdx, rust-img-vmdk and rust-disk-partitions all made
   # the same call.
   #
   # NO `EXPECT_OVERFLOW_CHECKS` HERE, DELIBERATELY. Overflow checks are
