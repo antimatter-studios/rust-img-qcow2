@@ -8,6 +8,9 @@ on:
   # decides whether they land. The queue reads ci-ok only from a workflow
   # that triggers here.
   merge_group:
+  # A full run of a branch on demand: the evidence a quick pull-request run
+  # is not. scripts/ci-plan.sh plans every event but pull_request as full.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,10 +36,21 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.c.outputs.code }}
+      # quick or full, and the test matrix's runners, from scripts/ci-plan.sh.
+      # A pull request runs quick; the merge queue, a push, a dispatch and
+      # any event the script does not name run full. ci-ok refuses a run
+      # whose plan is missing or invalid.
+      profile: ${{ steps.plan.outputs.profile }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Plan the profile
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: bash scripts/ci-plan.sh "$EVENT" | tee -a "$GITHUB_OUTPUT"
       - name: rust-fs-core at the pinned tag, for code-changed.sh
         uses: actions/checkout@v4
         with:
@@ -82,10 +96,14 @@ jobs:
     name: test / ${{ matrix.os }}
     needs: changes
     if: needs.changes.outputs.code == 'true'
+    # The quick profile runs this leg on ubuntu-latest alone; the full profile
+    # runs all three runners (scripts/ci-plan.sh). The job and its names are
+    # the same either way, so the debug run with its overflow handshake and
+    # floor gates every pull request.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.changes.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -176,7 +194,8 @@ jobs:
   test-32bit:
     name: test / i686-unknown-linux-gnu
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Full profile only; ci-ok accepts its skip on a quick run alone.
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -280,7 +299,8 @@ jobs:
   test-release:
     name: test (release)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Full profile only; ci-ok accepts its skip on a quick run alone.
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -400,8 +420,9 @@ jobs:
       # pull request without having run. Every guard runs even after one fails,
       # and the floor makes a glob that matched nothing a failure, not a pass.
       # tests/ci_profile.rs holds this loop and its floor in place. The floor
-      # is 2, not 3, because test-package-cli.sh left with the packaging it
-      # tested: that is rust-fs-core's now, tested there (#146).
+      # went to 2 when test-package-cli.sh left with the packaging it tested
+      # (rust-fs-core's now, tested there, #146), and to 3 with
+      # test-ci-profile.sh, the CI plan and verdict truth tables.
       - name: script tests (tests/scripts/*.sh, by glob)
         working-directory: rust-img-qcow2
         shell: bash
@@ -414,7 +435,7 @@ jobs:
             bash "$t" || failed=$((failed + 1))
             ran=$((ran + 1))
           done
-          floor=2
+          floor=3
           echo "ran $ran script tests, $failed failed (floor $floor)"
           [ "$failed" -eq 0 ] || exit 1
           [ "$ran" -ge "$floor" ] || { echo "::error::ran $ran script tests, floor is $floor"; exit 1; }
@@ -432,7 +453,8 @@ jobs:
   qemu-validation:
     name: qemu-validation
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Full profile only; ci-ok accepts its skip on a quick run alone.
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -518,6 +540,9 @@ jobs:
   # tests/ci_profile.rs holds the two files to.
   cli:
     name: cli (the installed tool, on PATH)
+    needs: changes
+    # Full profile only; ci-ok accepts its skip on a quick run alone.
+    if: needs.changes.outputs.profile == 'full'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -586,6 +611,9 @@ jobs:
   # it. A dependency on the sibling fails here before it reaches a user.
   standalone:
     name: standalone (a checkout with no sibling builds, ${{ matrix.os }})
+    needs: changes
+    # Full profile only; ci-ok accepts its skip on a quick run alone.
+    if: needs.changes.outputs.profile == 'full'
     strategy:
       fail-fast: false
       matrix:
@@ -667,19 +695,25 @@ jobs:
       # echoed and looped over a hand-kept list that left out `semver`, so a
       # public-API break failed its own job and ci-ok still went green. A
       # job added to `needs:` is now judged without editing this step.
+      #
+      # The verdict is scripts/ci-verdict.sh, so the truth table in
+      # tests/scripts/test-ci-profile.sh tests the code this step runs. The
+      # job list on its command line is `needs:` again, so a job that never
+      # reported is missing rather than silently absent.
+      - uses: actions/checkout@v4
       - name: every gating job must have concluded success
         env:
           NEEDS: ${{ toJSON(needs) }}
           # false only for a change to documentation alone: then, and only
           # then, a skipped job is not a failed one.
           CODE: ${{ needs.changes.outputs.code }}
+          # quick or full. On quick, and only on quick, the FULL_ONLY legs
+          # may skip; a missing or invalid profile fails.
+          PROFILE: ${{ needs.changes.outputs.profile }}
+          FULL_ONLY: test-32bit test-release qemu-validation cli standalone
         run: |
           set -euo pipefail
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          echo "code changed: $CODE"
-          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" '[to_entries[] | select(.value.result != "success" and ($code != "false" or .value.result != "skipped")) | .key] | join(", ")')"
-          if [ -n "$bad" ]; then
-              echo "::error::not 'success': $bad -- failure, cancellation and skipping all mean the gate did not run to completion"
-              exit 1
-          fi
-          echo "all gating jobs succeeded"
+          echo "code changed: $CODE; profile: $PROFILE"
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key) \(.value.result)"' |
+            bash scripts/ci-verdict.sh changes test test-32bit test-release fmt qemu-validation cli semver standalone
